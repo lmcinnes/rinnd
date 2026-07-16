@@ -5,7 +5,15 @@ use crate::graph::{NeighborGraph, SearchGraph};
 use crate::heap::NeighborHeap;
 use crate::nndescent::{nn_descent, NNDescentParams};
 use crate::rng::FastRng;
-use crate::search::greedy_search;
+use crate::search::{
+    greedy_search,
+    greedy_search_indices_with_workspace,
+    greedy_search_quantized_i8_with_workspace,
+    greedy_search_with_workspace,
+    greedy_search_with_workspace_stats,
+    SearchStats,
+    SearchWorkspace,
+};
 use crate::tree::FlatTree;
 use rayon::prelude::*;
 
@@ -35,8 +43,8 @@ pub struct NNDescentIndex<D: Distance<f32>> {
     pub neighbor_distances: Vec<f32>,
     /// Search graph (CSR format)
     pub search_graph: SearchGraph,
-    /// Search tree
-    pub search_tree: Option<FlatTree>,
+    /// RP trees retained for query initialization.
+    pub search_trees: Vec<FlatTree>,
     /// Vertex ordering (for tree leaf order)
     pub vertex_order: Vec<usize>,
     /// Minimum distance in graph (for epsilon scaling)
@@ -46,6 +54,330 @@ pub struct NNDescentIndex<D: Distance<f32>> {
 }
 
 impl<D: Distance<f32>> NNDescentIndex<D> {
+    fn original_to_internal(&self) -> Vec<usize> {
+        let mut inverse = vec![0; self.n_points];
+        for (internal_id, &original_id) in self.vertex_order.iter().enumerate() {
+            inverse[original_id] = internal_id;
+        }
+        inverse
+    }
+
+    /// Return the search graph in original input-ID order.
+    pub fn search_graph_original_order(&self) -> SearchGraph {
+        let mut graph = self.search_graph.clone();
+        graph.reorder(&self.original_to_internal());
+        graph
+    }
+
+    #[inline]
+    fn process_query_with_workspace_stats(
+        &self,
+        query: &[f32],
+        query_id: usize,
+        k: usize,
+        epsilon: f32,
+        graph: &SearchGraph,
+        trees: &[FlatTree],
+        min_distance: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>, SearchStats) {
+        let mut rng = FastRng::new(self.rng_seed.wrapping_add(query_id as u64));
+
+        let (mut indices, mut distances, stats) = greedy_search_with_workspace_stats(
+            query,
+            &self.data,
+            self.dim,
+            graph,
+            trees,
+            &self.distance,
+            k,
+            epsilon,
+            min_distance,
+            &mut rng,
+            workspace,
+        );
+
+        for idx in &mut indices {
+            if *idx >= 0 {
+                *idx = self.vertex_order[*idx as usize] as i32;
+            }
+        }
+
+        if let Some(correction) = self.distance_correction {
+            for d in &mut distances {
+                *d = correction(*d);
+            }
+        }
+
+        while indices.len() < k {
+            indices.push(-1);
+            distances.push(f32::INFINITY);
+        }
+
+        indices.truncate(k);
+        distances.truncate(k);
+        (indices, distances, stats)
+    }
+
+    #[inline]
+    fn process_query_with_workspace(
+        &self,
+        query: &[f32],
+        query_id: usize,
+        k: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>) {
+        let mut rng = FastRng::new(self.rng_seed.wrapping_add(query_id as u64));
+
+        let (mut indices, mut distances) = greedy_search_with_workspace(
+            query,
+            &self.data,
+            self.dim,
+            &self.search_graph,
+            &self.search_trees,
+            &self.distance,
+            k,
+            epsilon,
+            self.min_distance,
+            &mut rng,
+            workspace,
+        );
+
+        for idx in &mut indices {
+            if *idx >= 0 {
+                *idx = self.vertex_order[*idx as usize] as i32;
+            }
+        }
+
+        if let Some(correction) = self.distance_correction {
+            for d in &mut distances {
+                *d = correction(*d);
+            }
+        }
+
+        while indices.len() < k {
+            indices.push(-1);
+            distances.push(f32::INFINITY);
+        }
+
+        indices.truncate(k);
+        distances.truncate(k);
+        (indices, distances)
+    }
+
+    #[inline]
+    fn process_query_indices_with_workspace(
+        &self,
+        query: &[f32],
+        query_id: usize,
+        k: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<i32> {
+        let mut rng = FastRng::new(self.rng_seed.wrapping_add(query_id as u64));
+        let mut indices = greedy_search_indices_with_workspace(
+            query,
+            &self.data,
+            self.dim,
+            &self.search_graph,
+            &self.search_trees,
+            &self.distance,
+            k,
+            epsilon,
+            self.min_distance,
+            &mut rng,
+            workspace,
+        );
+
+        for idx in &mut indices {
+            if *idx >= 0 {
+                *idx = self.vertex_order[*idx as usize] as i32;
+            }
+        }
+
+        indices.resize(k, -1);
+        indices.truncate(k);
+        indices
+    }
+
+    #[inline]
+    fn process_query(&self, query: &[f32], query_id: usize, k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        let mut rng = FastRng::new(self.rng_seed.wrapping_add(query_id as u64));
+
+        let (mut indices, mut distances) = greedy_search(
+            query,
+            &self.data,
+            self.dim,
+            &self.search_graph,
+            &self.search_trees,
+            &self.distance,
+            k,
+            epsilon,
+            self.min_distance,
+            &mut rng,
+        );
+
+        for idx in &mut indices {
+            if *idx >= 0 {
+                *idx = self.vertex_order[*idx as usize] as i32;
+            }
+        }
+
+        if let Some(correction) = self.distance_correction {
+            for d in &mut distances {
+                *d = correction(*d);
+            }
+        }
+
+        while indices.len() < k {
+            indices.push(-1);
+            distances.push(f32::INFINITY);
+        }
+
+        indices.truncate(k);
+        distances.truncate(k);
+        (indices, distances)
+    }
+
+    /// Query for a single nearest-neighbor request using a reusable workspace.
+    pub fn query_one_with_workspace(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>) {
+        self.process_query_with_workspace(query, 0, k, epsilon, workspace)
+    }
+
+    /// Query one vector and return only original input IDs, avoiding distance
+    /// result allocation and correction.
+    pub fn query_one_indices_with_workspace(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<i32> {
+        self.process_query_indices_with_workspace(query, 0, k, epsilon, workspace)
+    }
+
+    /// Query one vector against a signed-int8 search representation that is
+    /// stored in this index's internal physical vertex order.
+    pub fn query_one_quantized_i8_with_workspace(
+        &self,
+        tree_query: &[f32],
+        query: &[i8],
+        query_inv_norm: f32,
+        quantized_data: &[i8],
+        inv_norms: &[f32],
+        k: usize,
+        rerank_width: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>) {
+        let mut rng = FastRng::new(self.rng_seed);
+        let search_k = k.max(rerank_width);
+        let (mut indices, mut distances) = greedy_search_quantized_i8_with_workspace(
+            tree_query,
+            query,
+            query_inv_norm,
+            quantized_data,
+            inv_norms,
+            self.dim,
+            &self.search_graph,
+            &self.search_trees,
+            search_k,
+            epsilon,
+            self.min_distance,
+            &mut rng,
+            workspace,
+        );
+
+        if rerank_width > k {
+            let mut reranked: Vec<(f32, i32)> = indices
+                .iter()
+                .copied()
+                .filter(|&idx| idx >= 0)
+                .map(|idx| {
+                    let point = &self.data[idx as usize * self.dim..(idx as usize + 1) * self.dim];
+                    (self.distance.distance(tree_query, point), idx)
+                })
+                .collect();
+            reranked.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            reranked.truncate(k);
+            indices = reranked.iter().map(|&(_, idx)| idx).collect();
+            distances = reranked.iter().map(|&(distance, _)| distance).collect();
+        }
+
+        for idx in &mut indices {
+            if *idx >= 0 {
+                *idx = self.vertex_order[*idx as usize] as i32;
+            }
+        }
+        indices.resize(k, -1);
+        distances.resize(k, f32::INFINITY);
+        indices.truncate(k);
+        distances.truncate(k);
+        (indices, distances)
+    }
+
+    /// Query for a single nearest-neighbor request using a reusable workspace,
+    /// returning instrumentation counters.
+    pub fn query_one_with_workspace_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>, SearchStats) {
+        self.process_query_with_workspace_stats(
+            query,
+            0,
+            k,
+            epsilon,
+            &self.search_graph,
+            &self.search_trees,
+            self.min_distance,
+            workspace,
+        )
+    }
+
+    /// Query using an externally provided search graph.
+    ///
+    /// This is intended for analysis/debugging to compare traversal behavior
+    /// across different graph structures while keeping data and distance code fixed.
+    pub fn query_one_on_graph_with_workspace_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        graph: &SearchGraph,
+        min_distance: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>, SearchStats) {
+        // External graphs use original input IDs. Convert them to the physical
+        // search layout before pairing their IDs with reordered data rows.
+        let mut internal_graph = graph.clone();
+        internal_graph.reorder(&self.vertex_order);
+        self.process_query_with_workspace_stats(
+            query,
+            0,
+            k,
+            epsilon,
+            &internal_graph,
+            &[],
+            min_distance,
+            workspace,
+        )
+    }
+
+    /// Query for a single nearest-neighbor request.
+    pub fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        self.process_query(query, 0, k, epsilon)
+    }
+
     /// Query for the k nearest neighbors of query points.
     ///
     /// # Arguments
@@ -65,50 +397,23 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
         k: usize,
         epsilon: f32,
     ) -> (Vec<i32>, Vec<f32>) {
-        let results: Vec<(Vec<i32>, Vec<f32>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                let query = &queries[i * self.dim..(i + 1) * self.dim];
-                let mut rng = FastRng::new(self.rng_seed.wrapping_add(i as u64));
-
-                let (mut indices, mut distances) = greedy_search(
-                    query,
-                    &self.data,
-                    self.dim,
-                    &self.search_graph,
-                    self.search_tree.as_ref(),
-                    &self.distance,
-                    k,
-                    epsilon,
-                    self.min_distance,
-                    &mut rng,
-                );
-
-                // Map back to original vertex order
-                for idx in &mut indices {
-                    if *idx >= 0 {
-                        *idx = self.vertex_order[*idx as usize] as i32;
-                    }
-                }
-
-                // Apply distance correction if needed
-                if let Some(correction) = self.distance_correction {
-                    for d in &mut distances {
-                        *d = correction(*d);
-                    }
-                }
-
-                // Pad to k if needed
-                while indices.len() < k {
-                    indices.push(-1);
-                    distances.push(f32::INFINITY);
-                }
-
-                indices.truncate(k);
-                distances.truncate(k);
-                (indices, distances)
-            })
-            .collect();
+        let results: Vec<(Vec<i32>, Vec<f32>)> = if n_queries <= 4 {
+            let mut workspace = SearchWorkspace::new(self.n_points, k);
+            (0..n_queries)
+                .map(|i| {
+                    let query = &queries[i * self.dim..(i + 1) * self.dim];
+                    self.process_query_with_workspace(query, i, k, epsilon, &mut workspace)
+                })
+                .collect()
+        } else {
+            (0..n_queries)
+                .into_par_iter()
+                .map(|i| {
+                    let query = &queries[i * self.dim..(i + 1) * self.dim];
+                    self.process_query(query, i, k, epsilon)
+                })
+                .collect()
+        };
 
         let mut all_indices = Vec::with_capacity(n_queries * k);
         let mut all_distances = Vec::with_capacity(n_queries * k);
@@ -135,6 +440,7 @@ pub struct NNDescentBuilder<'a> {
     metric: Metric,
     n_neighbors: usize,
     n_trees: usize,
+    n_search_trees: usize,
     leaf_size: Option<usize>,
     max_candidates: Option<usize>,
     n_iters: Option<usize>,
@@ -160,6 +466,7 @@ impl<'a> NNDescentBuilder<'a> {
             metric: Metric::Euclidean,
             n_neighbors: 30,
             n_trees: 8,
+            n_search_trees: 1,
             leaf_size: None,
             max_candidates: None,
             n_iters: None,
@@ -194,6 +501,15 @@ impl<'a> NNDescentBuilder<'a> {
     /// Set the number of RP trees.
     pub fn n_trees(mut self, n: usize) -> Self {
         self.n_trees = n;
+        self
+    }
+
+    /// Set the number of construction RP trees retained for query seeding.
+    ///
+    /// This is independent of `n_trees`, which controls construction. Values
+    /// larger than the constructed forest are clamped to the forest size.
+    pub fn n_search_trees(mut self, n: usize) -> Self {
+        self.n_search_trees = n;
         self
     }
 
@@ -316,7 +632,7 @@ impl<'a> NNDescentBuilder<'a> {
         neighbor_heap.sort_all();
 
         // Build search graph with diversification and pruning (matching PyNNDescent pipeline)
-        let search_graph = SearchGraph::from_dense_diversified(
+        let (mut search_graph, min_distance) = SearchGraph::from_dense_diversified(
             &neighbor_heap.indices,
             &neighbor_heap.distances,
             self.data,
@@ -328,13 +644,6 @@ impl<'a> NNDescentBuilder<'a> {
             self.pruning_degree_multiplier,
         );
 
-        // Get min distance
-        let min_distance = neighbor_heap.distances
-            .iter()
-            .filter(|&&d| d > 0.0 && d < f32::INFINITY)
-            .copied()
-            .fold(f32::INFINITY, f32::min);
-
         // Apply distance correction to stored distances if needed
         let neighbor_distances = if let Some(corr) = correction {
             neighbor_heap.distances.iter().map(|&d| corr(d)).collect()
@@ -342,14 +651,51 @@ impl<'a> NNDescentBuilder<'a> {
             neighbor_heap.distances.clone()
         };
 
-        // Use first tree for search
-        let search_tree = forest.into_iter().next();
+        // Use the first retained tree for physical search-time layout and keep
+        // the requested prefix of the forest for query seeding. This preserves
+        // the current one-tree behavior by default while allowing entry-quality
+        // experiments independently of construction forest size.
+        let mut search_trees: Vec<FlatTree> = forest
+            .into_iter()
+            .take(self.n_search_trees)
+            .collect();
+        let vertex_order: Vec<usize> = search_trees
+            .first()
+            .map(|tree| tree.indices.iter().map(|&idx| idx as usize).collect())
+            .unwrap_or_else(|| (0..self.n_points).collect());
 
-        // For now, identity vertex order
-        let vertex_order: Vec<usize> = (0..self.n_points).collect();
+        assert_eq!(
+            vertex_order.len(),
+            self.n_points,
+            "search tree order must include every point"
+        );
+        let mut old_to_new = vec![usize::MAX; self.n_points];
+        for (new_idx, &old_idx) in vertex_order.iter().enumerate() {
+            assert!(
+                old_idx < self.n_points,
+                "search tree contains an out-of-range point ID"
+            );
+            assert_eq!(
+                old_to_new[old_idx],
+                usize::MAX,
+                "search tree order contains a duplicate point ID"
+            );
+            old_to_new[old_idx] = new_idx;
+        }
+
+        let mut reordered_data = Vec::with_capacity(self.data.len());
+        for &old_idx in &vertex_order {
+            let start = old_idx * self.dim;
+            reordered_data.extend_from_slice(&self.data[start..start + self.dim]);
+        }
+
+        search_graph.reorder(&vertex_order);
+        for tree in &mut search_trees {
+            tree.remap_indices(&old_to_new);
+        }
 
         NNDescentIndex {
-            data: self.data.to_vec(),
+            data: reordered_data,
             n_points: self.n_points,
             dim: self.dim,
             distance,
@@ -358,7 +704,7 @@ impl<'a> NNDescentBuilder<'a> {
             neighbor_indices: neighbor_heap.indices,
             neighbor_distances,
             search_graph,
-            search_tree,
+            search_trees,
             vertex_order,
             min_distance,
             rng_seed: self.random_seed,
@@ -439,5 +785,44 @@ mod tests {
 
         assert_eq!(indices.len(), 15); // 3 queries × 5 neighbors
         assert_eq!(distances.len(), 15);
+    }
+
+    #[test]
+    fn test_search_layout_uses_tree_order_and_preserves_original_results() {
+        let n = 100;
+        let dim = 10;
+        let data = create_test_data(n, dim);
+
+        let index = NNDescentBuilder::new(&data, n, dim)
+            .n_neighbors(10)
+            .n_trees(2)
+            .n_iters(3)
+            .build_euclidean();
+
+        assert_eq!(index.vertex_order.len(), n);
+        let mut sorted_order = index.vertex_order.clone();
+        sorted_order.sort_unstable();
+        assert_eq!(sorted_order, (0..n).collect::<Vec<_>>());
+
+        for (new_idx, &old_idx) in index.vertex_order.iter().enumerate() {
+            assert_eq!(
+                &index.data[new_idx * dim..(new_idx + 1) * dim],
+                &data[old_idx * dim..(old_idx + 1) * dim],
+            );
+        }
+
+        let tree = index.search_trees.first().expect("search tree");
+        assert_eq!(tree.indices, (0..n as i32).collect::<Vec<_>>());
+
+        let exported_graph = index.search_graph_original_order();
+        let mut round_trip_graph = exported_graph.clone();
+        round_trip_graph.reorder(&index.vertex_order);
+        assert_eq!(round_trip_graph.indptr, index.search_graph.indptr);
+        assert_eq!(round_trip_graph.indices, index.search_graph.indices);
+
+        let query_id = 37usize;
+        let query = &data[query_id * dim..(query_id + 1) * dim];
+        let (indices, _) = index.query_one(query, 10, 0.1);
+        assert!(indices.contains(&(query_id as i32)));
     }
 }

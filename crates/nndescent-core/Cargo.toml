@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "heap"
 harness = false
+
+[[bench]]
+name = "search_hotpath"
+harness = false

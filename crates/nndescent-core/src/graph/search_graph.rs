@@ -270,7 +270,7 @@ impl SearchGraph {
         dist: &D,
         diversify_prob: f32,
         pruning_degree_multiplier: f32,
-    ) -> Self {
+    ) -> (Self, f32) {
         use rayon::prelude::*;
 
         let max_degree = (pruning_degree_multiplier * k as f32).round() as usize;
@@ -283,7 +283,7 @@ impl SearchGraph {
                 let row_start = i * k;
                 let row_indices = &neighbor_indices[row_start..row_start + k];
                 let row_dists = &neighbor_distances[row_start..row_start + k];
-                diversify_row(row_indices, row_dists, data, dim, dist, diversify_prob)
+                diversify_row(row_indices, row_dists, data, dim, dist, diversify_prob, max_degree)
             })
             .collect();
 
@@ -305,7 +305,7 @@ impl SearchGraph {
             transpose_csr(&fwd_indptr, &fwd_indices, &fwd_data, n_points);
 
         // Diversify reverse graph rows (parallel)
-        let rev_diversified: Vec<Vec<i32>> = (0..n_points)
+        let rev_diversified: Vec<Vec<(i32, f32)>> = (0..n_points)
             .into_par_iter()
             .map(|i| {
                 let start = rev_indptr[i] as usize;
@@ -322,49 +322,91 @@ impl SearchGraph {
                     row_data[a].partial_cmp(&row_data[b]).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                diversify_sorted_csr(row_indices, row_data, &order, data, dim, dist, diversify_prob)
+                diversify_sorted_csr(row_indices, row_data, &order, data, dim, dist, diversify_prob, max_degree)
             })
             .collect();
 
-        // Step 4: Union forward + diversified reverse into final graph
-        // Build adjacency sets per vertex
-        let mut adj: Vec<Vec<i32>> = vec![Vec::new(); n_points];
+        // Step 4-6: weighted union, self-loop removal, and degree pruning.
+        // Edge weights must survive until pruning: selecting by vertex ID here
+        // can discard the nearest edges and materially weaken search quality.
+        let graph = weighted_union_pruned(&diversified, &rev_diversified, n_points, max_degree);
 
-        // Add forward edges
-        for v in 0..n_points {
-            for &(idx, _) in &diversified[v] {
-                if idx >= 0 {
-                    adj[v].push(idx);
+        let min_distance = fwd_data
+            .iter()
+            .map(|&d| if d == 0.0 { f32::EPSILON } else { d })
+            .filter(|&d| d.is_finite())
+            .fold(f32::INFINITY, f32::min);
+
+        (graph, min_distance)
+    }
+}
+
+/// Union weighted forward and reverse rows and retain the nearest edges.
+///
+/// PyNNDescent combines duplicate sparse edges with `maximum`, then performs
+/// degree pruning using the retained edge weights. The returned binary CSR is
+/// sorted by vertex ID only after the nearest edges have been selected.
+fn weighted_union_pruned(
+    forward: &[Vec<(i32, f32)>],
+    reverse: &[Vec<(i32, f32)>],
+    n_points: usize,
+    max_degree: usize,
+) -> SearchGraph {
+    let mut indptr = Vec::with_capacity(n_points + 1);
+    let mut indices = Vec::new();
+    indptr.push(0);
+
+    for vertex in 0..n_points {
+        let mut row = Vec::with_capacity(forward[vertex].len() + reverse[vertex].len());
+        row.extend(
+            forward[vertex]
+                .iter()
+                .copied()
+                .filter(|&(idx, distance)| {
+                    idx >= 0 && idx != vertex as i32 && distance.is_finite()
+                }),
+        );
+        row.extend(
+            reverse[vertex]
+                .iter()
+                .copied()
+                .filter(|&(idx, distance)| {
+                    idx >= 0 && idx != vertex as i32 && distance.is_finite()
+                }),
+        );
+
+        // Group duplicate vertex IDs and match scipy sparse `maximum` used by
+        // PyNNDescent when unioning forward and reverse search graphs.
+        row.sort_unstable_by_key(|&(idx, _)| idx);
+        let mut deduplicated: Vec<(i32, f32)> = Vec::with_capacity(row.len());
+        for (idx, distance) in row {
+            if let Some((last_idx, last_distance)) = deduplicated.last_mut() {
+                if *last_idx == idx {
+                    *last_distance = last_distance.max(distance);
+                    continue;
                 }
             }
+            deduplicated.push((idx, distance));
         }
 
-        // Add diversified reverse edges
-        for v in 0..n_points {
-            adj[v].extend_from_slice(&rev_diversified[v]);
-        }
+        // Select by distance, with vertex ID providing deterministic tie order.
+        deduplicated.sort_unstable_by(|&(left_idx, left_distance), &(right_idx, right_distance)| {
+            left_distance
+                .total_cmp(&right_distance)
+                .then_with(|| left_idx.cmp(&right_idx))
+        });
+        deduplicated.truncate(max_degree);
 
-        // Step 5 & 6: Sort, dedup, remove self-loops, degree prune, build CSR
-        let mut indptr = Vec::with_capacity(n_points + 1);
-        let mut indices = Vec::new();
-        indptr.push(0i32);
+        // Search CSR rows follow PyNNDescent's binary CSR column order.
+        deduplicated.sort_unstable_by_key(|&(idx, _)| idx);
+        indices.extend(deduplicated.into_iter().map(|(idx, _)| idx));
+        indptr.push(indices.len() as i32);
+    }
 
-        for (v, row) in adj.iter_mut().enumerate() {
-            row.sort_unstable();
-            row.dedup();
-            // Remove self-loop
-            row.retain(|&idx| idx != v as i32 && idx >= 0);
-            // Degree prune: keep only first max_degree
-            let keep = row.len().min(max_degree);
-            indices.extend_from_slice(&row[..keep]);
-            indptr.push(indices.len() as i32);
-        }
-
-        Self {
-            indptr,
-            indices,
-            n_vertices: n_points,
-        }
+    SearchGraph {
+        indptr,
+        indices,
+        n_vertices: n_points,
     }
 }
 
@@ -379,6 +421,7 @@ fn diversify_row<D: Distance<f32>>(
     dim: usize,
     dist: &D,
     prune_probability: f32,
+    max_degree: usize,
 ) -> Vec<(i32, f32)> {
     let mut retained = Vec::new();
 
@@ -405,6 +448,9 @@ fn diversify_row<D: Distance<f32>>(
 
         if keep {
             retained.push((j, d_ij));
+            if retained.len() >= max_degree {
+                break;
+            }
         }
     }
 
@@ -413,7 +459,7 @@ fn diversify_row<D: Distance<f32>>(
 
 /// Diversify a CSR row given a sorted order (for reverse graph diversification).
 ///
-/// Returns the indices of retained neighbors.
+/// Returns retained neighbor indices and their original edge distances.
 fn diversify_sorted_csr<D: Distance<f32>>(
     row_indices: &[i32],
     row_data: &[f32],
@@ -422,7 +468,8 @@ fn diversify_sorted_csr<D: Distance<f32>>(
     dim: usize,
     dist: &D,
     prune_probability: f32,
-) -> Vec<i32> {
+    max_degree: usize,
+) -> Vec<(i32, f32)> {
     let mut retained_indices = Vec::new();
     let mut retained_data = Vec::new();
 
@@ -451,10 +498,16 @@ fn diversify_sorted_csr<D: Distance<f32>>(
         if keep {
             retained_indices.push(j);
             retained_data.push(d_ij);
+            if retained_indices.len() >= max_degree {
+                break;
+            }
         }
     }
 
     retained_indices
+        .into_iter()
+        .zip(retained_data)
+        .collect()
 }
 
 /// Transpose a CSR graph, producing a new CSR with distances.
@@ -565,5 +618,45 @@ mod tests {
         assert_eq!(graph.degree(0), 1);
         assert_eq!(graph.degree(1), 1);
         assert_eq!(graph.degree(2), 1);
+    }
+
+    #[test]
+    fn test_weighted_union_prunes_by_distance_not_vertex_id() {
+        let forward = vec![
+            vec![(4, 0.1), (1, 0.4), (2, 0.3)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ];
+        let reverse = vec![
+            vec![(3, 0.2), (4, 0.9)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ];
+
+        let graph = weighted_union_pruned(&forward, &reverse, 5, 2);
+
+        // Duplicate edge 4 takes max(0.1, 0.9), matching scipy `maximum`,
+        // leaving vertices 3 and 2 as the nearest two edges.
+        assert_eq!(graph.neighbors(0), &[2, 3]);
+    }
+
+    #[test]
+    fn test_weighted_union_filters_edges_and_breaks_ties_by_id() {
+        let forward = vec![
+            vec![(0, 0.0), (-1, 0.1), (3, 0.2), (2, 0.2)],
+            vec![],
+            vec![],
+            vec![],
+        ];
+        let reverse = vec![vec![(1, f32::INFINITY)], vec![], vec![], vec![]];
+
+        let graph = weighted_union_pruned(&forward, &reverse, 4, 1);
+
+        assert_eq!(graph.neighbors(0), &[2]);
+        assert_eq!(graph.num_edges(), 1);
     }
 }

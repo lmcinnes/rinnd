@@ -15,6 +15,89 @@
 const FLOAT32_MAX: f32 = f32::MAX;
 
 // ────────────────────────────────────────────────────────────────
+//  Symmetric signed-int8 distances
+// ────────────────────────────────────────────────────────────────
+
+/// Integer dot product for two symmetrically quantized vectors.
+///
+/// Values are widened before multiplication, so the result is exact for
+/// dimensions up to the practical limits of an `i32` accumulator.
+#[inline]
+pub fn quantized_i8_dot(x: &[i8], y: &[i8]) -> i32 {
+    debug_assert_eq!(x.len(), y.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { quantized_i8_dot_avx2(x, y) };
+        }
+    }
+
+    x.iter()
+        .zip(y)
+        .map(|(&a, &b)| i32::from(a) * i32::from(b))
+        .sum()
+}
+
+/// Alternative angular distance for two symmetrically quantized vectors.
+///
+/// `inv_norm_x` and `inv_norm_y` are precomputed reciprocal L2 norms in the
+/// integer domain. Per-vector quantization scales cancel during cosine
+/// normalization and therefore are not needed in the search loop.
+#[inline]
+pub fn quantized_i8_alternative_dot(
+    x: &[i8],
+    y: &[i8],
+    inv_norm_x: f32,
+    inv_norm_y: f32,
+) -> f32 {
+    let similarity = quantized_i8_dot(x, y) as f32 * inv_norm_x * inv_norm_y;
+    if similarity <= 0.0 {
+        FLOAT32_MAX
+    } else {
+        -similarity.min(1.0).log2()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantized_i8_dot_avx2(x: &[i8], y: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let mut sum = _mm256_setzero_si256();
+    let ones = _mm256_set1_epi16(1);
+    let chunks = x.len() / 32;
+
+    for chunk in 0..chunks {
+        let offset = chunk * 32;
+        let vx = _mm256_loadu_si256(x.as_ptr().add(offset) as *const __m256i);
+        let vy = _mm256_loadu_si256(y.as_ptr().add(offset) as *const __m256i);
+
+        let x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vx));
+        let x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vx));
+        let y_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vy));
+        let y_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vy));
+
+        let products_lo = _mm256_mullo_epi16(x_lo, y_lo);
+        let products_hi = _mm256_mullo_epi16(x_hi, y_hi);
+        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(products_lo, ones));
+        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(products_hi, ones));
+    }
+
+    let hi = _mm256_extracti128_si256::<1>(sum);
+    let lo = _mm256_castsi256_si128(sum);
+    let sum128 = _mm_add_epi32(lo, hi);
+    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32::<0x4E>(sum128));
+    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0xB1>(sum64));
+    let mut result = _mm_cvtsi128_si32(sum32);
+
+    for i in chunks * 32..x.len() {
+        result += i32::from(x[i]) * i32::from(y[i]);
+    }
+    result
+}
+
+// ────────────────────────────────────────────────────────────────
 //  uint8 quantized distances
 // ────────────────────────────────────────────────────────────────
 
@@ -317,6 +400,24 @@ unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quantized_i8_dot_matches_scalar_for_remainders() {
+        for len in [1, 7, 31, 32, 33, 100, 128, 784] {
+            let x: Vec<i8> = (0..len).map(|i| ((i * 37) % 255) as i16 - 127).map(|v| v as i8).collect();
+            let y: Vec<i8> = (0..len).map(|i| ((i * 73 + 11) % 255) as i16 - 127).map(|v| v as i8).collect();
+            let expected: i32 = x.iter().zip(&y).map(|(&a, &b)| i32::from(a) * i32::from(b)).sum();
+            assert_eq!(quantized_i8_dot(&x, &y), expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn test_quantized_i8_alternative_dot_identical() {
+        let x = [12i8, -35, 72, 4, -8];
+        let norm = (quantized_i8_dot(&x, &x) as f32).sqrt();
+        let distance = quantized_i8_alternative_dot(&x, &x, norm.recip(), norm.recip());
+        assert!(distance.abs() < 1e-6, "distance={distance}");
+    }
 
     fn make_codebook_256() -> Vec<f32> {
         // Simple identity codebook: index i → value i as float

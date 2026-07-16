@@ -19,37 +19,112 @@ use super::traits::Distance;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InnerProduct;
 
+#[inline]
+fn scalar_dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    let mut dot = 0.0f32;
+
+    let chunks = a.len() / 4;
+    let remainder = a.len() % 4;
+
+    for i in 0..chunks {
+        let idx = i * 4;
+        dot += a[idx] * b[idx]
+            + a[idx + 1] * b[idx + 1]
+            + a[idx + 2] * b[idx + 2]
+            + a[idx + 3] * b[idx + 3];
+    }
+
+    let start = chunks * 4;
+    for i in 0..remainder {
+        dot += a[start + i] * b[start + i];
+    }
+
+    dot
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(result)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 8;
+    let mut vdot = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let idx = i * 8;
+        let va = _mm256_loadu_ps(a.as_ptr().add(idx));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(idx));
+        vdot = _mm256_fmadd_ps(va, vb, vdot);
+    }
+
+    let mut dot = hsum256_ps(vdot);
+    for i in (chunks * 8)..n {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
+#[inline]
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    scalar_dot(a, b)
+}
+
 impl Distance<f32> for InnerProduct {
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len());
-
-        let mut dot = 0.0f32;
-
-        // Process in chunks of 4 for better pipelining
-        let chunks = a.len() / 4;
-        let remainder = a.len() % 4;
-
-        for i in 0..chunks {
-            let idx = i * 4;
-            dot += a[idx] * b[idx]
-                + a[idx + 1] * b[idx + 1]
-                + a[idx + 2] * b[idx + 2]
-                + a[idx + 3] * b[idx + 3];
-        }
-
-        // Handle remainder
-        let start = chunks * 4;
-        for i in 0..remainder {
-            dot += a[start + i] * b[start + i];
-        }
-
+        let dot = dot_product(a, b);
         // Negate so that higher similarity = lower distance
         -dot
     }
 
     fn name(&self) -> &'static str {
         "inner_product"
+    }
+}
+
+/// Dot distance used by pynndescent for normalized vectors.
+///
+/// Formula: 1 - dot(a, b), clamped to 1.0 when dot <= 0.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dot;
+
+impl Distance<f32> for Dot {
+    #[inline]
+    fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        let dot = dot_product(a, b);
+        if dot <= 0.0 {
+            1.0
+        } else {
+            1.0 - dot
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "dot"
     }
 }
 
@@ -64,27 +139,7 @@ impl DotProduct {
     /// Compute the dot product of two vectors.
     #[inline]
     pub fn compute(a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len());
-
-        let mut dot = 0.0f32;
-
-        let chunks = a.len() / 4;
-        let remainder = a.len() % 4;
-
-        for i in 0..chunks {
-            let idx = i * 4;
-            dot += a[idx] * b[idx]
-                + a[idx + 1] * b[idx + 1]
-                + a[idx + 2] * b[idx + 2]
-                + a[idx + 3] * b[idx + 3];
-        }
-
-        let start = chunks * 4;
-        for i in 0..remainder {
-            dot += a[start + i] * b[start + i];
-        }
-
-        dot
+        dot_product(a, b)
     }
 }
 

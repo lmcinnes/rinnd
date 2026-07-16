@@ -87,6 +87,16 @@ impl FlatTree {
         &self.indices[start..end]
     }
 
+    /// Remap point IDs stored in leaves from an old ID space to a new one.
+    ///
+    /// `old_to_new[old_id]` must contain the corresponding new point ID.
+    pub fn remap_indices(&mut self, old_to_new: &[usize]) {
+        for idx in &mut self.indices {
+            debug_assert!(*idx >= 0 && (*idx as usize) < old_to_new.len());
+            *idx = old_to_new[*idx as usize] as i32;
+        }
+    }
+
     /// Get all leaf boundaries.
     ///
     /// Returns a vector of (start, end) pairs for each leaf.
@@ -203,5 +213,17 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert!(leaves.contains(&(0, 2)));
         assert!(leaves.contains(&(2, 4)));
+    }
+
+    #[test]
+    fn test_remap_indices_preserves_leaf_ranges() {
+        let mut tree = create_test_tree();
+        let children = tree.children.clone();
+
+        tree.remap_indices(&[2, 0, 3, 1]);
+
+        assert_eq!(tree.indices, vec![2, 0, 3, 1]);
+        assert_eq!(tree.children, children);
+        assert_eq!(tree.get_all_leaves(), vec![(0, 2), (2, 4)]);
     }
 }

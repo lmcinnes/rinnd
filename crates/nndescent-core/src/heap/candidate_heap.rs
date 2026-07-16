@@ -150,6 +150,14 @@ impl BoundedHeap {
         (indices, distances)
     }
 
+    /// Extract indices sorted by ascending distance without allocating a
+    /// parallel distance vector.
+    pub fn into_sorted_indices(self) -> Vec<i32> {
+        let mut pairs = self.heap.into_vec();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs.into_iter().map(|(_, idx)| idx).collect()
+    }
+
     /// Clear the heap.
     #[inline]
     pub fn clear(&mut self) {

@@ -46,7 +46,7 @@ pub mod quantized;
 pub use traits::{Distance, HasSquaredForm};
 pub use euclidean::{Euclidean, SquaredEuclidean};
 pub use cosine::Cosine;
-pub use inner_product::InnerProduct;
+pub use inner_product::{InnerProduct, Dot};
 
 // Minkowski family
 pub use minkowski::{Manhattan, Chebyshev, Minkowski, Canberra, BrayCurtis};
@@ -61,7 +61,7 @@ pub use binary::{
 
 // Alternative/proxy distances
 pub use alternatives::{
-    AlternativeCosine, AlternativeDot, AlternativeInnerProduct, ProxyInnerProduct,
+    AlternativeCosine, AlternativeDot, AlternativeInnerProduct, DirectNormalizedCosine, ProxyInnerProduct,
     correct_alternative_cosine, correct_alternative_inner_product,
     true_angular_from_alt_cosine,
 };
@@ -162,7 +162,8 @@ impl Metric {
             Metric::Canberra => Canberra.distance(a, b),
             Metric::BrayCurtis => BrayCurtis.distance(a, b),
             Metric::Cosine => Cosine.distance(a, b),
-            Metric::InnerProduct | Metric::Dot => InnerProduct.distance(a, b),
+            Metric::InnerProduct => InnerProduct.distance(a, b),
+            Metric::Dot => Dot.distance(a, b),
             Metric::Correlation => Correlation.distance(a, b),
             Metric::TrueAngular => TrueAngular.distance(a, b),
             Metric::TSSS => TSSS.distance(a, b),

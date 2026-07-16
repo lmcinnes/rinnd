@@ -1,24 +1,22 @@
-//! Bit-packed visited set for efficient tracking during graph search.
-//!
-//! Uses a single bit per element to track whether a node has been visited,
-//! matching PyNNDescent's visited set implementation.
+//! Epoch-stamped visited set for efficient tracking during graph search.
 
-/// A bit-packed set for tracking visited nodes during search.
+/// A dense epoch-stamped set for tracking visited nodes during search.
 ///
-/// Each bit represents whether the corresponding node index has been visited.
-/// This is much more memory-efficient than a `HashSet` for dense indices.
+/// Clearing normally increments the current epoch instead of writing the full
+/// allocation. The backing storage is reset only when the `u16` epoch wraps.
 #[derive(Clone)]
 pub struct VisitedSet {
-    bits: Vec<u8>,
+    epochs: Vec<u16>,
+    epoch: u16,
     n_elements: usize,
 }
 
 impl VisitedSet {
     /// Create a new visited set that can track `n` elements.
     pub fn new(n: usize) -> Self {
-        let n_bytes = (n >> 3) + 1;
         Self {
-            bits: vec![0u8; n_bytes],
+            epochs: vec![0; n],
+            epoch: 1,
             n_elements: n,
         }
     }
@@ -27,38 +25,35 @@ impl VisitedSet {
     #[inline]
     pub fn is_visited(&self, idx: i32) -> bool {
         debug_assert!(idx >= 0 && (idx as usize) < self.n_elements);
-        let loc = (idx >> 3) as usize;
-        let mask = 1u8 << (idx & 7);
-        (self.bits[loc] & mask) != 0
+        self.epochs[idx as usize] == self.epoch
     }
 
     /// Mark an index as visited.
     #[inline]
     pub fn mark(&mut self, idx: i32) {
         debug_assert!(idx >= 0 && (idx as usize) < self.n_elements);
-        let loc = (idx >> 3) as usize;
-        let mask = 1u8 << (idx & 7);
-        self.bits[loc] |= mask;
+        self.epochs[idx as usize] = self.epoch;
     }
 
     /// Check if visited and mark in one operation.
     /// Returns `true` if the index was already visited, `false` otherwise.
-    ///
-    /// This matches PyNNDescent's `check_and_mark_visited` function.
     #[inline]
     pub fn check_and_mark(&mut self, idx: i32) -> bool {
         debug_assert!(idx >= 0 && (idx as usize) < self.n_elements);
-        let loc = (idx >> 3) as usize;
-        let mask = 1u8 << (idx & 7);
-        let was_visited = (self.bits[loc] & mask) != 0;
-        self.bits[loc] |= mask;
+        let entry = &mut self.epochs[idx as usize];
+        let was_visited = *entry == self.epoch;
+        *entry = self.epoch;
         was_visited
     }
 
-    /// Clear all visited flags.
+    /// Start a new empty generation in constant time except on epoch overflow.
     #[inline]
     pub fn clear(&mut self) {
-        self.bits.fill(0);
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.epochs.fill(0);
+            self.epoch = 1;
+        }
     }
 
     /// Get the number of elements this set can track.
@@ -71,7 +66,7 @@ impl std::fmt::Debug for VisitedSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VisitedSet")
             .field("n_elements", &self.n_elements)
-            .field("n_bytes", &self.bits.len())
+            .field("epoch", &self.epoch)
             .finish()
     }
 }
@@ -136,6 +131,21 @@ mod tests {
             assert!(!visited.check_and_mark(i));
             assert!(visited.is_visited(i));
         }
+    }
+
+    #[test]
+    fn test_clear_handles_epoch_overflow() {
+        let mut visited = VisitedSet::new(16);
+        visited.mark(7);
+        visited.epoch = u16::MAX;
+        visited.epochs[3] = u16::MAX;
+
+        visited.clear();
+
+        assert_eq!(visited.epoch, 1);
+        assert!(visited.epochs.iter().all(|&epoch| epoch == 0));
+        assert!(!visited.is_visited(3));
+        assert!(!visited.is_visited(7));
     }
 
     #[test]

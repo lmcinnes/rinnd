@@ -48,7 +48,7 @@ pub mod index;
 // Re-exports for convenience
 pub use distance::{Distance, Euclidean, SquaredEuclidean, Cosine, InnerProduct, Metric};
 pub use heap::NeighborHeap;
-pub use index::{NNDescentIndex, NNDescentBuilder};
+pub use index::{NNDescentBuilder, NNDescentIndex};
 pub use rng::{TauRand, FastRng};
 pub use visited::VisitedSet;
 

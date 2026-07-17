@@ -373,7 +373,6 @@ dependencies = [
  "bytemuck",
  "criterion",
  "memmap2",
- "nndescent-simd",
  "num-traits",
  "ordered-float",
  "rand",

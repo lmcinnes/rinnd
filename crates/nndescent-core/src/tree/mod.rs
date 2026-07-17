@@ -3,5 +3,5 @@
 mod flat_tree;
 mod builder;
 
-pub use flat_tree::FlatTree;
+pub use flat_tree::{FlatTree, QuantizedFlatTree};
 pub use builder::{build_rp_tree, build_rp_forest, rptree_leaf_array};

@@ -12,6 +12,7 @@ __pycache__/
 *.egg-info/
 dist/
 *.whl
+.venv/
 
 # Benchmark data
 .data/
@@ -22,3 +23,6 @@ dist/
 *.swp
 *.swo
 *~
+
+# Benchmarking
+ann-benchmarks/

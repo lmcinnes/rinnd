@@ -9,4 +9,4 @@ mod neighbor_heap;
 mod candidate_heap;
 
 pub use neighbor_heap::NeighborHeap;
-pub use candidate_heap::{CandidateHeap, BoundedHeap};
+pub use candidate_heap::{BoundedHeap, CandidateHeap};

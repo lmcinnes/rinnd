@@ -39,6 +39,60 @@ pub fn quantized_i8_dot(x: &[i8], y: &[i8]) -> i32 {
         .sum()
 }
 
+/// Reconstruct an inner product for per-dimension symmetric signed-int8 codes.
+///
+/// `scales[i]` is the dequantization scale shared by the query and every
+/// database vector in dimension `i`, so each integer product is multiplied by
+/// `scales[i]²`. This remains correct for negative inner products.
+#[inline]
+pub fn quantized_i8_per_dimension_dot(x: &[i8], y: &[i8], scales: &[f32]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    debug_assert_eq!(x.len(), scales.len());
+    x.iter()
+        .zip(y)
+        .zip(scales)
+        .map(|((&a, &b), &scale)| i32::from(a) as f32 * i32::from(b) as f32 * scale * scale)
+        .sum()
+}
+
+/// Encode one signed SQ4 value in the low four bits.
+///
+/// Values use a biased representation: signed `-7..=7` maps to nibbles
+/// `0..=14`; nibble `15` is reserved and decodes as zero defensively.
+#[inline(always)]
+pub fn encode_signed_i4(value: i8) -> u8 {
+    debug_assert!((-7..=7).contains(&value));
+    (value + 7) as u8
+}
+
+/// Decode one biased signed SQ4 nibble.
+#[inline(always)]
+pub fn decode_signed_i4(nibble: u8) -> i8 {
+    match nibble & 0x0f {
+        15 => 0,
+        value => value as i8 - 7,
+    }
+}
+
+/// Exact integer dot product for two nibble-packed signed SQ4 vectors.
+///
+/// Dimension zero occupies the low nibble, dimension one the high nibble.
+/// `dim` is explicit so an odd final dimension never consumes the padding
+/// nibble.
+#[inline]
+pub fn quantized_i4_dot(x: &[u8], y: &[u8], dim: usize) -> i32 {
+    debug_assert!(x.len() >= dim.div_ceil(2));
+    debug_assert!(y.len() >= dim.div_ceil(2));
+    let mut result = 0i32;
+    for i in 0..dim {
+        let shift = (i & 1) * 4;
+        let a = decode_signed_i4(x[i / 2] >> shift);
+        let b = decode_signed_i4(y[i / 2] >> shift);
+        result += i32::from(a) * i32::from(b);
+    }
+    result
+}
+
 /// Alternative angular distance for two symmetrically quantized vectors.
 ///
 /// `inv_norm_x` and `inv_norm_y` are precomputed reciprocal L2 norms in the
@@ -417,6 +471,34 @@ mod tests {
         let norm = (quantized_i8_dot(&x, &x) as f32).sqrt();
         let distance = quantized_i8_alternative_dot(&x, &x, norm.recip(), norm.recip());
         assert!(distance.abs() < 1e-6, "distance={distance}");
+    }
+
+    #[test]
+    fn test_per_dimension_i8_reconstructs_negative_inner_product() {
+        let x = [2i8, -3, 4];
+        let y = [-5i8, -2, -1];
+        let scales = [0.5f32, 0.25, 2.0];
+        let expected = -10.0 * 0.25 + 6.0 * 0.0625 - 4.0 * 4.0;
+        assert!((quantized_i8_per_dimension_dot(&x, &y, &scales) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_signed_i4_encoding_and_odd_dimension_dot() {
+        for value in -7i8..=7 {
+            assert_eq!(decode_signed_i4(encode_signed_i4(value)), value);
+        }
+        assert_eq!(decode_signed_i4(15), 0);
+
+        let x = [
+            encode_signed_i4(-7) | (encode_signed_i4(3) << 4),
+            encode_signed_i4(-2) | (encode_signed_i4(7) << 4),
+        ];
+        let y = [
+            encode_signed_i4(2) | (encode_signed_i4(-4) << 4),
+            encode_signed_i4(-5) | (encode_signed_i4(-7) << 4),
+        ];
+        // The high nibble of the last byte is padding and must be ignored.
+        assert_eq!(quantized_i4_dot(&x, &y, 3), -14 - 12 + 10);
     }
 
     fn make_codebook_256() -> Vec<f32> {

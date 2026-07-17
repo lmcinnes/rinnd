@@ -22,7 +22,7 @@ fn bench_neighbor_heap_push(c: &mut Criterion) {
                         for _ in 0..k * 2 {
                             let neighbor = (rng.next_int() as usize) % n_points;
                             let dist = (rng.next_int() as f32).abs() / (i32::MAX as f32);
-                            heap.checked_flagged_push(i, dist, neighbor as i32, true);
+                            heap.checked_flagged_push(i, neighbor as i32, dist, true);
                         }
                     }
                     black_box(heap)
@@ -52,13 +52,15 @@ fn bench_neighbor_heap_deheap(c: &mut Criterion) {
                     for _ in 0..k * 2 {
                         let neighbor = (rng.next_int() as usize) % n_points;
                         let dist = (rng.next_int() as f32).abs() / (i32::MAX as f32);
-                        template_heap.checked_flagged_push(i, dist, neighbor as i32, true);
+                        template_heap.checked_flagged_push(i, neighbor as i32, dist, true);
                     }
                 }
                 
                 bench.iter(|| {
-                    let mut heap = template_heap.clone();
-                    heap.deheap_sort();
+                    let heap = template_heap.clone();
+                    for point in 0..n_points {
+                        black_box(heap.deheap_sort(point));
+                    }
                     black_box(heap)
                 })
             },

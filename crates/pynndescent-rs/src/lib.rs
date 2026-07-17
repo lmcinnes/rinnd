@@ -7,6 +7,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use nndescent_core::index::{NNDescentBuilder, NNDescentIndex};
 use nndescent_core::distance::*;
@@ -16,7 +17,8 @@ use nndescent_core::distance::quantized::{
     quantized_u8_sq_euclidean,
 };
 use nndescent_core::graph::SearchGraph;
-use nndescent_core::search::{SearchStats, SearchWorkspace};
+use nndescent_core::search::SearchWorkspace;
+use nndescent_core::tree::{FlatTree, QuantizedFlatTree};
 
 /// NNDescent index for approximate nearest neighbor search.
 ///
@@ -77,30 +79,33 @@ trait AnyIndex: Send + Sync {
     fn query(&self, queries: &[f32], n_queries: usize, k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>);
     fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>);
     fn query_one_indices(&self, query: &[f32], k: usize, epsilon: f32) -> Vec<i32>;
-    fn query_one_with_stats(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>, u64);
-    fn query_one_with_profile(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>, SearchStats);
-    fn query_one_on_graph_with_stats(
+    fn query_one_quantized_widths(
         &self,
-        query: &[f32],
-        k: usize,
-        epsilon: f32,
-        indptr: &[i32],
-        indices: &[i32],
-        min_distance: f32,
-    ) -> PyResult<(Vec<i32>, Vec<f32>, u64)>;
-    fn query_one_on_graph_with_profile(
-        &self,
-        query: &[f32],
-        k: usize,
-        epsilon: f32,
-        indptr: &[i32],
-        indices: &[i32],
-        min_distance: f32,
-    ) -> PyResult<(Vec<i32>, Vec<f32>, SearchStats)>;
+        _query: &[f32],
+        _k: usize,
+        _epsilon: f32,
+        _candidate_width: usize,
+        _rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        Err(PyValueError::new_err(
+            "query-time quantized widths require a quantized cosine_distance_mode",
+        ))
+    }
     fn neighbor_indices(&self) -> &[i32];
     fn neighbor_distances(&self) -> &[f32];
     fn search_graph_original_order(&self) -> SearchGraph;
     fn search_graph_min_distance(&self) -> f32;
+    fn export_search_tree(&self) -> Option<FlatTree>;
+    fn storage_info(&self) -> (&'static str, usize, usize, usize, f64);
+    fn quantized_tree_storage_info(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (0, 0, 0, 0, 0, 0)
+    }
+    fn retained_fp32_tree_topology_bytes(&self) -> usize {
+        0
+    }
+    fn released_fp32_data_bytes(&self) -> usize {
+        0
+    }
 }
 
 struct AnyIndexWithWorkspace<D: Distance<f32> + Send + Sync> {
@@ -114,49 +119,174 @@ struct QuantizedI8Index {
     inv_norms: Vec<f32>,
     workspace: Mutex<SearchWorkspace>,
     query_scratch: Mutex<Vec<i8>>,
+    candidate_width: usize,
     rerank_width: usize,
+    encoding: QuantizedI8Encoding,
+    global_multiplier: f32,
+    global_dequant_scale: f32,
+    quantized_trees: Vec<QuantizedFlatTree>,
+    released_fp32_tree_bytes: usize,
+    released_fp32_data_bytes: usize,
+    encode_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuantizedI8Encoding {
+    PerVectorCosine,
+    GlobalSymmetric,
+    PerVectorSymmetric,
 }
 
 impl QuantizedI8Index {
-    fn new(index: NNDescentIndex<DirectNormalizedCosine>, rerank_width: usize) -> Self {
+    fn new(
+        mut index: NNDescentIndex<DirectNormalizedCosine>,
+        candidate_width: usize,
+        rerank_width: usize,
+        encoding: QuantizedI8Encoding,
+        quantize_trees: bool,
+    ) -> Self {
+        let encode_start = Instant::now();
         let dim = index.dim;
         let mut quantized_data = Vec::with_capacity(index.data.len());
         let mut inv_norms = Vec::with_capacity(index.n_points);
+        let global_max_abs = index
+            .data
+            .iter()
+            .fold(0.0f32, |value, &x| value.max(x.abs()));
+        let global_multiplier = if global_max_abs > 0.0 {
+            127.0 / global_max_abs
+        } else {
+            0.0
+        };
+        let global_dequant_scale = if global_multiplier > 0.0 {
+            global_multiplier.recip()
+        } else {
+            0.0
+        };
+
         for row in index.data.chunks_exact(dim) {
-            let max_abs = row.iter().fold(0.0f32, |value, &x| value.max(x.abs()));
-            let multiplier = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+            let multiplier = match encoding {
+                QuantizedI8Encoding::PerVectorCosine | QuantizedI8Encoding::PerVectorSymmetric => {
+                    let max_abs = row.iter().fold(0.0f32, |value, &x| value.max(x.abs()));
+                    if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 }
+                }
+                QuantizedI8Encoding::GlobalSymmetric => global_multiplier,
+            };
             let start = quantized_data.len();
-            quantized_data.extend(
-                row.iter()
-                    .map(|&x| (x * multiplier).round().clamp(-127.0, 127.0) as i8),
-            );
-            let norm_sq: i32 = quantized_data[start..]
-                .iter()
-                .map(|&x| i32::from(x) * i32::from(x))
-                .sum();
-            inv_norms.push(if norm_sq > 0 {
-                (norm_sq as f32).sqrt().recip()
-            } else {
-                0.0
-            });
+            quantized_data.extend(row.iter().map(|&x| {
+                (x * multiplier).round().clamp(-127.0, 127.0) as i8
+            }));
+            match encoding {
+                QuantizedI8Encoding::PerVectorCosine => {
+                    let norm_sq: i32 = quantized_data[start..]
+                        .iter().map(|&x| i32::from(x) * i32::from(x)).sum();
+                    inv_norms.push(if norm_sq > 0 { (norm_sq as f32).sqrt().recip() } else { 0.0 });
+                }
+                QuantizedI8Encoding::PerVectorSymmetric => {
+                    inv_norms.push(if multiplier > 0.0 { multiplier.recip() } else { 0.0 });
+                }
+                QuantizedI8Encoding::GlobalSymmetric => inv_norms.push(global_dequant_scale),
+            }
         }
 
         let n_points = index.n_points;
         let initial_k = index.n_neighbors.max(1);
+        let released_fp32_tree_bytes = if quantize_trees {
+            index.search_trees.iter().map(|tree| {
+                tree.hyperplanes.len() * std::mem::size_of::<f32>()
+                    + tree.offsets.len() * std::mem::size_of::<f32>()
+                    + tree.children.len() * std::mem::size_of::<[i32; 2]>()
+                    + tree.indices.len() * std::mem::size_of::<i32>()
+            }).sum()
+        } else {
+            0
+        };
+        let quantized_trees = if quantize_trees {
+            std::mem::take(&mut index.search_trees)
+                .into_iter()
+                .map(QuantizedFlatTree::from_owned_flat_tree)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let release_fp32_data = quantize_trees && rerank_width == 0;
+        let released_fp32_data_bytes = if release_fp32_data {
+            index.data.len() * std::mem::size_of::<f32>()
+        } else {
+            0
+        };
+        if release_fp32_data {
+            drop(std::mem::take(&mut index.data));
+        }
         Self {
             index,
             quantized_data,
             inv_norms,
             workspace: Mutex::new(SearchWorkspace::new(n_points, initial_k)),
             query_scratch: Mutex::new(vec![0; dim]),
+            candidate_width,
             rerank_width,
+            encoding,
+            global_multiplier,
+            global_dequant_scale,
+            quantized_trees,
+            released_fp32_tree_bytes,
+            released_fp32_data_bytes,
+            encode_seconds: encode_start.elapsed().as_secs_f64(),
         }
     }
 
-    fn query_one_quantized(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
-        let mut quantized_query = self.query_scratch.lock().expect("quantized query mutex poisoned");
-        let max_abs = query.iter().fold(0.0f32, |value, &x| value.max(x.abs()));
-        let multiplier = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+    #[inline]
+    fn exact_rerank_requested(k: usize, candidate_width: usize, rerank_width: usize) -> bool {
+        if candidate_width == 0 {
+            rerank_width > k
+        } else {
+            rerank_width > 0
+        }
+    }
+
+    fn ensure_rerank_available(
+        &self,
+        k: usize,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<()> {
+        if self.released_fp32_data_bytes > 0
+            && Self::exact_rerank_requested(k, candidate_width, rerank_width)
+        {
+            return Err(PyValueError::new_err(
+                "exact reranking is unavailable because FP32 vector data was released",
+            ));
+        }
+        Ok(())
+    }
+
+    fn tree_query_scale(&self, query: &[f32]) -> f32 {
+        match self.encoding {
+            QuantizedI8Encoding::PerVectorCosine | QuantizedI8Encoding::PerVectorSymmetric => {
+                let max_abs = query.iter().fold(0.0f32, |value, &x| value.max(x.abs()));
+                if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 }
+            }
+            QuantizedI8Encoding::GlobalSymmetric => self.global_dequant_scale,
+        }
+    }
+
+    fn routed_trees(&self) -> Option<&[QuantizedFlatTree]> {
+        if self.quantized_trees.is_empty() {
+            None
+        } else {
+            Some(&self.quantized_trees)
+        }
+    }
+
+    fn quantize_query(&self, query: &[f32], quantized_query: &mut Vec<i8>) -> f32 {
+        let multiplier = match self.encoding {
+            QuantizedI8Encoding::PerVectorCosine | QuantizedI8Encoding::PerVectorSymmetric => {
+                let max_abs = query.iter().fold(0.0f32, |value, &x| value.max(x.abs()));
+                if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 }
+            }
+            QuantizedI8Encoding::GlobalSymmetric => self.global_multiplier,
+        };
         quantized_query.resize(query.len(), 0);
         for (output, &value) in quantized_query.iter_mut().zip(query) {
             *output = (value * multiplier).round().clamp(-127.0, 127.0) as i8;
@@ -165,11 +295,40 @@ impl QuantizedI8Index {
             .iter()
             .map(|&x| i32::from(x) * i32::from(x))
             .sum();
-        let query_inv_norm = if norm_sq > 0 {
-            (norm_sq as f32).sqrt().recip()
-        } else {
-            0.0
+        let query_inv_norm = match self.encoding {
+            QuantizedI8Encoding::PerVectorCosine if norm_sq > 0 => {
+                (norm_sq as f32).sqrt().recip()
+            }
+            QuantizedI8Encoding::PerVectorCosine => 0.0,
+            QuantizedI8Encoding::GlobalSymmetric => self.global_dequant_scale,
+            QuantizedI8Encoding::PerVectorSymmetric => if multiplier > 0.0 { multiplier.recip() } else { 0.0 },
         };
+        query_inv_norm
+    }
+
+    fn query_one_quantized(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+    ) -> (Vec<i32>, Vec<f32>) {
+        self.query_one_quantized_widths(
+            query, k, epsilon, self.candidate_width, self.rerank_width,
+        )
+    }
+
+    fn query_one_quantized_widths(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> (Vec<i32>, Vec<f32>) {
+        // Always acquire these mutexes in scratch-then-workspace order. The
+        // scratch guard stays alive because the traversal borrows its buffer.
+        let mut quantized_query = self.query_scratch.lock().expect("quantized query mutex poisoned");
+        let query_inv_norm = self.quantize_query(query, &mut quantized_query);
         let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
         self.index.query_one_quantized_i8_with_workspace(
             query,
@@ -177,12 +336,16 @@ impl QuantizedI8Index {
             query_inv_norm,
             &self.quantized_data,
             &self.inv_norms,
+            self.routed_trees(),
+            self.tree_query_scale(query),
             k,
-            self.rerank_width,
+            candidate_width,
+            rerank_width,
             epsilon,
             &mut workspace,
         )
     }
+
 }
 
 impl AnyIndex for QuantizedI8Index {
@@ -205,49 +368,17 @@ impl AnyIndex for QuantizedI8Index {
         self.query_one_quantized(query, k, epsilon).0
     }
 
-    fn query_one_with_stats(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>, u64) {
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        let (indices, distances, stats) = self.index.query_one_with_workspace_stats(query, k, epsilon, &mut workspace);
-        (indices, distances, stats.distance_evaluations)
-    }
-
-    fn query_one_with_profile(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>, SearchStats) {
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        self.index.query_one_with_workspace_stats(query, k, epsilon, &mut workspace)
-    }
-
-    fn query_one_on_graph_with_stats(
+    fn query_one_quantized_widths(
         &self,
         query: &[f32],
         k: usize,
         epsilon: f32,
-        indptr: &[i32],
-        indices: &[i32],
-        min_distance: f32,
-    ) -> PyResult<(Vec<i32>, Vec<f32>, u64)> {
-        validate_external_graph(&self.index, indptr, indices)?;
-        let graph = SearchGraph { indptr: indptr.to_vec(), indices: indices.to_vec(), n_vertices: self.index.n_points };
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        let (ids, distances, stats) = self.index.query_one_on_graph_with_workspace_stats(
-            query, k, epsilon, &graph, min_distance, &mut workspace,
-        );
-        Ok((ids, distances, stats.distance_evaluations))
-    }
-
-    fn query_one_on_graph_with_profile(
-        &self,
-        query: &[f32],
-        k: usize,
-        epsilon: f32,
-        indptr: &[i32],
-        indices: &[i32],
-        min_distance: f32,
-    ) -> PyResult<(Vec<i32>, Vec<f32>, SearchStats)> {
-        validate_external_graph(&self.index, indptr, indices)?;
-        let graph = SearchGraph { indptr: indptr.to_vec(), indices: indices.to_vec(), n_vertices: self.index.n_points };
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        Ok(self.index.query_one_on_graph_with_workspace_stats(
-            query, k, epsilon, &graph, min_distance, &mut workspace,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        self.ensure_rerank_available(k, candidate_width, rerank_width)?;
+        Ok(self.query_one_quantized_widths(
+            query, k, epsilon, candidate_width, rerank_width,
         ))
     }
 
@@ -255,40 +386,58 @@ impl AnyIndex for QuantizedI8Index {
     fn neighbor_distances(&self) -> &[f32] { &self.index.neighbor_distances }
     fn search_graph_original_order(&self) -> SearchGraph { self.index.search_graph_original_order() }
     fn search_graph_min_distance(&self) -> f32 { self.index.min_distance }
-}
-
-fn validate_external_graph<D: Distance<f32>>(
-    index: &NNDescentIndex<D>,
-    indptr: &[i32],
-    indices: &[i32],
-) -> PyResult<()> {
-    if indptr.len() != index.n_points + 1 || indptr.first() != Some(&0) {
-        return Err(PyValueError::new_err("invalid external graph indptr"));
+    fn export_search_tree(&self) -> Option<FlatTree> { self.index.export_search_tree() }
+    fn storage_info(&self) -> (&'static str, usize, usize, usize, f64) {
+        let encoding = match self.encoding {
+            QuantizedI8Encoding::PerVectorCosine => "int8_per_vector_cosine",
+            QuantizedI8Encoding::GlobalSymmetric => "sq8u_global_symmetric",
+            QuantizedI8Encoding::PerVectorSymmetric => "sq8p_per_vector_symmetric",
+        };
+        let code_bytes = self.quantized_data.len();
+        let metadata_bytes = match self.encoding {
+            QuantizedI8Encoding::PerVectorCosine | QuantizedI8Encoding::PerVectorSymmetric =>
+                self.inv_norms.len() * std::mem::size_of::<f32>(),
+            QuantizedI8Encoding::GlobalSymmetric =>
+                self.inv_norms.len() * std::mem::size_of::<f32>(),
+        };
+        (
+            encoding,
+            code_bytes,
+            metadata_bytes,
+            self.index.retained_fp32_bytes(),
+            self.encode_seconds,
+        )
     }
-    if *indptr.last().unwrap_or(&-1) != indices.len() as i32
-        || indptr.windows(2).any(|pair| pair[1] < pair[0])
-        || indices.iter().any(|&idx| idx < 0 || idx as usize >= index.n_points)
-    {
-        return Err(PyValueError::new_err("invalid external graph indices"));
-    }
-    Ok(())
-}
 
-fn stats_to_pydict<'py>(py: Python<'py>, stats: SearchStats) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new_bound(py);
-    d.set_item("distance_evaluations", stats.distance_evaluations)?;
-    d.set_item("tree_seed_candidates", stats.tree_seed_candidates)?;
-    d.set_item("random_seed_candidates", stats.random_seed_candidates)?;
-    d.set_item("neighbor_candidates_scanned", stats.neighbor_candidates_scanned)?;
-    d.set_item("visited_checks", stats.visited_checks)?;
-    d.set_item("visited_already_seen", stats.visited_already_seen)?;
-    d.set_item("seed_pushes", stats.seed_pushes)?;
-    d.set_item("seed_pops", stats.seed_pops)?;
-    d.set_item("result_push_attempts", stats.result_push_attempts)?;
-    d.set_item("result_push_inserted", stats.result_push_inserted)?;
-    d.set_item("bound_updates", stats.bound_updates)?;
-    d.set_item("main_loop_iterations", stats.main_loop_iterations)?;
-    Ok(d)
+    fn quantized_tree_storage_info(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let code_bytes = self.quantized_trees.iter().map(QuantizedFlatTree::code_bytes).sum();
+        let scale_bytes = self.quantized_trees.iter().map(QuantizedFlatTree::scale_bytes).sum();
+        let offset_bytes = self.quantized_trees.iter().map(QuantizedFlatTree::offset_bytes).sum();
+        let topology_bytes = self.quantized_trees.iter().map(|tree| {
+            tree.children.len() * std::mem::size_of::<[i32; 2]>()
+                + tree.indices.len() * std::mem::size_of::<i32>()
+        }).sum();
+        (
+            code_bytes,
+            scale_bytes,
+            offset_bytes,
+            topology_bytes,
+            0,
+            self.released_fp32_tree_bytes,
+        )
+    }
+
+    fn retained_fp32_tree_topology_bytes(&self) -> usize {
+        self.index.search_trees.iter().map(|tree| {
+            tree.children.len() * std::mem::size_of::<[i32; 2]>()
+                + tree.indices.len() * std::mem::size_of::<i32>()
+        }).sum()
+    }
+
+    fn released_fp32_data_bytes(&self) -> usize {
+        self.released_fp32_data_bytes
+    }
+
 }
 
 impl<D: Distance<f32> + Send + Sync> AnyIndexWithWorkspace<D> {
@@ -318,136 +467,6 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
         self.index
             .query_one_indices_with_workspace(query, k, epsilon, &mut workspace)
     }
-    fn query_one_with_stats(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>, u64) {
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        let (indices, distances, stats) = self
-            .index
-            .query_one_with_workspace_stats(query, k, epsilon, &mut workspace);
-        (indices, distances, stats.distance_evaluations)
-    }
-    fn query_one_with_profile(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>, SearchStats) {
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        self.index
-            .query_one_with_workspace_stats(query, k, epsilon, &mut workspace)
-    }
-    fn query_one_on_graph_with_stats(
-        &self,
-        query: &[f32],
-        k: usize,
-        epsilon: f32,
-        indptr: &[i32],
-        indices: &[i32],
-        min_distance: f32,
-    ) -> PyResult<(Vec<i32>, Vec<f32>, u64)> {
-        if indptr.len() != self.index.n_points + 1 {
-            return Err(PyValueError::new_err(format!(
-                "indptr length {} does not match n_points+1 ({})",
-                indptr.len(),
-                self.index.n_points + 1
-            )));
-        }
-        if indptr[0] != 0 {
-            return Err(PyValueError::new_err("indptr[0] must be 0"));
-        }
-        if *indptr.last().unwrap_or(&-1) != indices.len() as i32 {
-            return Err(PyValueError::new_err(format!(
-                "indptr[-1]={} does not match indices length {}",
-                indptr[indptr.len() - 1],
-                indices.len()
-            )));
-        }
-        for w in indptr.windows(2) {
-            if w[1] < w[0] {
-                return Err(PyValueError::new_err("indptr must be non-decreasing"));
-            }
-        }
-        for &idx in indices {
-            if idx < 0 || idx as usize >= self.index.n_points {
-                return Err(PyValueError::new_err(format!(
-                    "graph contains out-of-range neighbor index {}",
-                    idx
-                )));
-            }
-        }
-
-        let graph = SearchGraph {
-            indptr: indptr.to_vec(),
-            indices: indices.to_vec(),
-            n_vertices: self.index.n_points,
-        };
-
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        let (out_indices, out_distances, stats) = self
-            .index
-            .query_one_on_graph_with_workspace_stats(
-                query,
-                k,
-                epsilon,
-                &graph,
-                min_distance,
-                &mut workspace,
-            );
-        Ok((out_indices, out_distances, stats.distance_evaluations))
-    }
-    fn query_one_on_graph_with_profile(
-        &self,
-        query: &[f32],
-        k: usize,
-        epsilon: f32,
-        indptr: &[i32],
-        indices: &[i32],
-        min_distance: f32,
-    ) -> PyResult<(Vec<i32>, Vec<f32>, SearchStats)> {
-        if indptr.len() != self.index.n_points + 1 {
-            return Err(PyValueError::new_err(format!(
-                "indptr length {} does not match n_points+1 ({})",
-                indptr.len(),
-                self.index.n_points + 1
-            )));
-        }
-        if indptr[0] != 0 {
-            return Err(PyValueError::new_err("indptr[0] must be 0"));
-        }
-        if *indptr.last().unwrap_or(&-1) != indices.len() as i32 {
-            return Err(PyValueError::new_err(format!(
-                "indptr[-1]={} does not match indices length {}",
-                indptr[indptr.len() - 1],
-                indices.len()
-            )));
-        }
-        for w in indptr.windows(2) {
-            if w[1] < w[0] {
-                return Err(PyValueError::new_err("indptr must be non-decreasing"));
-            }
-        }
-        for &idx in indices {
-            if idx < 0 || idx as usize >= self.index.n_points {
-                return Err(PyValueError::new_err(format!(
-                    "graph contains out-of-range neighbor index {}",
-                    idx
-                )));
-            }
-        }
-
-        let graph = SearchGraph {
-            indptr: indptr.to_vec(),
-            indices: indices.to_vec(),
-            n_vertices: self.index.n_points,
-        };
-
-        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
-        let out = self
-            .index
-            .query_one_on_graph_with_workspace_stats(
-                query,
-                k,
-                epsilon,
-                &graph,
-                min_distance,
-                &mut workspace,
-            );
-        Ok(out)
-    }
     fn neighbor_indices(&self) -> &[i32] {
         &self.index.neighbor_indices
     }
@@ -460,17 +479,31 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
     fn search_graph_min_distance(&self) -> f32 {
         self.index.min_distance
     }
+    fn export_search_tree(&self) -> Option<FlatTree> {
+        self.index.export_search_tree()
+    }
+    fn storage_info(&self) -> (&'static str, usize, usize, usize, f64) {
+        (
+            "fp32",
+            self.index.data.len() * std::mem::size_of::<f32>(),
+            0,
+            0,
+            0.0,
+        )
+    }
 }
 
 #[pymethods]
 impl PyNNDescent {
     #[new]
-    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_rerank_width=0))]
+    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none"))]
     fn new(
         data: PyReadonlyArray2<f32>,
         metric: &str,
         n_neighbors: usize,
         n_trees: Option<usize>,
+        n_search_trees: usize,
+        search_tree_leaf_budget: usize,
         leaf_size: Option<usize>,
         max_candidates: Option<usize>,
         n_iters: Option<usize>,
@@ -481,11 +514,19 @@ impl PyNNDescent {
         verbose: bool,
         normalize: bool,
         cosine_distance_mode: &str,
+        quantized_candidate_width: usize,
         quantized_rerank_width: usize,
+        tree_quantization: &str,
     ) -> PyResult<Self> {
         let shape = data.shape();
         let n_points = shape[0];
         let dim = shape[1];
+
+        if quantized_candidate_width > 0 && quantized_rerank_width > quantized_candidate_width {
+            return Err(PyValueError::new_err(
+                "quantized_rerank_width must not exceed quantized_candidate_width when candidate width is explicit",
+            ));
+        }
 
         // Copy data to owned vec in C-contiguous (row-major) order
         let mut data_vec: Vec<f32> = if data.is_c_contiguous() {
@@ -507,19 +548,38 @@ impl PyNNDescent {
 
         // For cosine, optional pre-normalization lets query-time distance use a dot-only path.
         let normalize_cosine = normalize && matches!(parsed_metric, Metric::Cosine);
-        let (direct_cosine, quantized_i8) = match cosine_distance_mode {
-            "log" => (false, false),
-            "direct" => (true, false),
-            "int8" => (true, true),
+        let (direct_cosine, quantized_encoding) = match cosine_distance_mode {
+            "log" => (false, None),
+            "direct" => (true, None),
+            "int8" => (true, Some(QuantizedI8Encoding::PerVectorCosine)),
+            "sq8u" => (true, Some(QuantizedI8Encoding::GlobalSymmetric)),
+            "sq8p" => (true, Some(QuantizedI8Encoding::PerVectorSymmetric)),
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "Unknown cosine_distance_mode: {other}; expected 'log', 'direct', or 'int8'"
+                    "Unknown cosine_distance_mode: {other}; expected 'log', 'direct', 'int8', 'sq8u', or 'sq8p'"
                 )))
             }
         };
+        let quantize_trees = match tree_quantization {
+            "none" => false,
+            "int8" => true,
+            other => return Err(PyValueError::new_err(format!(
+                "Unknown tree_quantization: {other}; expected 'none' or 'int8'"
+            ))),
+        };
+        if quantize_trees && quantized_encoding.is_none() {
+            return Err(PyValueError::new_err(
+                "tree_quantization='int8' is available only with a quantized cosine_distance_mode",
+            ));
+        }
+        if quantize_trees && matches!(quantized_encoding, Some(QuantizedI8Encoding::GlobalSymmetric)) {
+            return Err(PyValueError::new_err(
+                "tree_quantization='int8' is incompatible with cosine_distance_mode='sq8u'; use tree_quantization='none'",
+            ));
+        }
         if direct_cosine && !normalize_cosine {
             return Err(PyValueError::new_err(
-                "direct and int8 cosine modes require metric='cosine' and normalize=True",
+                "direct and quantized cosine modes require metric='cosine' and normalize=True",
             ));
         }
         if normalize_cosine {
@@ -534,10 +594,14 @@ impl PyNNDescent {
             parsed_metric,
             normalize_cosine,
             direct_cosine,
-            quantized_i8,
+            quantized_encoding,
+            quantized_candidate_width,
             quantized_rerank_width,
+            quantize_trees,
             n_neighbors,
             n_trees,
+            n_search_trees,
+            search_tree_leaf_budget,
             leaf_size,
             max_candidates,
             n_iters,
@@ -702,15 +766,23 @@ impl PyNNDescent {
         Ok(PyArray1::from_vec_bound(py, indices))
     }
 
-    /// Query a single vector and return indices plus number of distance evaluations.
-    #[pyo3(signature = (query, k=10, epsilon=0.1))]
-    fn query_one_indices_with_stats<'py>(
+    /// Query a quantized index with independent query-time candidate and FP32
+    /// rerank widths. The index and graph are not rebuilt.
+    ///
+    /// `candidate_width=0` selects legacy compatibility semantics:
+    /// `max(k, rerank_width)`. An explicit candidate width must be at least
+    /// `k`; rerank width must be zero or in `k..=candidate_width`.
+    #[pyo3(signature = (query, k=10, epsilon=0.1, candidate_width=0, rerank_width=0))]
+    fn query_one_indices_quantized<'py>(
         &self,
         py: Python<'py>,
         query: numpy::PyReadonlyArray1<f32>,
         k: usize,
         epsilon: f32,
-    ) -> PyResult<(Bound<'py, PyArray1<i32>>, u64)> {
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<Bound<'py, PyArray1<i32>>> {
+        validate_quantized_widths(k, candidate_width, rerank_width)?;
         let qdim = query.shape()[0];
         if qdim != self.dim {
             return Err(PyValueError::new_err(format!(
@@ -720,154 +792,20 @@ impl PyNNDescent {
         }
 
         let query_slice = query.as_slice()?;
-        let (indices, _distances, dist_evals) = if self.normalize {
-            let mut scratch = self
-                .query_scratch
-                .lock()
-                .expect("query scratch mutex poisoned");
-            if scratch.len() != qdim {
-                scratch.resize(qdim, 0.0);
-            }
+        let result = if self.normalize {
+            let mut scratch = self.query_scratch.lock().expect("query scratch mutex poisoned");
+            if scratch.len() != qdim { scratch.resize(qdim, 0.0); }
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| self.index_data.query_one_with_stats(&scratch[..], k, epsilon))
+            py.allow_threads(|| self.index_data.query_one_quantized_widths(
+                &scratch[..], k, epsilon, candidate_width, rerank_width,
+            ))
         } else {
-            py.allow_threads(|| self.index_data.query_one_with_stats(query_slice, k, epsilon))
-        };
-
-        Ok((PyArray1::from_vec_bound(py, indices), dist_evals))
-    }
-
-    /// Query a single vector and return indices plus detailed search-loop counters.
-    #[pyo3(signature = (query, k=10, epsilon=0.1))]
-    fn query_one_indices_with_profile<'py>(
-        &self,
-        py: Python<'py>,
-        query: numpy::PyReadonlyArray1<f32>,
-        k: usize,
-        epsilon: f32,
-    ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyDict>)> {
-        let qdim = query.shape()[0];
-        if qdim != self.dim {
-            return Err(PyValueError::new_err(format!(
-                "Query dimension {} does not match data dimension {}",
-                qdim, self.dim
-            )));
-        }
-
-        let query_slice = query.as_slice()?;
-        let (indices, _distances, stats) = if self.normalize {
-            let mut scratch = self
-                .query_scratch
-                .lock()
-                .expect("query scratch mutex poisoned");
-            if scratch.len() != qdim {
-                scratch.resize(qdim, 0.0);
-            }
-            scratch.copy_from_slice(query_slice);
-            normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| self.index_data.query_one_with_profile(&scratch[..], k, epsilon))
-        } else {
-            py.allow_threads(|| self.index_data.query_one_with_profile(query_slice, k, epsilon))
-        };
-
-        Ok((PyArray1::from_vec_bound(py, indices), stats_to_pydict(py, stats)?))
-    }
-
-    /// Query on a caller-supplied CSR search graph and return indices + distance eval count.
-    #[pyo3(signature = (query, graph_indptr, graph_indices, k=10, epsilon=0.1, min_distance=0.0))]
-    fn query_one_indices_on_graph_with_stats<'py>(
-        &self,
-        py: Python<'py>,
-        query: numpy::PyReadonlyArray1<f32>,
-        graph_indptr: numpy::PyReadonlyArray1<i32>,
-        graph_indices: numpy::PyReadonlyArray1<i32>,
-        k: usize,
-        epsilon: f32,
-        min_distance: f32,
-    ) -> PyResult<(Bound<'py, PyArray1<i32>>, u64)> {
-        let qdim = query.shape()[0];
-        if qdim != self.dim {
-            return Err(PyValueError::new_err(format!(
-                "Query dimension {} does not match data dimension {}",
-                qdim, self.dim
-            )));
-        }
-
-        let indptr = graph_indptr.as_slice()?;
-        let indices = graph_indices.as_slice()?;
-        let query_slice = query.as_slice()?;
-
-        let (out_indices, _out_distances, dist_evals) = if self.normalize {
-            let mut scratch = self
-                .query_scratch
-                .lock()
-                .expect("query scratch mutex poisoned");
-            if scratch.len() != qdim {
-                scratch.resize(qdim, 0.0);
-            }
-            scratch.copy_from_slice(query_slice);
-            normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| {
-                self.index_data
-                    .query_one_on_graph_with_stats(&scratch[..], k, epsilon, indptr, indices, min_distance)
-            })?
-        } else {
-            py.allow_threads(|| {
-                self.index_data
-                    .query_one_on_graph_with_stats(query_slice, k, epsilon, indptr, indices, min_distance)
-            })?
-        };
-
-        Ok((PyArray1::from_vec_bound(py, out_indices), dist_evals))
-    }
-
-    /// Query on a caller-supplied CSR search graph and return indices + detailed counters.
-    #[pyo3(signature = (query, graph_indptr, graph_indices, k=10, epsilon=0.1, min_distance=0.0))]
-    fn query_one_indices_on_graph_with_profile<'py>(
-        &self,
-        py: Python<'py>,
-        query: numpy::PyReadonlyArray1<f32>,
-        graph_indptr: numpy::PyReadonlyArray1<i32>,
-        graph_indices: numpy::PyReadonlyArray1<i32>,
-        k: usize,
-        epsilon: f32,
-        min_distance: f32,
-    ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyDict>)> {
-        let qdim = query.shape()[0];
-        if qdim != self.dim {
-            return Err(PyValueError::new_err(format!(
-                "Query dimension {} does not match data dimension {}",
-                qdim, self.dim
-            )));
-        }
-
-        let indptr = graph_indptr.as_slice()?;
-        let indices = graph_indices.as_slice()?;
-        let query_slice = query.as_slice()?;
-
-        let (out_indices, _out_distances, stats) = if self.normalize {
-            let mut scratch = self
-                .query_scratch
-                .lock()
-                .expect("query scratch mutex poisoned");
-            if scratch.len() != qdim {
-                scratch.resize(qdim, 0.0);
-            }
-            scratch.copy_from_slice(query_slice);
-            normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| {
-                self.index_data
-                    .query_one_on_graph_with_profile(&scratch[..], k, epsilon, indptr, indices, min_distance)
-            })?
-        } else {
-            py.allow_threads(|| {
-                self.index_data
-                    .query_one_on_graph_with_profile(query_slice, k, epsilon, indptr, indices, min_distance)
-            })?
-        };
-
-        Ok((PyArray1::from_vec_bound(py, out_indices), stats_to_pydict(py, stats)?))
+            py.allow_threads(|| self.index_data.query_one_quantized_widths(
+                query_slice, k, epsilon, candidate_width, rerank_width,
+            ))
+        }?;
+        Ok(PyArray1::from_vec_bound(py, result.0))
     }
 
     /// Export current search graph in CSR format.
@@ -883,6 +821,46 @@ impl PyNNDescent {
             PyArray1::from_vec_bound(py, graph.indices),
             min_distance,
         ))
+    }
+
+    /// Return search-representation storage and encoding metadata.
+    fn storage_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let (encoding, code_bytes, metadata_bytes, retained_fp32_bytes, encode_seconds) =
+            self.index_data.storage_info();
+        let info = PyDict::new_bound(py);
+        info.set_item("encoding", encoding)?;
+        info.set_item("code_bytes", code_bytes)?;
+        info.set_item("metadata_bytes", metadata_bytes)?;
+        info.set_item("retained_fp32_bytes", retained_fp32_bytes)?;
+        info.set_item("encode_seconds", encode_seconds)?;
+        let (tree_code_bytes, tree_scale_bytes, tree_offset_bytes, tree_topology_bytes,
+            hypothetical_releasable_fp32_tree_bytes, released_fp32_tree_bytes) =
+            self.index_data.quantized_tree_storage_info();
+        info.set_item("tree_code_bytes", tree_code_bytes)?;
+        info.set_item("tree_scale_bytes", tree_scale_bytes)?;
+        info.set_item("tree_offset_bytes", tree_offset_bytes)?;
+        info.set_item("tree_topology_bytes", tree_topology_bytes)?;
+        info.set_item("hypothetical_releasable_fp32_tree_bytes", hypothetical_releasable_fp32_tree_bytes)?;
+        info.set_item("released_fp32_tree_bytes", released_fp32_tree_bytes)?;
+        info.set_item(
+            "released_fp32_data_bytes",
+            self.index_data.released_fp32_data_bytes(),
+        )?;
+        let retained_fp32_tree_topology_bytes =
+            self.index_data.retained_fp32_tree_topology_bytes();
+        info.set_item(
+            "retained_fp32_tree_topology_bytes",
+            retained_fp32_tree_topology_bytes,
+        )?;
+        let allocated_bytes = code_bytes + metadata_bytes + retained_fp32_bytes
+            + retained_fp32_tree_topology_bytes
+            + tree_code_bytes + tree_scale_bytes + tree_offset_bytes + tree_topology_bytes;
+        info.set_item("allocated_bytes", allocated_bytes)?;
+        info.set_item(
+            "bytes_per_vector",
+            allocated_bytes as f64 / self.n_points as f64,
+        )?;
+        Ok(info)
     }
 
     /// Get the computed neighbor graph.
@@ -910,6 +888,32 @@ impl PyNNDescent {
 
         Ok((indices_2d, distances_2d))
     }
+
+    /// Export the first retained RP tree in original input-ID space.
+    ///
+    /// Returns `(hyperplanes, offsets, children, leaf_indices)`.
+    fn export_search_tree<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray2<i32>>,
+        Bound<'py, PyArray1<i32>>,
+    )> {
+        let tree = self
+            .index_data
+            .export_search_tree()
+            .ok_or_else(|| PyValueError::new_err("no retained search tree is available"))?;
+        let children: Vec<i32> = tree.children.into_iter().flatten().collect();
+        let hyperplanes = PyArray1::from_vec_bound(py, tree.hyperplanes)
+            .reshape([tree.n_nodes, tree.dim])?;
+        let offsets = PyArray1::from_vec_bound(py, tree.offsets);
+        let children = PyArray1::from_vec_bound(py, children)
+            .reshape([tree.n_nodes, 2])?;
+        let indices = PyArray1::from_vec_bound(py, tree.indices);
+        Ok((hyperplanes, offsets, children, indices))
+    }
 }
 
 fn normalize_rows_inplace(data: &mut [f32], dim: usize) {
@@ -929,6 +933,28 @@ fn normalize_rows_inplace(data: &mut [f32], dim: usize) {
     }
 }
 
+fn validate_quantized_widths(k: usize, candidate_width: usize, rerank_width: usize) -> PyResult<()> {
+    if candidate_width == 0 {
+        return Ok(());
+    }
+    if candidate_width < k {
+        return Err(PyValueError::new_err(format!(
+            "candidate_width {candidate_width} must be at least k ({k})"
+        )));
+    }
+    if rerank_width > candidate_width {
+        return Err(PyValueError::new_err(format!(
+            "rerank_width {rerank_width} must not exceed candidate_width {candidate_width}"
+        )));
+    }
+    if rerank_width > 0 && rerank_width < k {
+        return Err(PyValueError::new_err(format!(
+            "rerank_width {rerank_width} must be zero or at least k ({k})"
+        )));
+    }
+    Ok(())
+}
+
 impl PyNNDescent {
     fn build_index(
         data: &[f32],
@@ -937,10 +963,14 @@ impl PyNNDescent {
         metric: Metric,
         normalize_cosine: bool,
         direct_cosine: bool,
-        quantized_i8: bool,
+        quantized_encoding: Option<QuantizedI8Encoding>,
+        quantized_candidate_width: usize,
         quantized_rerank_width: usize,
+        quantize_trees: bool,
         n_neighbors: usize,
         n_trees: Option<usize>,
+        n_search_trees: usize,
+        search_tree_leaf_budget: usize,
         leaf_size: Option<usize>,
         max_candidates: Option<usize>,
         n_iters: Option<usize>,
@@ -960,6 +990,8 @@ impl PyNNDescent {
             .metric(metric)
             .n_neighbors(n_neighbors)
             .n_trees(effective_n_trees)
+            .n_search_trees(n_search_trees)
+            .search_tree_leaf_budget(search_tree_leaf_budget)
             .delta(delta)
             .random_seed(random_seed)
             .diversify_prob(diversify_prob)
@@ -975,7 +1007,6 @@ impl PyNNDescent {
         if let Some(ni) = n_iters {
             builder = builder.n_iters(ni);
         }
-
         // Dispatch to the correct concrete distance type for each metric.
         // Metrics with fast alternatives use proxy distances + correction.
         // Others use the direct distance function.
@@ -1000,10 +1031,13 @@ impl PyNNDescent {
             // Angular / similarity
             Metric::Cosine => {
                 if normalize_cosine {
-                    if quantized_i8 {
+                    if let Some(encoding) = quantized_encoding {
                         Box::new(QuantizedI8Index::new(
                             builder.build_with_distance(DirectNormalizedCosine, None),
+                            quantized_candidate_width,
                             quantized_rerank_width,
+                            encoding,
+                            quantize_trees,
                         )) as Box<dyn AnyIndex>
                     } else if direct_cosine {
                         build!(DirectNormalizedCosine, None, None)
@@ -1448,4 +1482,104 @@ fn pynndescent_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(benchmark_quantized_distances_u8, m)?)?;
     m.add_function(wrap_pyfunction!(benchmark_quantized_angular_i8, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod quantization_tests {
+    use super::*;
+
+    fn normalized_fixture(n: usize, dim: usize) -> Vec<f32> {
+        let mut data: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 37 + 11) as f32 * 0.071).sin() + ((i * 13) as f32 * 0.037).cos() * 0.3)
+            .collect();
+        normalize_rows_inplace(&mut data, dim);
+        data
+    }
+
+    fn make_quantized(
+        data: &[f32],
+        n: usize,
+        dim: usize,
+        encoding: QuantizedI8Encoding,
+        rerank_width: usize,
+    ) -> QuantizedI8Index {
+        let builder = NNDescentBuilder::new(data, n, dim)
+            .n_neighbors(10)
+            .n_trees(3)
+            .n_search_trees(2)
+            .n_iters(3)
+            .random_seed(41);
+        QuantizedI8Index::new(
+            builder.build_with_distance(DirectNormalizedCosine, None),
+            0,
+            rerank_width,
+            encoding,
+            false,
+        )
+    }
+
+    #[test]
+    fn sq8p_storage_and_error_bounds_are_preserved() {
+        let (n, dim) = (48, 5);
+        let data = normalized_fixture(n, dim);
+
+        let sq8p = make_quantized(&data, n, dim, QuantizedI8Encoding::PerVectorSymmetric, 0);
+        let sq8p_storage = sq8p.storage_info();
+        assert_eq!(sq8p_storage.1, n * dim);
+        assert_eq!(sq8p_storage.2, n * std::mem::size_of::<f32>());
+        for ((row, codes), &scale) in sq8p.index.data.chunks_exact(dim)
+            .zip(sq8p.quantized_data.chunks_exact(dim)).zip(&sq8p.inv_norms) {
+            for (&value, &code) in row.iter().zip(codes) {
+                assert!((value - code as f32 * scale).abs() <= scale * 0.501 + 1e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_quantized_modes_return_sorted_production_results() {
+        let (n, dim) = (64, 7);
+        let data = normalized_fixture(n, dim);
+        let encodings = [
+            QuantizedI8Encoding::PerVectorCosine,
+            QuantizedI8Encoding::GlobalSymmetric,
+            QuantizedI8Encoding::PerVectorSymmetric,
+        ];
+        let query = &data[9 * dim..10 * dim];
+        for encoding in encodings {
+            let index = make_quantized(&data, n, dim, encoding, 0);
+            let default_result = index.query_one_quantized(query, 6, 0.1);
+            let explicit_default = index.query_one_quantized_widths(query, 6, 0.1, 0, 0);
+            assert_eq!(default_result, explicit_default, "encoding={encoding:?}");
+            assert_eq!(default_result.0.len(), 6);
+            assert_eq!(default_result.1.len(), 6);
+            assert!(default_result.1.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+    }
+
+    #[test]
+    fn quantized_candidate_and_rerank_widths_are_independent() {
+        let (n, dim) = (96, 9);
+        let data = normalized_fixture(n, dim);
+        let query = &data[13 * dim..14 * dim];
+        let index = make_quantized(
+            &data, n, dim, QuantizedI8Encoding::GlobalSymmetric, 0,
+        );
+
+        let narrow = index.query_one_quantized_widths(query, 6, 0.08, 6, 0);
+        let wide = index.query_one_quantized_widths(query, 6, 0.08, 18, 0);
+        let reranked = index.query_one_quantized_widths(query, 6, 0.08, 18, 12);
+        assert_eq!(narrow.0.len(), 6);
+        assert_eq!(wide.0.len(), 6);
+        assert_eq!(reranked.0.len(), 6);
+        assert!(reranked.1.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn quantized_width_validation_is_clear_and_legacy_zero_is_accepted() {
+        assert!(validate_quantized_widths(10, 0, 5).is_ok());
+        assert!(validate_quantized_widths(10, 9, 0).is_err());
+        assert!(validate_quantized_widths(10, 20, 21).is_err());
+        assert!(validate_quantized_widths(10, 20, 5).is_err());
+        assert!(validate_quantized_widths(10, 20, 10).is_ok());
+    }
 }

@@ -12,13 +12,11 @@ rust-version.workspace = true
 default = ["std", "rayon"]
 std = []
 rayon = ["dep:rayon"]
-simd = ["dep:nndescent-simd"]
 mmap = ["dep:memmap2"]
 serde = ["dep:serde", "dep:bincode"]
 
 [dependencies]
 rayon = { workspace = true, optional = true }
-nndescent-simd = { path = "../nndescent-simd", optional = true }
 num-traits = { workspace = true }
 ordered-float = { workspace = true }
 rand = { workspace = true }
@@ -41,6 +39,4 @@ harness = false
 name = "heap"
 harness = false
 
-[[bench]]
-name = "search_hotpath"
-harness = false
+

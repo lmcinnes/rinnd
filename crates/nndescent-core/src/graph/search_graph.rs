@@ -659,4 +659,5 @@ mod tests {
         assert_eq!(graph.neighbors(0), &[2]);
         assert_eq!(graph.num_edges(), 1);
     }
+
 }

@@ -10,9 +10,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Feature flags for explicit SIMD targeting (auto-detection is default)
-avx2 = []
-avx512 = []
 
 [dependencies]
 bytemuck = { workspace = true }

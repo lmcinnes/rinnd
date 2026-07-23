@@ -365,34 +365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nndescent-core"
-version = "0.1.0"
-dependencies = [
- "approx",
- "bincode",
- "bytemuck",
- "criterion",
- "memmap2",
- "num-traits",
- "ordered-float",
- "rand",
- "rand_chacha",
- "rand_xoshiro",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "nndescent-simd"
-version = "0.1.0"
-dependencies = [
- "approx",
- "bytemuck",
- "criterion",
- "rand",
-]
-
-[[package]]
 name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -520,16 +492,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "535d180e0ecab6268a3e718bb9fd44db66bbbc256257165fc699dadf70d16fe7"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pynndescent-rs"
-version = "0.1.0"
-dependencies = [
- "nndescent-core",
- "nndescent-simd",
- "numpy",
- "pyo3",
 ]
 
 [[package]]
@@ -697,6 +659,44 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "rinnd"
+version = "0.1.0"
+dependencies = [
+ "numpy",
+ "pyo3",
+ "rinnd-core",
+ "rinnd-simd",
+]
+
+[[package]]
+name = "rinnd-core"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bincode",
+ "bytemuck",
+ "criterion",
+ "memmap2",
+ "num-traits",
+ "ordered-float",
+ "rand",
+ "rand_chacha",
+ "rand_xoshiro",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "rinnd-simd"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bytemuck",
+ "criterion",
+ "rand",
+]
 
 [[package]]
 name = "rustc-hash"

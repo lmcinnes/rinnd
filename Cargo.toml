@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nndescent-core",
-    "crates/nndescent-simd",
-    "crates/pynndescent-rs",
+    "crates/rinnd-core",
+    "crates/rinnd-simd",
+    "crates/rinnd",
 ]
 
 [workspace.package]
@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Leland McInnes <leland.mcinnes@gmail.com>"]
 license = "BSD-2-Clause"
-repository = "https://github.com/lmcinnes/nndescent-rs"
+repository = "https://github.com/lmcinnes/rinnd"
 rust-version = "1.75"
 
 [workspace.dependencies]

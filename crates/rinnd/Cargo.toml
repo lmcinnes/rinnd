@@ -1,0 +1,21 @@
+[package]
+name = "rinnd"
+description = "Python bindings for RINND"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rinnd"
+crate-type = ["cdylib"]
+
+[dependencies]
+rinnd-core = { path = "../rinnd-core", features = ["rayon"] }
+rinnd-simd = { path = "../rinnd-simd" }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
+
+[dev-dependencies]

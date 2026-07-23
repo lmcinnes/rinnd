@@ -1,13 +1,13 @@
-# nndescent-rs
+# RINND
 
 A high-performance Rust implementation of the [NN-Descent](https://dl.acm.org/doi/10.1145/1963405.1963487) algorithm for approximate k-nearest neighbor graph construction and search.
 
 ## Crate Structure
 
 ```
-nndescent-rs/
+rinnd/
 ├── crates/
-│   ├── nndescent-core/     # Core algorithm library
+│   ├── rinnd-core/         # Core algorithm library
 │   │   ├── src/
 │   │   │   ├── distance/   # 30+ distance metrics with SIMD acceleration
 │   │   │   ├── heap/       # Neighbor and candidate heaps
@@ -16,8 +16,8 @@ nndescent-rs/
 │   │   │   ├── nndescent/  # NN-Descent algorithm
 │   │   │   └── search/     # Greedy graph search
 │   │   └── benches/        # Criterion benchmarks
-│   ├── nndescent-simd/     # SIMD distance kernels (AVX2, AVX-512)
-│   └── pynndescent-rs/     # Python bindings (PyO3 + maturin)
+│   ├── rinnd-simd/         # SIMD distance kernels (AVX2, AVX-512)
+│   └── rinnd/              # Python bindings (PyO3 + maturin)
 ```
 
 ## Features
@@ -48,18 +48,18 @@ cargo bench --release
 
 ```bash
 # Requires maturin: pip install maturin
-maturin develop --release -m crates/pynndescent-rs/Cargo.toml
+maturin develop --release -m crates/rinnd/Cargo.toml
 ```
 
 ### Usage
 
 ```python
 import numpy as np
-import pynndescent_rs
+import rinnd
 
 # Build index
 data = np.random.rand(10000, 128).astype(np.float32)
-index = pynndescent_rs.NNDescent(data, metric="euclidean", n_neighbors=15)
+index = rinnd.RINND(data, metric="euclidean", n_neighbors=15)
 
 # Get the k-NN graph
 indices, distances = index.neighbor_graph
@@ -69,21 +69,21 @@ query = np.random.rand(100, 128).astype(np.float32)
 indices, distances = index.query(query, k=10)
 
 # Check SIMD support
-print(pynndescent_rs.simd_info())
+print(rinnd.simd_info())
 ```
 
 ## Rust Usage
 
-Add `nndescent-core` as a dependency in your `Cargo.toml`:
+Add `rinnd-core` as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nndescent-core = { path = "crates/nndescent-core" }
+rinnd-core = { path = "crates/rinnd-core" }
 ```
 
 ```rust
-use nndescent_core::index::NNDescentBuilder;
-use nndescent_core::distance::SquaredEuclidean;
+use rinnd_core::index::NNDescentBuilder;
+use rinnd_core::distance::SquaredEuclidean;
 
 let data: Vec<f32> = /* your data */;
 let n_points = 10000;

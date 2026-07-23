@@ -77,6 +77,19 @@ pub struct PyNNDescent {
 /// Trait for type-erased index operations.
 trait AnyIndex: Send + Sync {
     fn query(&self, queries: &[f32], n_queries: usize, k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>);
+    fn query_quantized_widths(
+        &self,
+        _queries: &[f32],
+        _n_queries: usize,
+        _k: usize,
+        _epsilon: f32,
+        _candidate_width: usize,
+        _rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        Err(PyValueError::new_err(
+            "query-time quantized widths require a quantized cosine_distance_mode",
+        ))
+    }
     fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>);
     fn query_one_indices(&self, query: &[f32], k: usize, epsilon: f32) -> Vec<i32>;
     fn query_one_quantized_widths(
@@ -127,6 +140,7 @@ struct QuantizedI8Index {
     quantized_trees: Vec<QuantizedFlatTree>,
     released_fp32_tree_bytes: usize,
     released_fp32_data_bytes: usize,
+    exact_rerank_available: bool,
     encode_seconds: f64,
 }
 
@@ -144,6 +158,7 @@ impl QuantizedI8Index {
         rerank_width: usize,
         encoding: QuantizedI8Encoding,
         quantize_trees: bool,
+        retain_fp32_data: bool,
     ) -> Self {
         let encode_start = Instant::now();
         let dim = index.dim;
@@ -209,7 +224,7 @@ impl QuantizedI8Index {
         } else {
             Vec::new()
         };
-        let release_fp32_data = quantize_trees && rerank_width == 0;
+        let release_fp32_data = !retain_fp32_data;
         let released_fp32_data_bytes = if release_fp32_data {
             index.data.len() * std::mem::size_of::<f32>()
         } else {
@@ -232,6 +247,7 @@ impl QuantizedI8Index {
             quantized_trees,
             released_fp32_tree_bytes,
             released_fp32_data_bytes,
+            exact_rerank_available: retain_fp32_data,
             encode_seconds: encode_start.elapsed().as_secs_f64(),
         }
     }
@@ -251,7 +267,7 @@ impl QuantizedI8Index {
         candidate_width: usize,
         rerank_width: usize,
     ) -> PyResult<()> {
-        if self.released_fp32_data_bytes > 0
+        if !self.exact_rerank_available
             && Self::exact_rerank_requested(k, candidate_width, rerank_width)
         {
             return Err(PyValueError::new_err(
@@ -358,6 +374,32 @@ impl AnyIndex for QuantizedI8Index {
             all_distances.extend(distances);
         }
         (all_indices, all_distances)
+    }
+
+    fn query_quantized_widths(
+        &self,
+        queries: &[f32],
+        n_queries: usize,
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        self.ensure_rerank_available(k, candidate_width, rerank_width)?;
+        let mut all_indices = Vec::with_capacity(n_queries * k);
+        let mut all_distances = Vec::with_capacity(n_queries * k);
+        for query in queries.chunks_exact(self.index.dim).take(n_queries) {
+            let (indices, distances) = self.query_one_quantized_widths(
+                query,
+                k,
+                epsilon,
+                candidate_width,
+                rerank_width,
+            );
+            all_indices.extend(indices);
+            all_distances.extend(distances);
+        }
+        Ok((all_indices, all_distances))
     }
 
     fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
@@ -496,7 +538,7 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
 #[pymethods]
 impl PyNNDescent {
     #[new]
-    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none"))]
+    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None))]
     fn new(
         data: PyReadonlyArray2<f32>,
         metric: &str,
@@ -517,6 +559,7 @@ impl PyNNDescent {
         quantized_candidate_width: usize,
         quantized_rerank_width: usize,
         tree_quantization: &str,
+        retain_fp32_data: Option<bool>,
     ) -> PyResult<Self> {
         let shape = data.shape();
         let n_points = shape[0];
@@ -586,6 +629,12 @@ impl PyNNDescent {
             normalize_rows_inplace(&mut data_vec, dim);
         }
 
+        let retain_fp32_data = retain_fp32_data.unwrap_or_else(|| {
+            // Preserve legacy behavior: FP32 data was released only when both
+            // trees were quantized and the constructor rerank width was zero.
+            !quantize_trees || quantized_rerank_width > 0
+        });
+
         // Build index based on metric
         let index_data = Self::build_index(
             &data_vec,
@@ -598,6 +647,7 @@ impl PyNNDescent {
             quantized_candidate_width,
             quantized_rerank_width,
             quantize_trees,
+            retain_fp32_data,
             n_neighbors,
             n_trees,
             n_search_trees,
@@ -687,6 +737,59 @@ impl PyNNDescent {
         let distances_2d = distances_arr.reshape([n_queries, k])?;
 
         Ok((indices_2d, distances_2d))
+    }
+
+    /// Query a quantized index with independent query-time candidate and FP32
+    /// rerank widths. The index and graph are reused for every width policy.
+    #[pyo3(signature = (query_data, k=10, epsilon=0.1, candidate_width=0, rerank_width=0))]
+    fn query_quantized<'py>(
+        &self,
+        py: Python<'py>,
+        query_data: PyReadonlyArray2<f32>,
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<f32>>)> {
+        validate_quantized_widths(k, candidate_width, rerank_width)?;
+        let shape = query_data.shape();
+        let n_queries = shape[0];
+        let query_dim = shape[1];
+        if query_dim != self.dim {
+            return Err(PyValueError::new_err(format!(
+                "Query dimension {} does not match data dimension {}",
+                query_dim, self.dim
+            )));
+        }
+
+        let mut query_vec: Vec<f32> = if query_data.is_c_contiguous() {
+            query_data.as_slice().unwrap().to_vec()
+        } else {
+            let mut vec = Vec::with_capacity(n_queries * query_dim);
+            for i in 0..n_queries {
+                for j in 0..query_dim {
+                    vec.push(*query_data.get([i, j]).unwrap());
+                }
+            }
+            vec
+        };
+        if self.normalize {
+            normalize_rows_inplace(&mut query_vec, query_dim);
+        }
+
+        let (indices, distances) = py.allow_threads(|| {
+            self.index_data.query_quantized_widths(
+                &query_vec,
+                n_queries,
+                k,
+                epsilon,
+                candidate_width,
+                rerank_width,
+            )
+        })?;
+        let indices_arr = PyArray1::from_vec_bound(py, indices).reshape([n_queries, k])?;
+        let distances_arr = PyArray1::from_vec_bound(py, distances).reshape([n_queries, k])?;
+        Ok((indices_arr, distances_arr))
     }
 
     /// Query for nearest neighbors of a single vector with lower Python overhead.
@@ -967,6 +1070,7 @@ impl PyNNDescent {
         quantized_candidate_width: usize,
         quantized_rerank_width: usize,
         quantize_trees: bool,
+        retain_fp32_data: bool,
         n_neighbors: usize,
         n_trees: Option<usize>,
         n_search_trees: usize,
@@ -1038,6 +1142,7 @@ impl PyNNDescent {
                             quantized_rerank_width,
                             encoding,
                             quantize_trees,
+                            retain_fp32_data,
                         )) as Box<dyn AnyIndex>
                     } else if direct_cosine {
                         build!(DirectNormalizedCosine, None, None)
@@ -1515,6 +1620,7 @@ mod quantization_tests {
             rerank_width,
             encoding,
             false,
+            true,
         )
     }
 
@@ -1557,6 +1663,49 @@ mod quantization_tests {
     }
 
     #[test]
+    fn constructor_width_defaults_match_query_time_widths() {
+        let (n, dim) = (96, 9);
+        let data = normalized_fixture(n, dim);
+        let query = &data[17 * dim..18 * dim];
+        let width_policies = [(10, 0), (10, 10), (20, 0), (20, 20), (32, 32), (64, 32)];
+        let encodings = [
+            QuantizedI8Encoding::PerVectorCosine,
+            QuantizedI8Encoding::PerVectorSymmetric,
+        ];
+
+        for encoding in encodings {
+            for (candidate_width, rerank_width) in width_policies {
+                let builder = NNDescentBuilder::new(&data, n, dim)
+                    .n_neighbors(10)
+                    .n_trees(3)
+                    .n_search_trees(2)
+                    .n_iters(3)
+                    .random_seed(41);
+                let index = QuantizedI8Index::new(
+                    builder.build_with_distance(DirectNormalizedCosine, None),
+                    candidate_width,
+                    rerank_width,
+                    encoding,
+                    true,
+                    true,
+                );
+                let legacy = index.query_one_quantized(query, 10, 0.08);
+                let explicit = index.query_one_quantized_widths(
+                    query,
+                    10,
+                    0.08,
+                    candidate_width,
+                    rerank_width,
+                );
+                assert_eq!(
+                    legacy, explicit,
+                    "encoding={encoding:?}, candidate={candidate_width}, rerank={rerank_width}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn quantized_candidate_and_rerank_widths_are_independent() {
         let (n, dim) = (96, 9);
         let data = normalized_fixture(n, dim);
@@ -1572,6 +1721,61 @@ mod quantization_tests {
         assert_eq!(wide.0.len(), 6);
         assert_eq!(reranked.0.len(), 6);
         assert!(reranked.1.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn query_time_widths_reuse_the_index_for_single_and_batch_queries() {
+        let (n, dim) = (96, 9);
+        let data = normalized_fixture(n, dim);
+        let queries = &data[11 * dim..14 * dim];
+        let index = make_quantized(
+            &data,
+            n,
+            dim,
+            QuantizedI8Encoding::PerVectorCosine,
+            0,
+        );
+
+        let (batch_indices, batch_distances) = index
+            .query_quantized_widths(queries, 3, 6, 0.08, 18, 12)
+            .expect("retained index should support exact reranking");
+        let mut expected_indices = Vec::new();
+        let mut expected_distances = Vec::new();
+        for query in queries.chunks_exact(dim) {
+            let (indices, distances) =
+                index.query_one_quantized_widths(query, 6, 0.08, 18, 12);
+            expected_indices.extend(indices);
+            expected_distances.extend(distances);
+        }
+        assert_eq!(batch_indices, expected_indices);
+        assert_eq!(batch_distances, expected_distances);
+    }
+
+    #[test]
+    fn pure_quantized_storage_rejects_query_time_exact_reranking() {
+        let (n, dim) = (64, 7);
+        let data = normalized_fixture(n, dim);
+        let builder = NNDescentBuilder::new(&data, n, dim)
+            .n_neighbors(10)
+            .n_trees(3)
+            .n_search_trees(2)
+            .n_iters(3)
+            .random_seed(43);
+        let index = QuantizedI8Index::new(
+            builder.build_with_distance(DirectNormalizedCosine, None),
+            10,
+            0,
+            QuantizedI8Encoding::PerVectorCosine,
+            true,
+            false,
+        );
+        let query = &data[7 * dim..8 * dim];
+
+        assert!(index.released_fp32_data_bytes > 0);
+        assert!(AnyIndex::query_one_quantized_widths(&index, query, 6, 0.08, 18, 0).is_ok());
+        let error = AnyIndex::query_one_quantized_widths(&index, query, 6, 0.08, 18, 12)
+            .expect_err("pure storage must reject exact reranking");
+        assert!(error.to_string().contains("FP32 vector data was released"));
     }
 
     #[test]

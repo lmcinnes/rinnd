@@ -1,0 +1,259 @@
+# Test every supported Python version and publish wheels/source distributions for
+# release-* tags. PyPI credentials are supplied by the pypirc secure file.
+trigger:
+  branches:
+    include:
+      - main
+      - master
+  tags:
+    include:
+      - release-*
+
+pr:
+  branches:
+    include:
+      - main
+      - master
+    exclude:
+      - docs/*
+      - README.md
+      - README.rst
+
+variables:
+  rustToolchain: '1.75.0'
+  packageDirectory: 'crates/rinnd'
+
+stages:
+  - stage: Test
+    displayName: Run tests
+    jobs:
+      - job: RustTests
+        displayName: Rust workspace tests
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: |
+              set -euxo pipefail
+              rustup toolchain install $(rustToolchain) --profile minimal
+              rustup default $(rustToolchain)
+              cargo test --release --workspace
+            displayName: Run Cargo tests
+
+      - job: PythonTests
+        displayName: Python tests
+        strategy:
+          matrix:
+            linux_py38:
+              imageName: ubuntu-latest
+              pythonVersion: '3.8'
+            linux_py39:
+              imageName: ubuntu-latest
+              pythonVersion: '3.9'
+            linux_py310:
+              imageName: ubuntu-latest
+              pythonVersion: '3.10'
+            linux_py311:
+              imageName: ubuntu-latest
+              pythonVersion: '3.11'
+            linux_py312:
+              imageName: ubuntu-latest
+              pythonVersion: '3.12'
+            windows_py38:
+              imageName: windows-latest
+              pythonVersion: '3.8'
+            windows_py39:
+              imageName: windows-latest
+              pythonVersion: '3.9'
+            windows_py310:
+              imageName: windows-latest
+              pythonVersion: '3.10'
+            windows_py311:
+              imageName: windows-latest
+              pythonVersion: '3.11'
+            windows_py312:
+              imageName: windows-latest
+              pythonVersion: '3.12'
+        pool:
+          vmImage: $(imageName)
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+            displayName: Use Python $(pythonVersion)
+
+          - bash: |
+              set -euxo pipefail
+              python -m pip install --upgrade pip
+              python -m pip install 'maturin>=1,<2' pytest numpy pyyaml h5py scikit-learn
+              rustup toolchain install $(rustToolchain) --profile minimal
+              rustup default $(rustToolchain)
+              python -m pip install --no-cache-dir -e ./$(packageDirectory)
+            displayName: Install package and test dependencies
+
+          - bash: |
+              set -euxo pipefail
+              export PYTHONPATH="$(Build.SourcesDirectory)/ann-benchmarks"
+              python -m pytest ann-benchmarks/test -v --disable-warnings \
+                --junitxml="$(Build.SourcesDirectory)/test-results/test-results.xml"
+            displayName: Run Python tests
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFiles: '$(Build.SourcesDirectory)/test-results/test-results.xml'
+              testRunTitle: '$(Agent.OS) - $(Build.BuildNumber) - Python $(pythonVersion)'
+
+  - stage: BuildPublishArtifact
+    displayName: Build release artifacts
+    dependsOn: Test
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/release-'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: BuildWheels
+        displayName: Build wheel
+        strategy:
+          matrix:
+            linux_py38:
+              imageName: ubuntu-latest
+              pythonVersion: '3.8'
+            linux_py39:
+              imageName: ubuntu-latest
+              pythonVersion: '3.9'
+            linux_py310:
+              imageName: ubuntu-latest
+              pythonVersion: '3.10'
+            linux_py311:
+              imageName: ubuntu-latest
+              pythonVersion: '3.11'
+            linux_py312:
+              imageName: ubuntu-latest
+              pythonVersion: '3.12'
+            windows_py38:
+              imageName: windows-latest
+              pythonVersion: '3.8'
+            windows_py39:
+              imageName: windows-latest
+              pythonVersion: '3.9'
+            windows_py310:
+              imageName: windows-latest
+              pythonVersion: '3.10'
+            windows_py311:
+              imageName: windows-latest
+              pythonVersion: '3.11'
+            windows_py312:
+              imageName: windows-latest
+              pythonVersion: '3.12'
+            macos_py38:
+              imageName: macOS-13
+              pythonVersion: '3.8'
+            macos_py39:
+              imageName: macOS-13
+              pythonVersion: '3.9'
+            macos_py310:
+              imageName: macOS-13
+              pythonVersion: '3.10'
+            macos_py311:
+              imageName: macOS-13
+              pythonVersion: '3.11'
+            macos_py312:
+              imageName: macOS-13
+              pythonVersion: '3.12'
+        pool:
+          vmImage: $(imageName)
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+            displayName: Use Python $(pythonVersion)
+
+          - bash: |
+              set -euxo pipefail
+              python -m pip install --upgrade pip
+              python -m pip install 'maturin>=1,<2'
+              rustup toolchain install $(rustToolchain) --profile minimal
+              rustup default $(rustToolchain)
+            displayName: Install build tools
+
+          - bash: |
+              set -euxo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/dist"
+              cd "$(Build.SourcesDirectory)/$(packageDirectory)"
+              python -m maturin build --release --manifest-path Cargo.toml \
+                --out "$(Build.ArtifactStagingDirectory)/dist"
+            displayName: Build wheel
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/dist'
+              artifact: 'wheel-$(Agent.JobName)'
+            displayName: Publish wheel artifact
+
+      - job: BuildSourceDistribution
+        displayName: Build source distribution
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+            displayName: Use Python 3.10
+
+          - bash: |
+              set -euxo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/dist"
+              python -m pip install --upgrade pip
+              python -m pip install 'maturin>=1,<2'
+              cd "$(Build.SourcesDirectory)/$(packageDirectory)"
+              python -m maturin sdist --out "$(Build.ArtifactStagingDirectory)/dist"
+            displayName: Build source distribution
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/dist'
+              artifact: source-distribution
+            displayName: Publish source distribution artifact
+
+  - stage: Publish
+    displayName: Publish to PyPI
+    dependsOn: BuildPublishArtifact
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/release-'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: PublishToPyPI
+        displayName: Upload release to PyPI
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: current
+              targetPath: '$(Pipeline.Workspace)/dist'
+            displayName: Download release artifacts
+
+          - task: DownloadSecureFile@1
+            name: PYPIRC_CONFIG
+            displayName: Download PyPI configuration
+            inputs:
+              secureFile: pypirc
+
+          - bash: |
+              set -euxo pipefail
+              python -m pip install --upgrade pip
+              python -m pip install 'twine>=5,<7'
+
+              package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$(Build.SourcesDirectory)/$(packageDirectory)/pyproject.toml" | head -n 1)
+              expected_tag="release-${package_version}"
+              echo "Package version: ${package_version}"
+              echo "Release tag: $(Build.SourceBranchName)"
+              if [[ "$(Build.SourceBranchName)" != "${expected_tag}" ]]; then
+                echo "Release tag must be ${expected_tag}"
+                exit 1
+              fi
+
+              mapfile -t distributions < <(find "$(Pipeline.Workspace)/dist" -type f \( -name '*.whl' -o -name '*.tar.gz' \) | sort)
+              if [[ ${#distributions[@]} -eq 0 ]]; then
+                echo 'No Python distributions were downloaded.'
+                exit 1
+              fi
+              python -m twine check "${distributions[@]}"
+              python -m twine upload --repository pypi \
+                --config-file "$(PYPIRC_CONFIG.secureFilePath)" "${distributions[@]}"
+            displayName: Validate and upload distributions

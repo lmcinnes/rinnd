@@ -1,6 +1,7 @@
 # RINND
 
 A high-performance Rust implementation of the [NN-Descent](https://dl.acm.org/doi/10.1145/1963405.1963487) algorithm for approximate k-nearest neighbor graph construction and search.
+This is an AI enabled port and optimization of [PyNNDescent](https://github.com/lmcinnes/pynndescent) designed to take advantage of the benefits that a rust compiled backend can offer.
 
 ## Crate Structure
 

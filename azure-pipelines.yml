@@ -36,7 +36,11 @@ stages:
               set -euxo pipefail
               rustup toolchain install $(rustToolchain) --profile minimal
               rustup default $(rustToolchain)
-              cargo test --release --workspace
+              # The rinnd crate is a PyO3 extension crate. Its unit-test binary
+              # links as a native executable and cannot resolve Python symbols
+              # on Linux without an explicit libpython link configuration. The
+              # Python binding is exercised by the PythonTests job below.
+              cargo test --release --workspace --exclude rinnd
             displayName: Run Cargo tests
 
       - job: PythonTests

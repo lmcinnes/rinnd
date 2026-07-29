@@ -84,7 +84,7 @@ stages:
           - bash: |
               set -euxo pipefail
               python -m pip install --upgrade pip
-              python -m pip install 'maturin>=1,<2' pytest numpy pyyaml h5py scikit-learn
+              python -m pip install 'maturin>=1,<2' pytest numpy
               rustup toolchain install $(rustToolchain) --profile minimal
               rustup default $(rustToolchain)
               python -m pip install --no-cache-dir -e ./$(packageDirectory)
@@ -92,8 +92,7 @@ stages:
 
           - bash: |
               set -euxo pipefail
-              export PYTHONPATH="$(Build.SourcesDirectory)/ann-benchmarks"
-              python -m pytest ann-benchmarks/test -v --disable-warnings \
+              python -m pytest tests -v --disable-warnings \
                 --junitxml="$(Build.SourcesDirectory)/test-results/test-results.xml"
             displayName: Run Python tests
 

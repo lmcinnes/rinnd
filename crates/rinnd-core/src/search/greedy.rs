@@ -561,8 +561,8 @@ pub fn batch_search<D: Distance<f32> + Sync>(
         let padding = k.saturating_sub(result_indices.len());
         indices.extend(result_indices);
         distances.extend(result_distances);
-        indices.extend(std::iter::repeat_n(-1, padding));
-        distances.extend(std::iter::repeat_n(f32::INFINITY, padding));
+        indices.extend(std::iter::repeat(-1).take(padding));
+        distances.extend(std::iter::repeat(f32::INFINITY).take(padding));
     }
     (indices, distances)
 }

@@ -145,21 +145,23 @@ stages:
             windows_py312:
               imageName: windows-latest
               pythonVersion: '3.12'
-            macos_py38:
-              imageName: macOS-13
-              pythonVersion: '3.8'
-            macos_py39:
-              imageName: macOS-13
-              pythonVersion: '3.9'
-            macos_py310:
-              imageName: macOS-13
-              pythonVersion: '3.10'
-            macos_py311:
-              imageName: macOS-13
-              pythonVersion: '3.11'
-            macos_py312:
-              imageName: macOS-13
-              pythonVersion: '3.12'
+            # No macOS build agents are available in the free tier of Azure DevOps, so macOS builds are disabled. 
+            # Uncomment the following lines to enable macOS builds if you have access to a macOS build agent.
+            # macos_py38:
+            #   imageName: macOS-13
+            #   pythonVersion: '3.8'
+            # macos_py39:
+            #   imageName: macOS-13
+            #   pythonVersion: '3.9'
+            # macos_py310:
+            #   imageName: macOS-13
+            #   pythonVersion: '3.10'
+            # macos_py311:
+            #   imageName: macOS-13
+            #   pythonVersion: '3.11'
+            # macos_py312:
+            #   imageName: macOS-13
+            #   pythonVersion: '3.12'
         pool:
           vmImage: $(imageName)
         steps:

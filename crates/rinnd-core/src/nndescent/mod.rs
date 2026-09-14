@@ -12,9 +12,30 @@ pub use update::{apply_updates, UpdateArray};
 use crate::distance::Distance;
 use crate::heap::NeighborHeap;
 use crate::rng::FastRng;
-use crate::tree::{build_rp_forest, rptree_leaf_array, FlatTree};
+use crate::tree::{
+    build_breadth_first_leaf_forest, build_rp_forest, build_rp_leaf_forest, rptree_leaf_array,
+    FlatTree,
+};
 
 use rayon::prelude::*;
+
+#[derive(Clone, Debug, Default)]
+pub struct NNDescentStats {
+    pub forest_seconds: f64,
+    pub leaf_initialization_seconds: f64,
+    pub candidate_seconds: Vec<f64>,
+    pub update_seconds: Vec<f64>,
+    pub updates: Vec<usize>,
+}
+
+impl NNDescentStats {
+    pub fn total_seconds(&self) -> f64 {
+        self.forest_seconds
+            + self.leaf_initialization_seconds
+            + self.candidate_seconds.iter().sum::<f64>()
+            + self.update_seconds.iter().sum::<f64>()
+    }
+}
 
 /// NN-Descent algorithm parameters.
 #[derive(Clone, Debug)]
@@ -83,7 +104,41 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
     distance: &D,
     params: &NNDescentParams,
     rng: &mut FastRng,
-) -> (NeighborHeap, Vec<FlatTree>) {
+) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
+    nn_descent_impl(data, n_points, dim, distance, params, rng, true, None)
+}
+
+pub(crate) fn nn_descent_graph<D: Distance<f32> + Sync>(
+    data: &[f32],
+    n_points: usize,
+    dim: usize,
+    distance: &D,
+    params: &NNDescentParams,
+    rng: &mut FastRng,
+    breadth_first_batch_width: Option<usize>,
+) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
+    nn_descent_impl(
+        data,
+        n_points,
+        dim,
+        distance,
+        params,
+        rng,
+        false,
+        breadth_first_batch_width,
+    )
+}
+
+fn nn_descent_impl<D: Distance<f32> + Sync>(
+    data: &[f32],
+    n_points: usize,
+    dim: usize,
+    distance: &D,
+    params: &NNDescentParams,
+    rng: &mut FastRng,
+    retain_trees: bool,
+    breadth_first_batch_width: Option<usize>,
+) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
     use std::time::Instant;
 
     let effective_max_candidates = params.max_candidates.min(60).min(params.n_neighbors);
@@ -94,24 +149,50 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
         println!("Building RP forest with {} trees...", params.n_trees);
     }
 
-    // Build random projection forest for initialization
-    let forest = build_rp_forest(
-        data,
-        n_points,
-        dim,
-        params.n_trees,
-        params.leaf_size,
-        rng,
-        params.angular,
-        params.max_depth,
-    );
+    let (forest, leaf_array) = if retain_trees {
+        let forest = build_rp_forest(
+            data,
+            n_points,
+            dim,
+            params.n_trees,
+            params.leaf_size,
+            rng,
+            params.angular,
+            params.max_depth,
+        );
+        let leaf_array = rptree_leaf_array(&forest);
+        (forest, leaf_array)
+    } else if let Some(batch_width) = breadth_first_batch_width {
+        let leaves = build_breadth_first_leaf_forest(
+            data,
+            n_points,
+            dim,
+            params.n_trees,
+            params.leaf_size,
+            rng,
+            params.angular,
+            params.max_depth,
+            batch_width,
+        );
+        (Vec::new(), leaves)
+    } else {
+        let leaves = build_rp_leaf_forest(
+            data,
+            n_points,
+            dim,
+            params.n_trees,
+            params.leaf_size,
+            rng,
+            params.angular,
+            params.max_depth,
+        );
+        (Vec::new(), leaves)
+    };
 
     let t_forest = t_forest_start.elapsed();
 
     // Initialize neighbor graph from tree leaves
     let mut neighbor_graph = NeighborHeap::new(n_points, params.n_neighbors);
-    let leaf_array = rptree_leaf_array(&forest);
-
     let t_init_start = Instant::now();
 
     if params.verbose {
@@ -129,8 +210,9 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
         );
     }
 
-    let mut t_candidates_total = std::time::Duration::ZERO;
-    let mut t_updates_total = std::time::Duration::ZERO;
+    let mut candidate_seconds = Vec::with_capacity(params.n_iters);
+    let mut update_seconds = Vec::with_capacity(params.n_iters);
+    let mut updates = Vec::with_capacity(params.n_iters);
     let mut actual_iters = 0;
 
     // NN-descent iterations
@@ -142,12 +224,13 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
         let t_cand_start = Instant::now();
         let candidates =
             CandidateSets::build_from_graph(&mut neighbor_graph, effective_max_candidates, rng);
-        t_candidates_total += t_cand_start.elapsed();
+        candidate_seconds.push(t_cand_start.elapsed().as_secs_f64());
 
         // Generate and apply updates
         let t_upd_start = Instant::now();
         let n_changes = update_iteration(&mut neighbor_graph, &candidates, data, dim, distance);
-        t_updates_total += t_upd_start.elapsed();
+        update_seconds.push(t_upd_start.elapsed().as_secs_f64());
+        updates.push(n_changes);
 
         if params.verbose {
             println!("Iteration {}: {} updates", iter + 1, n_changes);
@@ -167,6 +250,8 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
     }
 
     if params.verbose {
+        let t_candidates_total: f64 = candidate_seconds.iter().sum();
+        let t_updates_total: f64 = update_seconds.iter().sum();
         println!("\n=== Timing Breakdown ===");
         println!(
             "Forest building:    {:>8.3}ms",
@@ -178,22 +263,28 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
         );
         println!(
             "Candidate building: {:>8.3}ms ({} iters)",
-            t_candidates_total.as_secs_f64() * 1000.0,
+            t_candidates_total * 1000.0,
             actual_iters
         );
         println!(
             "Update iterations:  {:>8.3}ms ({} iters)",
-            t_updates_total.as_secs_f64() * 1000.0,
+            t_updates_total * 1000.0,
             actual_iters
         );
-        let total = t_forest + t_init + t_candidates_total + t_updates_total;
-        println!(
-            "Total measured:     {:>8.3}ms",
-            total.as_secs_f64() * 1000.0
-        );
+        let total =
+            t_forest.as_secs_f64() + t_init.as_secs_f64() + t_candidates_total + t_updates_total;
+        println!("Total measured:     {:>8.3}ms", total * 1000.0);
     }
 
-    (neighbor_graph, forest)
+    let stats = NNDescentStats {
+        forest_seconds: t_forest.as_secs_f64(),
+        leaf_initialization_seconds: t_init.as_secs_f64(),
+        candidate_seconds,
+        update_seconds,
+        updates,
+    };
+
+    (neighbor_graph, forest, stats)
 }
 
 /// Initialize the neighbor graph from RP tree leaves (parallel version).
@@ -525,7 +616,8 @@ mod tests {
             verbose: false,
         };
 
-        let (graph, _forest) = nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
+        let (graph, _forest, _stats) =
+            nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
 
         // Check that each point has neighbors
         for point in 0..n_points {
@@ -554,7 +646,7 @@ mod tests {
 
         let params = NNDescentParams::new(5);
 
-        let (graph, _) = nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
+        let (graph, _, _) = nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
 
         // No point should have itself as a neighbor
         for point in 0..n_points {

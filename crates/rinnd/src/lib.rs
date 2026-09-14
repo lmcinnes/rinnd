@@ -6,15 +6,15 @@ use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use rinnd_core::distance::quantized::{
     quantized_i8_alternative_dot, quantized_i8_dot, quantized_u8_sq_euclidean,
 };
 use rinnd_core::distance::*;
-use rinnd_core::graph::SearchGraph;
-use rinnd_core::index::{NNDescentBuilder, NNDescentIndex};
+use rinnd_core::graph::{NeighborGraph, SearchGraph};
+use rinnd_core::index::{BuildStats, GraphBuildResult, NNDescentBuilder, NNDescentIndex};
 use rinnd_core::search::SearchWorkspace;
 use rinnd_core::tree::{FlatTree, QuantizedFlatTree};
 
@@ -74,6 +74,9 @@ pub struct PyNNDescent {
 
 /// Trait for type-erased index operations.
 trait AnyIndex: Send + Sync {
+    fn prepare(&self);
+    fn is_prepared(&self) -> bool;
+    fn search_enabled(&self) -> bool;
     fn query(
         &self,
         queries: &[f32],
@@ -108,8 +111,8 @@ trait AnyIndex: Send + Sync {
             "query-time quantized widths require a quantized cosine_distance_mode",
         ))
     }
-    fn neighbor_indices(&self) -> &[i32];
-    fn neighbor_distances(&self) -> &[f32];
+    fn neighbor_graph(&self) -> (Vec<i32>, Vec<f32>);
+    fn build_stats(&self) -> BuildStats;
     fn search_graph_original_order(&self) -> SearchGraph;
     fn search_graph_min_distance(&self) -> f32;
     fn export_search_tree(&self) -> Option<FlatTree>;
@@ -126,8 +129,22 @@ trait AnyIndex: Send + Sync {
 }
 
 struct AnyIndexWithWorkspace<D: Distance<f32> + Send + Sync> {
-    index: NNDescentIndex<D>,
+    index: RwLock<NNDescentIndex<D>>,
     workspace: Mutex<SearchWorkspace>,
+}
+
+struct GraphOnlyIndex {
+    graph: NeighborGraph,
+    stats: BuildStats,
+}
+
+impl GraphOnlyIndex {
+    fn new(result: GraphBuildResult) -> Self {
+        Self {
+            graph: result.graph,
+            stats: result.stats,
+        }
+    }
 }
 
 struct QuantizedI8Index {
@@ -398,6 +415,16 @@ impl QuantizedI8Index {
 }
 
 impl AnyIndex for QuantizedI8Index {
+    fn prepare(&self) {}
+
+    fn is_prepared(&self) -> bool {
+        true
+    }
+
+    fn search_enabled(&self) -> bool {
+        true
+    }
+
     fn query(
         &self,
         queries: &[f32],
@@ -456,11 +483,14 @@ impl AnyIndex for QuantizedI8Index {
         Ok(self.query_one_quantized_widths(query, k, epsilon, candidate_width, rerank_width))
     }
 
-    fn neighbor_indices(&self) -> &[i32] {
-        &self.index.neighbor_indices
+    fn neighbor_graph(&self) -> (Vec<i32>, Vec<f32>) {
+        (
+            self.index.neighbor_indices.clone(),
+            self.index.neighbor_distances.clone(),
+        )
     }
-    fn neighbor_distances(&self) -> &[f32] {
-        &self.index.neighbor_distances
+    fn build_stats(&self) -> BuildStats {
+        self.index.build_stats.clone()
     }
     fn search_graph_original_order(&self) -> SearchGraph {
         self.index.search_graph_original_order()
@@ -545,6 +575,66 @@ impl AnyIndex for QuantizedI8Index {
     }
 }
 
+impl AnyIndex for GraphOnlyIndex {
+    fn prepare(&self) {}
+
+    fn is_prepared(&self) -> bool {
+        false
+    }
+
+    fn search_enabled(&self) -> bool {
+        false
+    }
+
+    fn query(
+        &self,
+        _queries: &[f32],
+        _n_queries: usize,
+        _k: usize,
+        _epsilon: f32,
+    ) -> (Vec<i32>, Vec<f32>) {
+        unreachable!("graph-only query must be rejected by the Python API")
+    }
+
+    fn query_one(&self, _query: &[f32], _k: usize, _epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        unreachable!("graph-only query must be rejected by the Python API")
+    }
+
+    fn query_one_indices(&self, _query: &[f32], _k: usize, _epsilon: f32) -> Vec<i32> {
+        unreachable!("graph-only query must be rejected by the Python API")
+    }
+
+    fn neighbor_graph(&self) -> (Vec<i32>, Vec<f32>) {
+        (self.graph.indices.clone(), self.graph.distances.clone())
+    }
+
+    fn build_stats(&self) -> BuildStats {
+        self.stats.clone()
+    }
+
+    fn search_graph_original_order(&self) -> SearchGraph {
+        unreachable!("graph-only search graph must be rejected by the Python API")
+    }
+
+    fn search_graph_min_distance(&self) -> f32 {
+        unreachable!("graph-only search graph must be rejected by the Python API")
+    }
+
+    fn export_search_tree(&self) -> Option<FlatTree> {
+        None
+    }
+
+    fn storage_info(&self) -> (&'static str, usize, usize, usize, f64) {
+        (
+            "graph_only",
+            self.graph.indices.len() * std::mem::size_of::<i32>(),
+            self.graph.distances.len() * std::mem::size_of::<f32>(),
+            0,
+            0.0,
+        )
+    }
+}
+
 impl<D: Distance<f32> + Send + Sync> AnyIndexWithWorkspace<D> {
     fn new(mut index: NNDescentIndex<D>, min_distance_override: Option<f32>) -> Self {
         if let Some(v) = min_distance_override {
@@ -553,12 +643,28 @@ impl<D: Distance<f32> + Send + Sync> AnyIndexWithWorkspace<D> {
         let initial_k = index.n_neighbors.max(1);
         Self {
             workspace: Mutex::new(SearchWorkspace::new(index.n_points, initial_k)),
-            index,
+            index: RwLock::new(index),
         }
     }
 }
 
 impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
+    fn prepare(&self) {
+        let mut index = self.index.write().expect("index lock poisoned");
+        index.prepare();
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.index
+            .read()
+            .expect("index lock poisoned")
+            .is_prepared()
+    }
+
+    fn search_enabled(&self) -> bool {
+        true
+    }
+
     fn query(
         &self,
         queries: &[f32],
@@ -566,43 +672,67 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
         k: usize,
         epsilon: f32,
     ) -> (Vec<i32>, Vec<f32>) {
-        self.index.query(queries, n_queries, k, epsilon)
+        self.prepare();
+        self.index
+            .read()
+            .expect("index lock poisoned")
+            .query(queries, n_queries, k, epsilon)
     }
     fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        self.prepare();
+        let index = self.index.read().expect("index lock poisoned");
         let mut workspace = self
             .workspace
             .lock()
             .expect("query workspace mutex poisoned");
-        self.index
-            .query_one_with_workspace(query, k, epsilon, &mut workspace)
+        index.query_one_with_workspace(query, k, epsilon, &mut workspace)
     }
     fn query_one_indices(&self, query: &[f32], k: usize, epsilon: f32) -> Vec<i32> {
+        self.prepare();
+        let index = self.index.read().expect("index lock poisoned");
         let mut workspace = self
             .workspace
             .lock()
             .expect("query workspace mutex poisoned");
+        index.query_one_indices_with_workspace(query, k, epsilon, &mut workspace)
+    }
+    fn neighbor_graph(&self) -> (Vec<i32>, Vec<f32>) {
+        let index = self.index.read().expect("index lock poisoned");
+        (
+            index.neighbor_indices.clone(),
+            index.neighbor_distances.clone(),
+        )
+    }
+    fn build_stats(&self) -> BuildStats {
         self.index
-            .query_one_indices_with_workspace(query, k, epsilon, &mut workspace)
-    }
-    fn neighbor_indices(&self) -> &[i32] {
-        &self.index.neighbor_indices
-    }
-    fn neighbor_distances(&self) -> &[f32] {
-        &self.index.neighbor_distances
+            .read()
+            .expect("index lock poisoned")
+            .build_stats
+            .clone()
     }
     fn search_graph_original_order(&self) -> SearchGraph {
-        self.index.search_graph_original_order()
+        self.prepare();
+        self.index
+            .read()
+            .expect("index lock poisoned")
+            .search_graph_original_order()
     }
     fn search_graph_min_distance(&self) -> f32 {
-        self.index.min_distance
+        self.prepare();
+        self.index.read().expect("index lock poisoned").min_distance
     }
     fn export_search_tree(&self) -> Option<FlatTree> {
-        self.index.export_search_tree()
+        self.prepare();
+        self.index
+            .read()
+            .expect("index lock poisoned")
+            .export_search_tree()
     }
     fn storage_info(&self) -> (&'static str, usize, usize, usize, f64) {
+        let index = self.index.read().expect("index lock poisoned");
         (
             "fp32",
-            self.index.data.len() * std::mem::size_of::<f32>(),
+            index.data.len() * std::mem::size_of::<f32>(),
             0,
             0,
             0.0,
@@ -613,7 +743,7 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
 #[pymethods]
 impl PyNNDescent {
     #[new]
-    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None))]
+    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6))]
     fn new(
         data: PyReadonlyArray2<f32>,
         metric: &str,
@@ -635,6 +765,10 @@ impl PyNNDescent {
         quantized_rerank_width: usize,
         tree_quantization: &str,
         retain_fp32_data: Option<bool>,
+        input_normalized: bool,
+        graph_only: bool,
+        tree_build_strategy: &str,
+        tree_batch_width: usize,
     ) -> PyResult<Self> {
         let shape = data.shape();
         let n_points = shape[0];
@@ -646,26 +780,17 @@ impl PyNNDescent {
             ));
         }
 
-        // Copy data to owned vec in C-contiguous (row-major) order
-        let mut data_vec: Vec<f32> = if data.is_c_contiguous() {
-            data.as_slice().unwrap().to_vec()
-        } else {
-            // F-contiguous or strided: read element by element in row-major order
-            let mut vec = Vec::with_capacity(n_points * dim);
-            for i in 0..n_points {
-                for j in 0..dim {
-                    vec.push(*data.get([i, j]).unwrap());
-                }
-            }
-            vec
-        };
-
         // Parse metric
         let parsed_metric = Metric::from_str(metric)
             .ok_or_else(|| PyValueError::new_err(format!("Unknown metric: {}", metric)))?;
 
         // For cosine, optional pre-normalization lets query-time distance use a dot-only path.
         let normalize_cosine = normalize && matches!(parsed_metric, Metric::Cosine);
+        if input_normalized && !normalize_cosine {
+            return Err(PyValueError::new_err(
+                "input_normalized=True requires metric='cosine' and normalize=True",
+            ));
+        }
         let (direct_cosine, quantized_encoding) = match cosine_distance_mode {
             "log" => (false, None),
             "direct" => (true, None),
@@ -707,7 +832,93 @@ impl PyNNDescent {
                 "direct and quantized cosine modes require metric='cosine' and normalize=True",
             ));
         }
-        if normalize_cosine {
+
+        if graph_only && quantized_encoding.is_some() {
+            return Err(PyValueError::new_err(
+                "graph_only=True is incompatible with quantized cosine modes",
+            ));
+        }
+
+        let breadth_first_batch_width = match tree_build_strategy {
+            "auto" if graph_only => Some(tree_batch_width),
+            "auto" => None,
+            "depth_first" => None,
+            "breadth_first" if !graph_only => {
+                return Err(PyValueError::new_err(
+                    "tree_build_strategy='breadth_first' currently requires graph_only=True",
+                ));
+            }
+            "breadth_first" => Some(tree_batch_width),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown tree_build_strategy: {other}; expected 'auto', 'depth_first', or 'breadth_first'"
+                )));
+            }
+        };
+        if breadth_first_batch_width.is_some_and(|width| !(1..=8).contains(&width)) {
+            return Err(PyValueError::new_err(
+                "tree_batch_width must be in 1..=8 for breadth-first construction",
+            ));
+        }
+
+        if graph_only {
+            let build = |values: &[f32]| {
+                Self::build_graph(
+                    values,
+                    n_points,
+                    dim,
+                    parsed_metric,
+                    normalize_cosine,
+                    direct_cosine,
+                    n_neighbors,
+                    n_trees,
+                    leaf_size,
+                    max_candidates,
+                    n_iters,
+                    delta,
+                    random_state.unwrap_or(42),
+                    verbose,
+                    breadth_first_batch_width,
+                )
+            };
+            let index_data = if data.is_c_contiguous() && (!normalize_cosine || input_normalized) {
+                build(data.as_slice()?)
+            } else {
+                let mut temporary = Vec::with_capacity(n_points * dim);
+                for row in 0..n_points {
+                    for column in 0..dim {
+                        temporary.push(*data.get([row, column]).unwrap());
+                    }
+                }
+                if normalize_cosine && !input_normalized {
+                    normalize_rows_inplace(&mut temporary, dim);
+                }
+                build(&temporary)
+            }?;
+
+            return Ok(Self {
+                n_points,
+                dim,
+                normalize: normalize_cosine,
+                n_neighbors,
+                index_data,
+                query_scratch: Mutex::new(Vec::new()),
+            });
+        }
+
+        // Search-capable indexes own their input after construction.
+        let mut data_vec: Vec<f32> = if data.is_c_contiguous() {
+            data.as_slice()?.to_vec()
+        } else {
+            let mut values = Vec::with_capacity(n_points * dim);
+            for row in 0..n_points {
+                for column in 0..dim {
+                    values.push(*data.get([row, column]).unwrap());
+                }
+            }
+            values
+        };
+        if normalize_cosine && !input_normalized {
             normalize_rows_inplace(&mut data_vec, dim);
         }
 
@@ -719,7 +930,7 @@ impl PyNNDescent {
 
         // Build index based on metric
         let index_data = Self::build_index(
-            &data_vec,
+            data_vec,
             n_points,
             dim,
             parsed_metric,
@@ -780,6 +991,7 @@ impl PyNNDescent {
         k: usize,
         epsilon: f32,
     ) -> PyResult<(Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<f32>>)> {
+        self.ensure_search_enabled()?;
         let shape = query_data.shape();
         let n_queries = shape[0];
         let query_dim = shape[1];
@@ -832,6 +1044,7 @@ impl PyNNDescent {
         candidate_width: usize,
         rerank_width: usize,
     ) -> PyResult<(Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<f32>>)> {
+        self.ensure_search_enabled()?;
         validate_quantized_widths(k, candidate_width, rerank_width)?;
         let shape = query_data.shape();
         let n_queries = shape[0];
@@ -882,6 +1095,7 @@ impl PyNNDescent {
         k: usize,
         epsilon: f32,
     ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<f32>>)> {
+        self.ensure_search_enabled()?;
         let qdim = query.shape()[0];
         if qdim != self.dim {
             return Err(PyValueError::new_err(format!(
@@ -923,6 +1137,7 @@ impl PyNNDescent {
         k: usize,
         epsilon: f32,
     ) -> PyResult<Bound<'py, PyArray1<i32>>> {
+        self.ensure_search_enabled()?;
         let qdim = query.shape()[0];
         if qdim != self.dim {
             return Err(PyValueError::new_err(format!(
@@ -966,6 +1181,7 @@ impl PyNNDescent {
         candidate_width: usize,
         rerank_width: usize,
     ) -> PyResult<Bound<'py, PyArray1<i32>>> {
+        self.ensure_search_enabled()?;
         validate_quantized_widths(k, candidate_width, rerank_width)?;
         let qdim = query.shape()[0];
         if qdim != self.dim {
@@ -1015,6 +1231,7 @@ impl PyNNDescent {
         &self,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<i32>>, f32)> {
+        self.ensure_search_enabled()?;
         let graph = self.index_data.search_graph_original_order();
         let min_distance = self.index_data.search_graph_min_distance();
         Ok((
@@ -1030,6 +1247,8 @@ impl PyNNDescent {
             self.index_data.storage_info();
         let info = PyDict::new_bound(py);
         info.set_item("encoding", encoding)?;
+        info.set_item("graph_only", !self.index_data.search_enabled())?;
+        info.set_item("graph_bytes", code_bytes + metadata_bytes)?;
         info.set_item("code_bytes", code_bytes)?;
         info.set_item("metadata_bytes", metadata_bytes)?;
         info.set_item("retained_fp32_bytes", retained_fp32_bytes)?;
@@ -1076,6 +1295,19 @@ impl PyNNDescent {
         Ok(info)
     }
 
+    /// Build query search structures. This method is idempotent.
+    fn prepare(&self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_search_enabled()?;
+        py.allow_threads(|| self.index_data.prepare());
+        Ok(())
+    }
+
+    /// Whether query search structures have been prepared.
+    #[getter]
+    fn is_prepared(&self) -> bool {
+        self.index_data.is_prepared()
+    }
+
     /// Get the computed neighbor graph.
     ///
     /// Returns
@@ -1090,8 +1322,7 @@ impl PyNNDescent {
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<f32>>)> {
         // Return the stored neighbor graph (no re-query needed)
-        let indices = self.index_data.neighbor_indices().to_vec();
-        let distances = self.index_data.neighbor_distances().to_vec();
+        let (indices, distances) = self.index_data.neighbor_graph();
 
         let indices_arr = PyArray1::from_vec_bound(py, indices);
         let distances_arr = PyArray1::from_vec_bound(py, distances);
@@ -1100,6 +1331,35 @@ impl PyNNDescent {
         let distances_2d = distances_arr.reshape([self.n_points, self.n_neighbors])?;
 
         Ok((indices_2d, distances_2d))
+    }
+
+    /// Return construction phase timings in seconds.
+    #[getter]
+    fn build_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self.index_data.build_stats();
+        let result = PyDict::new_bound(py);
+        result.set_item("forest_seconds", stats.nn_descent.forest_seconds)?;
+        result.set_item(
+            "leaf_initialization_seconds",
+            stats.nn_descent.leaf_initialization_seconds,
+        )?;
+        result.set_item(
+            "candidate_seconds",
+            stats.nn_descent.candidate_seconds.clone(),
+        )?;
+        result.set_item("update_seconds", stats.nn_descent.update_seconds.clone())?;
+        result.set_item("updates", stats.nn_descent.updates.clone())?;
+        result.set_item("nn_descent_seconds", stats.nn_descent.total_seconds())?;
+        result.set_item("sort_seconds", stats.sort_seconds)?;
+        result.set_item(
+            "distance_correction_seconds",
+            stats.distance_correction_seconds,
+        )?;
+        result.set_item("raw_graph_seconds", stats.raw_graph_seconds)?;
+        result.set_item("search_graph_seconds", stats.search_graph_seconds)?;
+        result.set_item("layout_seconds", stats.layout_seconds)?;
+        result.set_item("total_seconds", stats.total_seconds)?;
+        Ok(result)
     }
 
     /// Export the first retained RP tree in original input-ID space.
@@ -1114,6 +1374,7 @@ impl PyNNDescent {
         Bound<'py, PyArray2<i32>>,
         Bound<'py, PyArray1<i32>>,
     )> {
+        self.ensure_search_enabled()?;
         let tree = self
             .index_data
             .export_search_tree()
@@ -1172,8 +1433,112 @@ fn validate_quantized_widths(
 }
 
 impl PyNNDescent {
-    fn build_index(
+    fn ensure_search_enabled(&self) -> PyResult<()> {
+        if self.index_data.search_enabled() {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(
+                "search is disabled because this index was built with graph_only=True and does not retain the input data",
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_graph(
         data: &[f32],
+        n_points: usize,
+        dim: usize,
+        metric: Metric,
+        normalize_cosine: bool,
+        direct_cosine: bool,
+        n_neighbors: usize,
+        n_trees: Option<usize>,
+        leaf_size: Option<usize>,
+        max_candidates: Option<usize>,
+        n_iters: Option<usize>,
+        delta: f32,
+        random_seed: u64,
+        verbose: bool,
+        breadth_first_batch_width: Option<usize>,
+    ) -> PyResult<Box<dyn AnyIndex>> {
+        let effective_n_trees = n_trees.unwrap_or_else(|| {
+            let log_val = 2.0 * (n_points as f64).log10();
+            (log_val.round() as usize).clamp(3, 12)
+        });
+        let mut builder = NNDescentBuilder::new(data, n_points, dim)
+            .metric(metric)
+            .n_neighbors(n_neighbors)
+            .n_trees(effective_n_trees)
+            .delta(delta)
+            .random_seed(random_seed)
+            .verbose(verbose);
+        if let Some(leaf_size) = leaf_size {
+            builder = builder.leaf_size(leaf_size);
+        }
+        if let Some(max_candidates) = max_candidates {
+            builder = builder.max_candidates(max_candidates);
+        }
+        if let Some(n_iters) = n_iters {
+            builder = builder.n_iters(n_iters);
+        }
+        if let Some(batch_width) = breadth_first_batch_width {
+            builder = builder.breadth_first_tree_batch_width(batch_width);
+        } else {
+            builder = builder.depth_first_tree_build();
+        }
+
+        macro_rules! build {
+            ($distance:expr, $correction:expr) => {
+                Box::new(GraphOnlyIndex::new(
+                    builder.build_graph_with_distance($distance, $correction),
+                )) as Box<dyn AnyIndex>
+            };
+        }
+
+        Ok(match metric {
+            Metric::Euclidean | Metric::L2 => {
+                build!(SquaredEuclidean, Some(|distance: f32| distance.sqrt()))
+            }
+            Metric::SquaredEuclidean => build!(SquaredEuclidean, None),
+            Metric::Manhattan => build!(Manhattan, None),
+            Metric::Chebyshev => build!(Chebyshev, None),
+            Metric::Canberra => build!(Canberra, None),
+            Metric::BrayCurtis => build!(BrayCurtis, None),
+            Metric::Cosine => {
+                if normalize_cosine && direct_cosine {
+                    build!(DirectNormalizedCosine, None)
+                } else if normalize_cosine {
+                    build!(AlternativeDot, Some(correct_alternative_cosine))
+                } else {
+                    build!(AlternativeCosine, Some(correct_alternative_cosine))
+                }
+            }
+            Metric::Dot => build!(AlternativeDot, Some(correct_alternative_cosine)),
+            Metric::InnerProduct => build!(
+                AlternativeInnerProduct,
+                Some(correct_alternative_inner_product)
+            ),
+            Metric::Correlation => build!(Correlation, None),
+            Metric::TrueAngular => build!(TrueAngular, None),
+            Metric::TSSS => build!(TSSS, None),
+            Metric::Hamming => build!(Hamming, None),
+            Metric::Jaccard => build!(Jaccard, None),
+            Metric::Dice => build!(Dice, None),
+            Metric::Matching => build!(Matching, None),
+            Metric::Kulsinski => build!(Kulsinski, None),
+            Metric::RogersTanimoto => build!(RogersTanimoto, None),
+            Metric::RussellRao => build!(RussellRao, None),
+            Metric::SokalMichener => build!(SokalMichener, None),
+            Metric::SokalSneath => build!(SokalSneath, None),
+            Metric::Yule => build!(Yule, None),
+            Metric::Hellinger => build!(Hellinger, None),
+            Metric::JensenShannon => build!(JensenShannon, None),
+            Metric::SymmetricKL => build!(SymmetricKL, None),
+        })
+    }
+
+    fn build_index(
+        data: Vec<f32>,
         n_points: usize,
         dim: usize,
         metric: Metric,
@@ -1203,7 +1568,7 @@ impl PyNNDescent {
             (log_val.round() as usize).clamp(3, 12)
         });
 
-        let mut builder = NNDescentBuilder::new(data, n_points, dim)
+        let mut builder = NNDescentBuilder::from_vec(data, n_points, dim)
             .metric(metric)
             .n_neighbors(n_neighbors)
             .n_trees(effective_n_trees)
@@ -1230,7 +1595,7 @@ impl PyNNDescent {
         macro_rules! build {
             ($dist:expr, $corr:expr, $min_override:expr) => {
                 Box::new(AnyIndexWithWorkspace::new(
-                    builder.build_with_distance($dist, $corr),
+                    builder.build_unprepared_with_distance($dist, $corr),
                     $min_override,
                 )) as Box<dyn AnyIndex>
             };

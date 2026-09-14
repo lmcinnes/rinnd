@@ -48,7 +48,7 @@ pub mod visited;
 // Re-exports for convenience
 pub use distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 pub use heap::NeighborHeap;
-pub use index::{NNDescentBuilder, NNDescentIndex};
+pub use index::{GraphBuildResult, NNDescentBuilder, NNDescentIndex};
 pub use rng::{FastRng, TauRand};
 pub use visited::VisitedSet;
 

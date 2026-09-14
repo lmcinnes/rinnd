@@ -3,7 +3,7 @@
 use crate::distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 use crate::graph::{NeighborGraph, SearchGraph};
 use crate::heap::NeighborHeap;
-use crate::nndescent::{nn_descent, NNDescentParams};
+use crate::nndescent::{nn_descent, nn_descent_graph, NNDescentParams, NNDescentStats};
 use crate::rng::FastRng;
 use crate::search::{
     greedy_search_indices_with_workspace_initialized,
@@ -13,6 +13,26 @@ use crate::search::{
 };
 use crate::tree::{FlatTree, QuantizedFlatTree};
 use rayon::prelude::*;
+use std::borrow::Cow;
+use std::time::Instant;
+
+#[derive(Clone, Debug, Default)]
+pub struct BuildStats {
+    pub nn_descent: NNDescentStats,
+    pub sort_seconds: f64,
+    pub distance_correction_seconds: f64,
+    pub search_graph_seconds: f64,
+    pub layout_seconds: f64,
+    pub raw_graph_seconds: f64,
+    pub total_seconds: f64,
+}
+
+/// Result of building only the k-NN graph, without query search structures.
+#[derive(Clone, Debug)]
+pub struct GraphBuildResult {
+    pub graph: NeighborGraph,
+    pub stats: BuildStats,
+}
 
 /// The main NNDescent index for approximate nearest neighbor search.
 ///
@@ -50,6 +70,13 @@ pub struct NNDescentIndex<D: Distance<f32>> {
     pub min_distance: f32,
     /// RNG seed for search
     rng_seed: u64,
+    /// Construction timings for diagnostics.
+    pub build_stats: BuildStats,
+    /// Proxy distances retained until the search graph is prepared.
+    construction_distances: Option<Vec<f32>>,
+    diversify_prob: f32,
+    pruning_degree_multiplier: f32,
+    prepared: bool,
 }
 
 fn resolve_quantized_candidate_width(
@@ -89,6 +116,72 @@ fn should_rerank_quantized(k: usize, candidate_width: usize, rerank_width: usize
 }
 
 impl<D: Distance<f32>> NNDescentIndex<D> {
+    /// Whether the query search graph and physical layout have been prepared.
+    pub fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+
+    /// Build query-only structures. Calling this more than once is a no-op.
+    pub fn prepare(&mut self) {
+        if self.prepared {
+            return;
+        }
+
+        let search_graph_start = Instant::now();
+        let construction_distances = self
+            .construction_distances
+            .as_deref()
+            .unwrap_or(&self.neighbor_distances);
+        let (mut search_graph, min_distance) = SearchGraph::from_dense_diversified(
+            &self.neighbor_indices,
+            construction_distances,
+            &self.data,
+            self.n_points,
+            self.n_neighbors,
+            self.dim,
+            &self.distance,
+            self.diversify_prob,
+            self.pruning_degree_multiplier,
+        );
+        self.build_stats.search_graph_seconds = search_graph_start.elapsed().as_secs_f64();
+
+        let layout_start = Instant::now();
+        let vertex_order: Vec<usize> = self
+            .search_trees
+            .first()
+            .map(|tree| tree.indices.iter().map(|&idx| idx as usize).collect())
+            .unwrap_or_else(|| (0..self.n_points).collect());
+        assert_eq!(vertex_order.len(), self.n_points);
+
+        let mut old_to_new = vec![usize::MAX; self.n_points];
+        for (new_idx, &old_idx) in vertex_order.iter().enumerate() {
+            assert!(old_idx < self.n_points);
+            assert_eq!(old_to_new[old_idx], usize::MAX);
+            old_to_new[old_idx] = new_idx;
+        }
+
+        let mut reordered_data = Vec::with_capacity(self.data.len());
+        for &old_idx in &vertex_order {
+            let start = old_idx * self.dim;
+            reordered_data.extend_from_slice(&self.data[start..start + self.dim]);
+        }
+
+        search_graph.reorder(&vertex_order);
+        for tree in &mut self.search_trees {
+            tree.remap_indices(&old_to_new);
+        }
+
+        self.data = reordered_data;
+        self.search_graph = search_graph;
+        self.vertex_order = vertex_order;
+        self.min_distance = min_distance;
+        self.construction_distances = None;
+        self.prepared = true;
+        self.build_stats.layout_seconds = layout_start.elapsed().as_secs_f64();
+        self.build_stats.total_seconds +=
+            self.build_stats.search_graph_seconds + self.build_stats.layout_seconds;
+    }
+
     /// Bytes in retained FP32 arrays used by production APIs, FP32 graph/tree
     /// initialization, or optional exact reranking.
     pub fn retained_fp32_bytes(&self) -> usize {
@@ -447,7 +540,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
 
 /// Builder for NNDescentIndex.
 pub struct NNDescentBuilder<'a> {
-    data: &'a [f32],
+    data: Cow<'a, [f32]>,
     n_points: usize,
     dim: usize,
     metric: Metric,
@@ -463,6 +556,7 @@ pub struct NNDescentBuilder<'a> {
     verbose: bool,
     diversify_prob: f32,
     pruning_degree_multiplier: f32,
+    breadth_first_batch_width: Option<usize>,
 }
 
 impl<'a> NNDescentBuilder<'a> {
@@ -474,7 +568,7 @@ impl<'a> NNDescentBuilder<'a> {
     /// * `dim` - Dimension of each point
     pub fn new(data: &'a [f32], n_points: usize, dim: usize) -> Self {
         Self {
-            data,
+            data: Cow::Borrowed(data),
             n_points,
             dim,
             metric: Metric::Euclidean,
@@ -490,6 +584,30 @@ impl<'a> NNDescentBuilder<'a> {
             verbose: false,
             diversify_prob: 1.0,
             pruning_degree_multiplier: 1.5,
+            breadth_first_batch_width: Some(6),
+        }
+    }
+
+    /// Create a builder that transfers owned data into the finished index.
+    pub fn from_vec(data: Vec<f32>, n_points: usize, dim: usize) -> NNDescentBuilder<'static> {
+        NNDescentBuilder {
+            data: Cow::Owned(data),
+            n_points,
+            dim,
+            metric: Metric::Euclidean,
+            n_neighbors: 30,
+            n_trees: 8,
+            n_search_trees: 1,
+            search_tree_leaf_budget: 1,
+            leaf_size: None,
+            max_candidates: None,
+            n_iters: None,
+            delta: 0.001,
+            random_seed: 42,
+            verbose: false,
+            diversify_prob: 1.0,
+            pruning_degree_multiplier: 1.5,
+            breadth_first_batch_width: Some(6),
         }
     }
 
@@ -516,6 +634,22 @@ impl<'a> NNDescentBuilder<'a> {
     /// Set the number of RP trees.
     pub fn n_trees(mut self, n: usize) -> Self {
         self.n_trees = n;
+        self
+    }
+
+    /// Use the experimental breadth-first forest for graph-only construction.
+    pub fn breadth_first_tree_batch_width(mut self, width: usize) -> Self {
+        assert!(
+            (1..=8).contains(&width),
+            "tree batch width must be in 1..=8"
+        );
+        self.breadth_first_batch_width = Some(width);
+        self
+    }
+
+    /// Use depth-first forest construction for graph-only construction.
+    pub fn depth_first_tree_build(mut self) -> Self {
+        self.breadth_first_batch_width = None;
         self
     }
 
@@ -597,12 +731,108 @@ impl<'a> NNDescentBuilder<'a> {
         self.build_with_distance(InnerProduct, None)
     }
 
+    /// Build only the sorted k-NN graph and discard data and RP trees.
+    pub fn build_graph_with_distance<D: Distance<f32>>(
+        self,
+        distance: D,
+        correction: Option<fn(f32) -> f32>,
+    ) -> GraphBuildResult {
+        let build_start = Instant::now();
+        let angular = matches!(
+            self.metric,
+            Metric::Cosine
+                | Metric::InnerProduct
+                | Metric::Dot
+                | Metric::Correlation
+                | Metric::TrueAngular
+                | Metric::TSSS
+        );
+        let leaf_size = self
+            .leaf_size
+            .unwrap_or_else(|| (5 * self.n_neighbors).min(256).max(60));
+        let max_candidates = self
+            .max_candidates
+            .unwrap_or_else(|| self.n_neighbors.min(60));
+        let n_iters = self
+            .n_iters
+            .unwrap_or_else(|| ((self.n_points as f64).log2().ceil() as usize).max(5));
+        let params = NNDescentParams {
+            n_neighbors: self.n_neighbors,
+            n_trees: self.n_trees,
+            leaf_size,
+            max_candidates,
+            n_iters,
+            delta: self.delta,
+            angular,
+            max_depth: 200,
+            verbose: self.verbose,
+        };
+        let mut rng = FastRng::new(self.random_seed);
+        let (mut neighbor_heap, _forest, nn_descent_stats) = nn_descent_graph(
+            &self.data,
+            self.n_points,
+            self.dim,
+            &distance,
+            &params,
+            &mut rng,
+            self.breadth_first_batch_width,
+        );
+
+        let sort_start = Instant::now();
+        neighbor_heap.sort_all();
+        let sort_seconds = sort_start.elapsed().as_secs_f64();
+
+        let distance_correction_start = Instant::now();
+        let distances = if let Some(correction) = correction {
+            neighbor_heap
+                .distances
+                .iter()
+                .map(|&distance| correction(distance))
+                .collect()
+        } else {
+            neighbor_heap.distances
+        };
+        let distance_correction_seconds = distance_correction_start.elapsed().as_secs_f64();
+        let raw_graph_seconds =
+            nn_descent_stats.total_seconds() + sort_seconds + distance_correction_seconds;
+
+        GraphBuildResult {
+            graph: NeighborGraph {
+                indices: neighbor_heap.indices,
+                distances,
+                n_points: self.n_points,
+                k: self.n_neighbors,
+            },
+            stats: BuildStats {
+                nn_descent: nn_descent_stats,
+                sort_seconds,
+                distance_correction_seconds,
+                search_graph_seconds: 0.0,
+                layout_seconds: 0.0,
+                raw_graph_seconds,
+                total_seconds: build_start.elapsed().as_secs_f64(),
+            },
+        }
+    }
+
     /// Build the index with a custom distance function.
     pub fn build_with_distance<D: Distance<f32>>(
         self,
         distance: D,
         correction: Option<fn(f32) -> f32>,
     ) -> NNDescentIndex<D> {
+        let mut index = self.build_unprepared_with_distance(distance, correction);
+        index.prepare();
+        index
+    }
+
+    /// Build only the sorted k-NN graph, deferring query search structures.
+    pub fn build_unprepared_with_distance<D: Distance<f32>>(
+        self,
+        distance: D,
+        correction: Option<fn(f32) -> f32>,
+    ) -> NNDescentIndex<D> {
+        let build_start = Instant::now();
         let angular = matches!(
             self.metric,
             Metric::Cosine
@@ -639,8 +869,8 @@ impl<'a> NNDescentBuilder<'a> {
         let mut rng = FastRng::new(self.random_seed);
 
         // Run NN-descent
-        let (mut neighbor_heap, forest) = nn_descent(
-            self.data,
+        let (mut neighbor_heap, forest, nn_descent_stats) = nn_descent(
+            &self.data,
             self.n_points,
             self.dim,
             &distance,
@@ -650,72 +880,36 @@ impl<'a> NNDescentBuilder<'a> {
 
         // Sort the heap so neighbors are in ascending distance order
         // (matches PyNNDescent's deheap_sort behavior)
+        let sort_start = Instant::now();
         neighbor_heap.sort_all();
-
-        // Build search graph with diversification and pruning (matching PyNNDescent pipeline)
-        let (mut search_graph, min_distance) = SearchGraph::from_dense_diversified(
-            &neighbor_heap.indices,
-            &neighbor_heap.distances,
-            self.data,
-            self.n_points,
-            self.n_neighbors,
-            self.dim,
-            &distance,
-            self.diversify_prob,
-            self.pruning_degree_multiplier,
-        );
+        let sort_seconds = sort_start.elapsed().as_secs_f64();
 
         // Apply distance correction to stored distances if needed
+        let distance_correction_start = Instant::now();
         let neighbor_distances = if let Some(corr) = correction {
             neighbor_heap.distances.iter().map(|&d| corr(d)).collect()
         } else {
             neighbor_heap.distances.clone()
         };
+        let distance_correction_seconds = distance_correction_start.elapsed().as_secs_f64();
 
-        // Use the first retained tree for physical search-time layout and keep
-        // the requested prefix of the forest for query seeding. This preserves
-        // the current one-tree behavior by default while allowing entry-quality
-        // experiments independently of construction forest size.
-        let mut search_trees: Vec<FlatTree> =
-            forest.into_iter().take(self.n_search_trees).collect();
-        let tree_order: Vec<usize> = search_trees
-            .first()
-            .map(|tree| tree.indices.iter().map(|&idx| idx as usize).collect())
-            .unwrap_or_else(|| (0..self.n_points).collect());
-        let vertex_order = tree_order;
+        let search_trees: Vec<FlatTree> = forest.into_iter().take(self.n_search_trees).collect();
+        let raw_graph_seconds =
+            nn_descent_stats.total_seconds() + sort_seconds + distance_correction_seconds;
+        let build_stats = BuildStats {
+            nn_descent: nn_descent_stats,
+            sort_seconds,
+            distance_correction_seconds,
+            search_graph_seconds: 0.0,
+            layout_seconds: 0.0,
+            raw_graph_seconds,
+            total_seconds: build_start.elapsed().as_secs_f64(),
+        };
 
-        assert_eq!(
-            vertex_order.len(),
-            self.n_points,
-            "search tree order must include every point"
-        );
-        let mut old_to_new = vec![usize::MAX; self.n_points];
-        for (new_idx, &old_idx) in vertex_order.iter().enumerate() {
-            assert!(
-                old_idx < self.n_points,
-                "search tree contains an out-of-range point ID"
-            );
-            assert_eq!(
-                old_to_new[old_idx],
-                usize::MAX,
-                "search tree order contains a duplicate point ID"
-            );
-            old_to_new[old_idx] = new_idx;
-        }
-
-        let mut reordered_data = Vec::with_capacity(self.data.len());
-        for &old_idx in &vertex_order {
-            let start = old_idx * self.dim;
-            reordered_data.extend_from_slice(&self.data[start..start + self.dim]);
-        }
-
-        search_graph.reorder(&vertex_order);
-        for tree in &mut search_trees {
-            tree.remap_indices(&old_to_new);
-        }
+        let construction_distances = correction.map(|_| neighbor_heap.distances.clone());
 
         NNDescentIndex {
-            data: reordered_data,
+            data: self.data.into_owned(),
             n_points: self.n_points,
             dim: self.dim,
             distance,
@@ -723,12 +917,17 @@ impl<'a> NNDescentBuilder<'a> {
             n_neighbors: self.n_neighbors,
             neighbor_indices: neighbor_heap.indices,
             neighbor_distances,
-            search_graph,
+            search_graph: SearchGraph::new(self.n_points),
             search_trees,
             search_tree_leaf_budget: self.search_tree_leaf_budget,
-            vertex_order,
-            min_distance,
+            vertex_order: (0..self.n_points).collect(),
+            min_distance: f32::INFINITY,
             rng_seed: self.random_seed,
+            build_stats,
+            construction_distances,
+            diversify_prob: self.diversify_prob,
+            pruning_degree_multiplier: self.pruning_degree_multiplier,
+            prepared: false,
         }
     }
 }
@@ -888,5 +1087,66 @@ mod tests {
         let mut ids = tree.indices;
         ids.sort_unstable();
         assert_eq!(ids, (0..n as i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_build_graph_with_distance_retains_only_graph() {
+        let n = 50;
+        let dim = 8;
+        let k = 5;
+        let data = create_test_data(n, dim);
+
+        let result = NNDescentBuilder::new(&data, n, dim)
+            .n_neighbors(k)
+            .n_trees(2)
+            .n_iters(3)
+            .build_graph_with_distance(SquaredEuclidean, Some(|distance| distance.sqrt()));
+
+        assert_eq!(result.graph.n_points, n);
+        assert_eq!(result.graph.k, k);
+        assert_eq!(result.graph.indices.len(), n * k);
+        assert_eq!(result.graph.distances.len(), n * k);
+        assert!(result
+            .graph
+            .indices
+            .iter()
+            .all(|&index| index >= 0 && index < n as i32));
+        assert!(result
+            .graph
+            .distances
+            .iter()
+            .all(|distance| distance.is_finite()));
+        assert!(result.stats.raw_graph_seconds > 0.0);
+        assert_eq!(result.stats.search_graph_seconds, 0.0);
+        assert_eq!(result.stats.layout_seconds, 0.0);
+    }
+
+    #[test]
+    fn test_build_graph_with_breadth_first_forest() {
+        let n = 100;
+        let dim = 12;
+        let k = 8;
+        let data = create_test_data(n, dim);
+
+        let result = NNDescentBuilder::new(&data, n, dim)
+            .n_neighbors(k)
+            .n_trees(4)
+            .n_iters(3)
+            .breadth_first_tree_batch_width(4)
+            .build_graph_with_distance(SquaredEuclidean, Some(|distance| distance.sqrt()));
+
+        assert_eq!(result.graph.indices.len(), n * k);
+        assert_eq!(result.graph.distances.len(), n * k);
+        assert!(result.graph.indices.iter().all(|&index| index >= 0));
+        assert!(result
+            .graph
+            .distances
+            .iter()
+            .all(|distance| distance.is_finite()));
+        assert!(result
+            .graph
+            .distances
+            .chunks(k)
+            .all(|row| row.windows(2).all(|pair| pair[0] <= pair[1])));
     }
 }

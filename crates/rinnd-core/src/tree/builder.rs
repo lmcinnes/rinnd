@@ -60,15 +60,6 @@ unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Build a random projection tree.
-///
-/// # Arguments
-/// * `data` - Flattened data array (n_points × dim)
-/// * `n_points` - Number of data points
-/// * `dim` - Dimension of each point
-/// * `leaf_size` - Maximum number of points in a leaf
-/// * `rng` - Random number generator
-/// * `angular` - Whether to use angular (cosine) distance for splitting
-/// * `max_depth` - Maximum tree depth
 pub fn build_rp_tree(
     data: &[f32],
     n_points: usize,
@@ -79,13 +70,28 @@ pub fn build_rp_tree(
     max_depth: usize,
 ) -> FlatTree {
     let indices: Vec<i32> = (0..n_points as i32).collect();
-
-    let mut builder = TreeBuilder::new(data, dim, leaf_size, angular, max_depth);
+    let mut builder = TreeBuilder::new(data, dim, leaf_size, angular, max_depth, true);
     builder.build(&indices, rng);
     builder.into_flat_tree()
 }
 
-/// Build a forest of random projection trees (parallel).
+/// Build only the leaf partitions of a random projection tree.
+pub(crate) fn build_rp_leaf_tree(
+    data: &[f32],
+    n_points: usize,
+    dim: usize,
+    leaf_size: usize,
+    rng: &mut FastRng,
+    angular: bool,
+    max_depth: usize,
+) -> Vec<Vec<i32>> {
+    let indices: Vec<i32> = (0..n_points as i32).collect();
+    let mut builder = TreeBuilder::new(data, dim, leaf_size, angular, max_depth, false);
+    builder.build(&indices, rng);
+    builder.into_leaves()
+}
+
+/// Build a forest of random projection trees in parallel.
 pub fn build_rp_forest(
     data: &[f32],
     n_points: usize,
@@ -96,10 +102,7 @@ pub fn build_rp_forest(
     angular: bool,
     max_depth: usize,
 ) -> Vec<FlatTree> {
-    // Generate seeds for each tree's RNG
     let seeds: Vec<u64> = (0..n_trees).map(|_| rng.next_u64()).collect();
-
-    // Build trees in parallel with independent RNGs
     seeds
         .into_par_iter()
         .map(|seed| {
@@ -117,50 +120,82 @@ pub fn build_rp_forest(
         .collect()
 }
 
-/// Extract leaf arrays from a forest.
-///
-/// Returns a 2D array where each row contains the point indices in one leaf.
+/// Build forest leaf partitions without retaining query-tree storage.
+pub(crate) fn build_rp_leaf_forest(
+    data: &[f32],
+    n_points: usize,
+    dim: usize,
+    n_trees: usize,
+    leaf_size: usize,
+    rng: &mut FastRng,
+    angular: bool,
+    max_depth: usize,
+) -> Vec<Vec<i32>> {
+    let seeds: Vec<u64> = (0..n_trees).map(|_| rng.next_u64()).collect();
+    seeds
+        .into_par_iter()
+        .map(|seed| {
+            let mut tree_rng = FastRng::new(seed);
+            build_rp_leaf_tree(
+                data,
+                n_points,
+                dim,
+                leaf_size,
+                &mut tree_rng,
+                angular,
+                max_depth,
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+/// Extract leaf arrays from a retained forest.
 pub fn rptree_leaf_array(forest: &[FlatTree]) -> Vec<Vec<i32>> {
     let mut result = Vec::new();
-
     for tree in forest {
-        let leaves = tree.get_all_leaves();
-        for (start, end) in leaves {
-            let leaf_indices = tree.indices[start..end].to_vec();
-            result.push(leaf_indices);
+        for (start, end) in tree.get_all_leaves() {
+            result.push(tree.indices[start..end].to_vec());
         }
     }
-
     result
 }
 
-/// Internal tree builder structure.
 struct TreeBuilder<'a> {
     data: &'a [f32],
     dim: usize,
     leaf_size: usize,
     angular: bool,
     max_depth: usize,
-
-    // Output arrays
+    retain_tree: bool,
     hyperplanes: Vec<f32>,
     offsets: Vec<f32>,
     children: Vec<[i32; 2]>,
     leaf_indices: Vec<i32>,
+    leaves: Vec<Vec<i32>>,
 }
 
 impl<'a> TreeBuilder<'a> {
-    fn new(data: &'a [f32], dim: usize, leaf_size: usize, angular: bool, max_depth: usize) -> Self {
+    fn new(
+        data: &'a [f32],
+        dim: usize,
+        leaf_size: usize,
+        angular: bool,
+        max_depth: usize,
+        retain_tree: bool,
+    ) -> Self {
         Self {
             data,
             dim,
             leaf_size,
             angular,
             max_depth,
+            retain_tree,
             hyperplanes: Vec::new(),
             offsets: Vec::new(),
             children: Vec::new(),
             leaf_indices: Vec::new(),
+            leaves: Vec::new(),
         }
     }
 
@@ -169,76 +204,62 @@ impl<'a> TreeBuilder<'a> {
         self.build_recursive(&mut indices, 0, rng);
     }
 
-    fn build_recursive(&mut self, indices: &mut [i32], depth: usize, rng: &mut FastRng) -> i32 {
+    fn store_leaf(&mut self, indices: &[i32]) -> i32 {
+        if !self.retain_tree {
+            self.leaves.push(indices.to_vec());
+            return -1;
+        }
         let node_id = self.children.len() as i32;
+        let start = self.leaf_indices.len() as i32;
+        self.leaf_indices.extend_from_slice(indices);
+        let end = self.leaf_indices.len() as i32;
+        self.hyperplanes
+            .resize(self.hyperplanes.len() + self.dim, 0.0);
+        self.offsets.push(0.0);
+        self.children.push([-start, -end]);
+        node_id
+    }
 
-        // Check if we should make a leaf
+    fn build_recursive(&mut self, indices: &mut [i32], depth: usize, rng: &mut FastRng) -> i32 {
         if indices.len() <= self.leaf_size || depth >= self.max_depth {
-            // Create leaf node
-            let start = self.leaf_indices.len() as i32;
-            self.leaf_indices.extend_from_slice(indices);
-            let end = self.leaf_indices.len() as i32;
-
-            // Store zeros for hyperplane (unused in leaves)
-            let hp_start = self.hyperplanes.len();
-            self.hyperplanes.resize(hp_start + self.dim, 0.0);
-            self.offsets.push(0.0);
-            self.children.push([-start, -end]);
-
-            return node_id;
+            return self.store_leaf(indices);
         }
 
-        // Select split hyperplane
         let (hyperplane, offset) = self.make_split(indices, rng);
-
-        // In-place partition: rearrange indices so left elements come first
         let split_pos = self.partition_inplace(indices, &hyperplane, offset, rng);
-
-        // Handle degenerate splits
         if split_pos == 0 || split_pos == indices.len() {
-            // Fall back to leaf
-            let start = self.leaf_indices.len() as i32;
-            self.leaf_indices.extend_from_slice(indices);
-            let end = self.leaf_indices.len() as i32;
-
-            let hp_start = self.hyperplanes.len();
-            self.hyperplanes.resize(hp_start + self.dim, 0.0);
-            self.offsets.push(0.0);
-            self.children.push([-start, -end]);
-
-            return node_id;
+            return self.store_leaf(indices);
         }
 
-        // Add placeholder for this node
-        self.hyperplanes.extend_from_slice(&hyperplane);
-        self.offsets.push(offset);
-        self.children.push([0, 0]); // Will be filled in
+        let node_id = if self.retain_tree {
+            let node_id = self.children.len() as i32;
+            self.hyperplanes.extend_from_slice(&hyperplane);
+            self.offsets.push(offset);
+            self.children.push([0, 0]);
+            node_id
+        } else {
+            -1
+        };
 
-        // Split indices slice and recurse
         let (left_indices, right_indices) = indices.split_at_mut(split_pos);
         let left_child = self.build_recursive(left_indices, depth + 1, rng);
         let right_child = self.build_recursive(right_indices, depth + 1, rng);
-
-        // Update children pointers
-        self.children[node_id as usize] = [left_child, right_child];
-
+        if self.retain_tree {
+            self.children[node_id as usize] = [left_child, right_child];
+        }
         node_id
     }
 
     fn make_split(&self, indices: &[i32], rng: &mut FastRng) -> (Vec<f32>, f32) {
-        // Pick two random points
         let idx1 = rng.next_index(indices.len());
         let mut idx2 = rng.next_index(indices.len());
         while idx2 == idx1 && indices.len() > 1 {
             idx2 = rng.next_index(indices.len());
         }
-
-        let p1 = indices[idx1] as usize;
-        let p2 = indices[idx2] as usize;
-
-        let point1 = &self.data[p1 * self.dim..(p1 + 1) * self.dim];
-        let point2 = &self.data[p2 * self.dim..(p2 + 1) * self.dim];
-
+        let point1 =
+            &self.data[indices[idx1] as usize * self.dim..(indices[idx1] as usize + 1) * self.dim];
+        let point2 =
+            &self.data[indices[idx2] as usize * self.dim..(indices[idx2] as usize + 1) * self.dim];
         if self.angular {
             self.make_angular_split(point1, point2)
         } else {
@@ -247,68 +268,46 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn make_euclidean_split(&self, point1: &[f32], point2: &[f32]) -> (Vec<f32>, f32) {
-        // Hyperplane is perpendicular bisector of the two points
-        // Normal vector: point2 - point1
-        // Offset: -dot(normal, midpoint) computed inline to avoid midpoint Vec
-
-        let dim = self.dim;
-        let mut hyperplane = vec![0.0f32; dim];
-        let mut norm_sq = 0.0f32;
-        let mut dot_nm = 0.0f32; // dot(normal, midpoint)
-
-        for i in 0..dim {
-            let h = point2[i] - point1[i];
-            let m = (point1[i] + point2[i]) * 0.5;
-            hyperplane[i] = h;
-            norm_sq += h * h;
-            dot_nm += h * m;
+        let mut hyperplane = vec![0.0; self.dim];
+        let mut norm_sq = 0.0;
+        let mut dot_nm = 0.0;
+        for i in 0..self.dim {
+            let value = point2[i] - point1[i];
+            hyperplane[i] = value;
+            norm_sq += value * value;
+            dot_nm += value * (point1[i] + point2[i]) * 0.5;
         }
-
         let norm = norm_sq.sqrt();
         let offset = if norm > 1e-8 {
-            let inv_norm = 1.0 / norm;
-            for x in &mut hyperplane {
-                *x *= inv_norm;
+            let inv_norm = norm.recip();
+            for value in &mut hyperplane {
+                *value *= inv_norm;
             }
             -dot_nm * inv_norm
         } else {
             0.0
         };
-
         (hyperplane, offset)
     }
 
     fn make_angular_split(&self, point1: &[f32], point2: &[f32]) -> (Vec<f32>, f32) {
-        // For angular distance, use the normalized difference
-        let mut hyperplane = Vec::with_capacity(self.dim);
-
-        // Normalize both points
-        let norm1: f32 = point1.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm2: f32 = point2.iter().map(|x| x * x).sum::<f32>().sqrt();
-
+        let norm1 = dot_product(point1, point1).sqrt();
+        let norm2 = dot_product(point2, point2).sqrt();
         if norm1 < 1e-8 || norm2 < 1e-8 {
-            // Degenerate case
-            hyperplane.resize(self.dim, 0.0);
-            return (hyperplane, 0.0);
+            return (vec![0.0; self.dim], 0.0);
         }
-
-        for i in 0..self.dim {
-            hyperplane.push(point2[i] / norm2 - point1[i] / norm1);
-        }
-
-        // Normalize hyperplane
-        let norm: f32 = hyperplane.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut hyperplane: Vec<f32> = (0..self.dim)
+            .map(|i| point2[i] / norm2 - point1[i] / norm1)
+            .collect();
+        let norm = dot_product(&hyperplane, &hyperplane).sqrt();
         if norm > 1e-8 {
-            for x in &mut hyperplane {
-                *x /= norm;
+            for value in &mut hyperplane {
+                *value /= norm;
             }
         }
-
-        (hyperplane, 0.0) // offset is 0 for angular splits
+        (hyperplane, 0.0)
     }
 
-    /// In-place partition of indices. Returns the split position (number of left elements).
-    /// After this call, indices[..split_pos] are left elements and indices[split_pos..] are right.
     fn partition_inplace(
         &self,
         indices: &mut [i32],
@@ -316,26 +315,17 @@ impl<'a> TreeBuilder<'a> {
         offset: f32,
         rng: &mut FastRng,
     ) -> usize {
-        let n = indices.len();
-        let dim = self.dim;
-
-        // Two-pointer partition: left pointer moves right, right pointer moves left
-        let mut left = 0usize;
-        let mut right = n;
-
+        let mut left = 0;
+        let mut right = indices.len();
         while left < right {
-            let idx = indices[left] as usize;
-            let p_start = idx * dim;
-            let point = &self.data[p_start..p_start + dim];
-
+            let index = indices[left] as usize;
+            let point = &self.data[index * self.dim..(index + 1) * self.dim];
             let margin = dot_product(point, hyperplane) + offset;
-
             let goes_left = if margin.abs() < 1e-8 {
                 !rng.next_bool()
             } else {
                 margin < 0.0
             };
-
             if goes_left {
                 left += 1;
             } else {
@@ -343,20 +333,22 @@ impl<'a> TreeBuilder<'a> {
                 indices.swap(left, right);
             }
         }
-
-        left // split position
+        left
     }
 
     fn into_flat_tree(self) -> FlatTree {
-        let n_nodes = self.children.len();
         FlatTree {
+            n_nodes: self.children.len(),
             hyperplanes: self.hyperplanes,
             offsets: self.offsets,
             children: self.children,
             indices: self.leaf_indices,
             dim: self.dim,
-            n_nodes,
         }
+    }
+
+    fn into_leaves(self) -> Vec<Vec<i32>> {
+        self.leaves
     }
 }
 
@@ -427,6 +419,19 @@ mod tests {
         all_indices.sort();
         let expected: Vec<i32> = (0..n_points as i32).collect();
         assert_eq!(all_indices, expected);
+    }
+
+    #[test]
+    fn test_leaf_only_tree_matches_retained_tree_partitions() {
+        let data: Vec<f32> = (0..800).map(|i| ((i as f32) * 0.17).sin()).collect();
+        let mut retained_rng = FastRng::new(42);
+        let mut leaf_only_rng = FastRng::new(42);
+
+        let tree = build_rp_tree(&data, 100, 8, 10, &mut retained_rng, true, 20);
+        let retained_leaves = rptree_leaf_array(&[tree]);
+        let leaf_only_leaves = build_rp_leaf_tree(&data, 100, 8, 10, &mut leaf_only_rng, true, 20);
+
+        assert_eq!(leaf_only_leaves, retained_leaves);
     }
 
     #[test]

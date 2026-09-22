@@ -73,6 +73,19 @@ indices, distances = index.query(query, k=10)
 print(rinnd.simd_info())
 ```
 
+Pass `n_jobs=-1` to use all logical cores available to the process, or a
+positive integer to give an index its own pool with exactly that many worker
+threads:
+
+```python
+index = rinnd.RINND(data, n_neighbors=15, n_jobs=4)
+```
+
+An explicit `n_jobs` setting applies to index construction, lazy preparation,
+and queries. Omitting `n_jobs`, or passing `None`, preserves the existing Rayon
+global-pool behavior, including `RAYON_NUM_THREADS`. Values of `0` and values
+less than `-1` are rejected.
+
 Construction produces the k-NN graph without building query-only structures.
 Accessing `neighbor_graph` does not trigger that extra work. Call
 `index.prepare()` explicitly when query latency must not include preparation;

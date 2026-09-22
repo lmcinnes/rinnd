@@ -36,6 +36,49 @@ def test_single_query_matches_batch_query():
     np.testing.assert_allclose(single_distances, batch_distances[0])
 
 
+def test_n_jobs_applies_to_construction_preparation_and_batch_query():
+    data = make_data(n_points=64)
+    index = rinnd.RINND(
+        data,
+        n_neighbors=6,
+        n_trees=2,
+        n_iters=3,
+        random_state=42,
+        n_jobs=1,
+    )
+
+    assert index.is_prepared is False
+    index.prepare()
+    assert index.is_prepared is True
+    indices, distances = index.query(data[:8], k=4)
+    assert indices.shape == (8, 4)
+    assert np.all(np.isfinite(distances))
+
+
+@pytest.mark.parametrize("n_jobs", [None, -1, 2])
+def test_n_jobs_accepts_all_cores_and_positive_limits(n_jobs):
+    data = make_data()
+    index = rinnd.RINND(
+        data,
+        graph_only=True,
+        n_neighbors=6,
+        n_trees=2,
+        n_iters=3,
+        random_state=42,
+        n_jobs=n_jobs,
+    )
+
+    indices, distances = index.neighbor_graph
+    assert indices.shape == (len(data), 6)
+    assert np.all(np.isfinite(distances))
+
+
+@pytest.mark.parametrize("n_jobs", [0, -2])
+def test_n_jobs_rejects_invalid_values(n_jobs):
+    with pytest.raises(ValueError, match="n_jobs must be -1 or a positive integer"):
+        rinnd.RINND(make_data(), n_jobs=n_jobs)
+
+
 def test_cosine_direct_mode_and_simd_info():
     data = make_data().astype(np.float32)
     index = rinnd.RINND(

@@ -17,5 +17,6 @@ rinnd-core = { path = "../rinnd-core", features = ["rayon"] }
 rinnd-simd = { path = "../rinnd-simd" }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]

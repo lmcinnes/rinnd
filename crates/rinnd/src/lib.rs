@@ -3,9 +3,10 @@
 //! This crate provides Python-compatible classes that mirror the PyNNDescent API.
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
@@ -17,6 +18,38 @@ use rinnd_core::graph::{NeighborGraph, SearchGraph};
 use rinnd_core::index::{BuildStats, GraphBuildResult, NNDescentBuilder, NNDescentIndex};
 use rinnd_core::search::SearchWorkspace;
 use rinnd_core::tree::{FlatTree, QuantizedFlatTree};
+
+fn thread_pool_for_n_jobs(n_jobs: Option<isize>) -> PyResult<Option<ThreadPool>> {
+    let Some(n_jobs) = n_jobs else {
+        return Ok(None);
+    };
+    let num_threads = match n_jobs {
+        -1 => std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+        1.. => n_jobs as usize,
+        _ => {
+            return Err(PyValueError::new_err(
+                "n_jobs must be -1 or a positive integer",
+            ))
+        }
+    };
+    ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .map(Some)
+        .map_err(|error| PyRuntimeError::new_err(format!("failed to create thread pool: {error}")))
+}
+
+fn install_in_pool<R: Send>(
+    thread_pool: Option<&ThreadPool>,
+    operation: impl FnOnce() -> R + Send,
+) -> R {
+    match thread_pool {
+        Some(thread_pool) => thread_pool.install(operation),
+        None => operation(),
+    }
+}
 
 /// NNDescent index for approximate nearest neighbor search.
 ///
@@ -45,6 +78,10 @@ use rinnd_core::tree::{FlatTree, QuantizedFlatTree};
 ///     Random seed for reproducibility.
 /// verbose : bool, default=False
 ///     Whether to print progress information.
+/// n_jobs : int, optional
+///     Maximum number of worker threads for this index. Use -1 for all
+///     available cores. Positive values select an exact thread count. If
+///     omitted, RINND uses Rayon's global thread pool configuration.
 ///
 /// Attributes
 /// ----------
@@ -70,6 +107,8 @@ pub struct PyNNDescent {
     index_data: Box<dyn AnyIndex>,
     /// Reusable scratch space for single-query normalization.
     query_scratch: Mutex<Vec<f32>>,
+    /// Optional per-index pool for explicit Python thread limits.
+    thread_pool: Option<ThreadPool>,
 }
 
 /// Trait for type-erased index operations.
@@ -743,7 +782,7 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
 #[pymethods]
 impl PyNNDescent {
     #[new]
-    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6))]
+    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6, n_jobs=None))]
     fn new(
         data: PyReadonlyArray2<f32>,
         metric: &str,
@@ -769,10 +808,12 @@ impl PyNNDescent {
         graph_only: bool,
         tree_build_strategy: &str,
         tree_batch_width: usize,
+        n_jobs: Option<isize>,
     ) -> PyResult<Self> {
         let shape = data.shape();
         let n_points = shape[0];
         let dim = shape[1];
+        let thread_pool = thread_pool_for_n_jobs(n_jobs)?;
 
         if quantized_candidate_width > 0 && quantized_rerank_width > quantized_candidate_width {
             return Err(PyValueError::new_err(
@@ -882,7 +923,8 @@ impl PyNNDescent {
                 )
             };
             let index_data = if data.is_c_contiguous() && (!normalize_cosine || input_normalized) {
-                build(data.as_slice()?)
+                let data_slice = data.as_slice()?;
+                install_in_pool(thread_pool.as_ref(), || build(data_slice))
             } else {
                 let mut temporary = Vec::with_capacity(n_points * dim);
                 for row in 0..n_points {
@@ -893,7 +935,7 @@ impl PyNNDescent {
                 if normalize_cosine && !input_normalized {
                     normalize_rows_inplace(&mut temporary, dim);
                 }
-                build(&temporary)
+                install_in_pool(thread_pool.as_ref(), || build(&temporary))
             }?;
 
             return Ok(Self {
@@ -903,6 +945,7 @@ impl PyNNDescent {
                 n_neighbors,
                 index_data,
                 query_scratch: Mutex::new(Vec::new()),
+                thread_pool,
             });
         }
 
@@ -929,31 +972,33 @@ impl PyNNDescent {
         });
 
         // Build index based on metric
-        let index_data = Self::build_index(
-            data_vec,
-            n_points,
-            dim,
-            parsed_metric,
-            normalize_cosine,
-            direct_cosine,
-            quantized_encoding,
-            quantized_candidate_width,
-            quantized_rerank_width,
-            quantize_trees,
-            retain_fp32_data,
-            n_neighbors,
-            n_trees,
-            n_search_trees,
-            search_tree_leaf_budget,
-            leaf_size,
-            max_candidates,
-            n_iters,
-            delta,
-            random_state.unwrap_or(42),
-            diversify_prob,
-            pruning_degree_multiplier,
-            verbose,
-        )?;
+        let index_data = install_in_pool(thread_pool.as_ref(), || {
+            Self::build_index(
+                data_vec,
+                n_points,
+                dim,
+                parsed_metric,
+                normalize_cosine,
+                direct_cosine,
+                quantized_encoding,
+                quantized_candidate_width,
+                quantized_rerank_width,
+                quantize_trees,
+                retain_fp32_data,
+                n_neighbors,
+                n_trees,
+                n_search_trees,
+                search_tree_leaf_budget,
+                leaf_size,
+                max_candidates,
+                n_iters,
+                delta,
+                random_state.unwrap_or(42),
+                diversify_prob,
+                pruning_degree_multiplier,
+                verbose,
+            )
+        })?;
 
         Ok(Self {
             n_points,
@@ -962,6 +1007,7 @@ impl PyNNDescent {
             n_neighbors,
             index_data,
             query_scratch: Mutex::new(vec![0.0; dim]),
+            thread_pool,
         })
     }
 
@@ -1019,8 +1065,9 @@ impl PyNNDescent {
             normalize_rows_inplace(&mut query_vec, query_dim);
         }
 
-        let (indices, distances) =
-            py.allow_threads(|| self.index_data.query(&query_vec, n_queries, k, epsilon));
+        let (indices, distances) = py.allow_threads(|| {
+            self.install(|| self.index_data.query(&query_vec, n_queries, k, epsilon))
+        });
 
         // Create 2D arrays directly
         let indices_arr = PyArray1::from_vec_bound(py, indices);
@@ -1072,14 +1119,16 @@ impl PyNNDescent {
         }
 
         let (indices, distances) = py.allow_threads(|| {
-            self.index_data.query_quantized_widths(
-                &query_vec,
-                n_queries,
-                k,
-                epsilon,
-                candidate_width,
-                rerank_width,
-            )
+            self.install(|| {
+                self.index_data.query_quantized_widths(
+                    &query_vec,
+                    n_queries,
+                    k,
+                    epsilon,
+                    candidate_width,
+                    rerank_width,
+                )
+            })
         })?;
         let indices_arr = PyArray1::from_vec_bound(py, indices).reshape([n_queries, k])?;
         let distances_arr = PyArray1::from_vec_bound(py, distances).reshape([n_queries, k])?;
@@ -1115,9 +1164,11 @@ impl PyNNDescent {
             }
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| self.index_data.query_one(&scratch[..], k, epsilon))
+            py.allow_threads(|| {
+                self.install(|| self.index_data.query_one(&scratch[..], k, epsilon))
+            })
         } else {
-            py.allow_threads(|| self.index_data.query_one(query_slice, k, epsilon))
+            py.allow_threads(|| self.install(|| self.index_data.query_one(query_slice, k, epsilon)))
         };
 
         let idx = PyArray1::from_vec_bound(py, indices);
@@ -1157,9 +1208,13 @@ impl PyNNDescent {
             }
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| self.index_data.query_one_indices(&scratch[..], k, epsilon))
+            py.allow_threads(|| {
+                self.install(|| self.index_data.query_one_indices(&scratch[..], k, epsilon))
+            })
         } else {
-            py.allow_threads(|| self.index_data.query_one_indices(query_slice, k, epsilon))
+            py.allow_threads(|| {
+                self.install(|| self.index_data.query_one_indices(query_slice, k, epsilon))
+            })
         };
 
         Ok(PyArray1::from_vec_bound(py, indices))
@@ -1203,23 +1258,27 @@ impl PyNNDescent {
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
             py.allow_threads(|| {
-                self.index_data.query_one_quantized_widths(
-                    &scratch[..],
-                    k,
-                    epsilon,
-                    candidate_width,
-                    rerank_width,
-                )
+                self.install(|| {
+                    self.index_data.query_one_quantized_widths(
+                        &scratch[..],
+                        k,
+                        epsilon,
+                        candidate_width,
+                        rerank_width,
+                    )
+                })
             })
         } else {
             py.allow_threads(|| {
-                self.index_data.query_one_quantized_widths(
-                    query_slice,
-                    k,
-                    epsilon,
-                    candidate_width,
-                    rerank_width,
-                )
+                self.install(|| {
+                    self.index_data.query_one_quantized_widths(
+                        query_slice,
+                        k,
+                        epsilon,
+                        candidate_width,
+                        rerank_width,
+                    )
+                })
             })
         }?;
         Ok(PyArray1::from_vec_bound(py, result.0))
@@ -1232,8 +1291,14 @@ impl PyNNDescent {
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<i32>>, f32)> {
         self.ensure_search_enabled()?;
-        let graph = self.index_data.search_graph_original_order();
-        let min_distance = self.index_data.search_graph_min_distance();
+        let (graph, min_distance) = py.allow_threads(|| {
+            self.install(|| {
+                (
+                    self.index_data.search_graph_original_order(),
+                    self.index_data.search_graph_min_distance(),
+                )
+            })
+        });
         Ok((
             PyArray1::from_vec_bound(py, graph.indptr),
             PyArray1::from_vec_bound(py, graph.indices),
@@ -1298,7 +1363,7 @@ impl PyNNDescent {
     /// Build query search structures. This method is idempotent.
     fn prepare(&self, py: Python<'_>) -> PyResult<()> {
         self.ensure_search_enabled()?;
-        py.allow_threads(|| self.index_data.prepare());
+        py.allow_threads(|| self.install(|| self.index_data.prepare()));
         Ok(())
     }
 
@@ -1375,9 +1440,8 @@ impl PyNNDescent {
         Bound<'py, PyArray1<i32>>,
     )> {
         self.ensure_search_enabled()?;
-        let tree = self
-            .index_data
-            .export_search_tree()
+        let tree = py
+            .allow_threads(|| self.install(|| self.index_data.export_search_tree()))
             .ok_or_else(|| PyValueError::new_err("no retained search tree is available"))?;
         let children: Vec<i32> = tree.children.into_iter().flatten().collect();
         let hyperplanes =
@@ -1432,7 +1496,52 @@ fn validate_quantized_widths(
     Ok(())
 }
 
+#[cfg(test)]
+mod thread_pool_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_n_jobs_values() {
+        assert!(thread_pool_for_n_jobs(Some(0)).is_err());
+        assert!(thread_pool_for_n_jobs(Some(-2)).is_err());
+    }
+
+    #[test]
+    fn omitted_n_jobs_does_not_create_a_local_pool() {
+        assert!(thread_pool_for_n_jobs(None)
+            .expect("valid default")
+            .is_none());
+    }
+
+    #[test]
+    fn positive_n_jobs_sets_the_local_pool_size() {
+        let global_threads = rayon::current_num_threads();
+        let pool = thread_pool_for_n_jobs(Some(2))
+            .expect("valid n_jobs")
+            .expect("explicit n_jobs creates a pool");
+
+        assert_eq!(pool.install(rayon::current_num_threads), 2);
+        assert_eq!(rayon::current_num_threads(), global_threads);
+    }
+
+    #[test]
+    fn minus_one_uses_available_parallelism() {
+        let expected = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let pool = thread_pool_for_n_jobs(Some(-1))
+            .expect("valid n_jobs")
+            .expect("explicit n_jobs creates a pool");
+
+        assert_eq!(pool.install(rayon::current_num_threads), expected);
+    }
+}
+
 impl PyNNDescent {
+    fn install<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        install_in_pool(self.thread_pool.as_ref(), operation)
+    }
+
     fn ensure_search_enabled(&self) -> PyResult<()> {
         if self.index_data.search_enabled() {
             Ok(())

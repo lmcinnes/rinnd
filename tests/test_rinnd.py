@@ -13,7 +13,9 @@ def test_named_distances_reports_supported_names():
 
 
 def make_data(n_points=32, dimension=4):
-    return np.arange(n_points * dimension, dtype=np.float32).reshape(n_points, dimension)
+    return np.arange(n_points * dimension, dtype=np.float32).reshape(
+        n_points, dimension
+    )
 
 
 def test_builds_neighbor_graph_and_queries():

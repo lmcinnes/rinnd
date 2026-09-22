@@ -148,6 +148,46 @@ pub enum Metric {
 }
 
 impl Metric {
+    /// Names accepted for runtime metric selection, including aliases.
+    pub const NAMED_DISTANCES: &'static [(&'static str, Metric)] = &[
+        ("euclidean", Metric::Euclidean),
+        ("l2", Metric::Euclidean),
+        ("sqeuclidean", Metric::SquaredEuclidean),
+        ("squared_euclidean", Metric::SquaredEuclidean),
+        ("manhattan", Metric::Manhattan),
+        ("taxicab", Metric::Manhattan),
+        ("l1", Metric::Manhattan),
+        ("chebyshev", Metric::Chebyshev),
+        ("linfinity", Metric::Chebyshev),
+        ("linfty", Metric::Chebyshev),
+        ("linf", Metric::Chebyshev),
+        ("canberra", Metric::Canberra),
+        ("braycurtis", Metric::BrayCurtis),
+        ("cosine", Metric::Cosine),
+        ("inner_product", Metric::InnerProduct),
+        ("ip", Metric::InnerProduct),
+        ("dot", Metric::Dot),
+        ("correlation", Metric::Correlation),
+        ("true_angular", Metric::TrueAngular),
+        ("tsss", Metric::TSSS),
+        ("hamming", Metric::Hamming),
+        ("jaccard", Metric::Jaccard),
+        ("dice", Metric::Dice),
+        ("matching", Metric::Matching),
+        ("kulsinski", Metric::Kulsinski),
+        ("rogerstanimoto", Metric::RogersTanimoto),
+        ("russellrao", Metric::RussellRao),
+        ("sokalsneath", Metric::SokalSneath),
+        ("sokalmichener", Metric::SokalMichener),
+        ("yule", Metric::Yule),
+        ("hellinger", Metric::Hellinger),
+        ("jensen_shannon", Metric::JensenShannon),
+        ("jensen-shannon", Metric::JensenShannon),
+        ("symmetric_kl", Metric::SymmetricKL),
+        ("symmetric-kl", Metric::SymmetricKL),
+        ("symmetric_kullback_liebler", Metric::SymmetricKL),
+    ];
+
     /// Compute distance between two vectors using this metric.
     pub fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         match self {
@@ -209,40 +249,9 @@ impl Metric {
 
     /// Parse metric from string (case-insensitive, supports PyNND aliases).
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            // Minkowski family
-            "euclidean" | "l2" => Some(Metric::Euclidean),
-            "sqeuclidean" | "squared_euclidean" => Some(Metric::SquaredEuclidean),
-            "manhattan" | "taxicab" | "l1" => Some(Metric::Manhattan),
-            "chebyshev" | "linfinity" | "linfty" | "linf" => Some(Metric::Chebyshev),
-            "canberra" => Some(Metric::Canberra),
-            "braycurtis" => Some(Metric::BrayCurtis),
-            // Angular / similarity
-            "cosine" => Some(Metric::Cosine),
-            "inner_product" | "ip" => Some(Metric::InnerProduct),
-            "dot" => Some(Metric::Dot),
-            "correlation" => Some(Metric::Correlation),
-            "true_angular" => Some(Metric::TrueAngular),
-            "tsss" => Some(Metric::TSSS),
-            // Binary / set
-            "hamming" => Some(Metric::Hamming),
-            "jaccard" => Some(Metric::Jaccard),
-            "dice" => Some(Metric::Dice),
-            "matching" => Some(Metric::Matching),
-            "kulsinski" => Some(Metric::Kulsinski),
-            "rogerstanimoto" => Some(Metric::RogersTanimoto),
-            "russellrao" => Some(Metric::RussellRao),
-            "sokalsneath" => Some(Metric::SokalSneath),
-            "sokalmichener" => Some(Metric::SokalMichener),
-            "yule" => Some(Metric::Yule),
-            // Distribution
-            "hellinger" => Some(Metric::Hellinger),
-            "jensen_shannon" | "jensen-shannon" => Some(Metric::JensenShannon),
-            "symmetric_kl" | "symmetric-kl" | "symmetric_kullback_liebler" => {
-                Some(Metric::SymmetricKL)
-            }
-            _ => None,
-        }
+        Self::NAMED_DISTANCES
+            .iter()
+            .find_map(|(name, metric)| name.eq_ignore_ascii_case(s).then_some(*metric))
     }
 }
 

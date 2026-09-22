@@ -58,6 +58,9 @@ maturin develop --release -m crates/rinnd/Cargo.toml
 import numpy as np
 import rinnd
 
+# Check whether a named distance is supported
+assert "euclidean" in rinnd.named_distances
+
 # Build index
 data = np.random.rand(10000, 128).astype(np.float32)
 index = rinnd.RINND(data, metric="euclidean", n_neighbors=15)

@@ -2174,6 +2174,11 @@ fn benchmark_quantized_angular_i8<'py>(
 /// The rinnd Python module.
 #[pymodule]
 fn rinnd(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let named_distances = PyDict::new_bound(_py);
+    for &(name, _) in Metric::NAMED_DISTANCES {
+        named_distances.set_item(name, true)?;
+    }
+    m.add("named_distances", named_distances)?;
     m.add_class::<PyNNDescent>()?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(simd_info, m)?)?;

@@ -4,6 +4,14 @@ import pytest
 import rinnd
 
 
+def test_named_distances_reports_supported_names():
+    assert isinstance(rinnd.named_distances, dict)
+    assert "euclidean" in rinnd.named_distances
+    assert "cosine" in rinnd.named_distances
+    assert "symmetric_kullback_liebler" in rinnd.named_distances
+    assert "not-a-metric" not in rinnd.named_distances
+
+
 def make_data(n_points=32, dimension=4):
     return np.arange(n_points * dimension, dtype=np.float32).reshape(n_points, dimension)
 

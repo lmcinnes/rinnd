@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rinnd"
-version = "0.1.2"
+version = "0.1.3"
 description = "RINND: Rust Implementation of Nearest Neighbour Descent"
 requires-python = ">=3.8"
 license = {text = "BSD-2-Clause"}

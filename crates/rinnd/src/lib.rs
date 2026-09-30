@@ -1413,6 +1413,14 @@ impl PyNNDescent {
             stats.nn_descent.candidate_seconds.clone(),
         )?;
         result.set_item("update_seconds", stats.nn_descent.update_seconds.clone())?;
+        result.set_item(
+            "update_generation_seconds",
+            stats.nn_descent.update_generation_seconds.clone(),
+        )?;
+        result.set_item(
+            "update_application_seconds",
+            stats.nn_descent.update_application_seconds.clone(),
+        )?;
         result.set_item("updates", stats.nn_descent.updates.clone())?;
         result.set_item("nn_descent_seconds", stats.nn_descent.total_seconds())?;
         result.set_item("sort_seconds", stats.sort_seconds)?;

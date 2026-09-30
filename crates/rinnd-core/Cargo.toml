@@ -9,12 +9,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std", "rayon"]
+default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves"]
 std = []
 rayon = ["dep:rayon"]
 mmap = ["dep:memmap2"]
 serde = ["dep:serde", "dep:bincode"]
 bench-internals = ["dep:memmap2"]
+batched-euclidean = []
+batched-angular = []
+compact-candidates = []
+batched-leaves = []
 
 [dependencies]
 rayon = { workspace = true, optional = true }

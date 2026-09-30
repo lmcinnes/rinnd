@@ -12,6 +12,8 @@ use super::traits::{Distance, HasSquaredForm};
 pub struct SquaredEuclidean;
 
 impl Distance<f32> for SquaredEuclidean {
+    const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-euclidean");
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
@@ -27,9 +29,48 @@ impl Distance<f32> for SquaredEuclidean {
         scalar_l2_sqr(a, b)
     }
 
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        for candidate in candidates {
+            assert_eq!(query.len(), candidate.len());
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return unsafe { l2_sqr_four_avx2(query, candidates) };
+            }
+        }
+        candidates.map(|candidate| scalar_l2_sqr(query, candidate))
+    }
+
     fn name(&self) -> &'static str {
         "squared_euclidean"
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn l2_sqr_four_avx2(query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let vector_end = query.len() / 8 * 8;
+    for offset in (0..vector_end).step_by(8) {
+        let query_values = _mm256_loadu_ps(query.as_ptr().add(offset));
+        for candidate in 0..4 {
+            let values = _mm256_loadu_ps(candidates[candidate].as_ptr().add(offset));
+            let difference = _mm256_sub_ps(query_values, values);
+            sums[candidate] = _mm256_fmadd_ps(difference, difference, sums[candidate]);
+        }
+    }
+    let mut results = sums.map(|sum| hsum256_ps_avx(sum));
+    for offset in vector_end..query.len() {
+        for candidate in 0..4 {
+            let difference = query[offset] - candidates[candidate][offset];
+            results[candidate] += difference * difference;
+        }
+    }
+    results
 }
 
 /// Scalar squared Euclidean distance (fallback).
@@ -116,6 +157,13 @@ unsafe fn hsum256_ps_avx(v: std::arch::x86_64::__m256) -> f32 {
 pub struct Euclidean;
 
 impl Distance<f32> for Euclidean {
+    const USE_DISTANCE_FOUR: bool = SquaredEuclidean::USE_DISTANCE_FOUR;
+
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        SquaredEuclidean.distance_four(query, candidates).map(f32::sqrt)
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         SquaredEuclidean.distance(a, b).sqrt()
@@ -183,6 +231,24 @@ pub mod simd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_distances_match_individual_bits() {
+        for dimension in (0..40).chain([100, 256, 784, 785, 1024]) {
+            let query: Vec<f32> = (0..dimension)
+                .map(|position| (position as f32 * 0.19).sin() * 255.0)
+                .collect();
+            let candidates: [Vec<f32>; 4] = std::array::from_fn(|candidate| {
+                (0..dimension)
+                    .map(|position| ((position + candidate * 17) as f32 * 0.31).cos() * 255.0)
+                    .collect()
+            });
+            let slices = candidates.each_ref().map(|candidate| candidate.as_slice());
+            let actual = SquaredEuclidean.distance_four(&query, slices);
+            let expected = slices.map(|candidate| SquaredEuclidean.distance(&query, candidate));
+            assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits), "dimension={dimension}");
+        }
+    }
 
     #[test]
     fn test_squared_euclidean_basic() {

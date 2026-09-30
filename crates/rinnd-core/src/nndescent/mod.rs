@@ -25,6 +25,8 @@ pub struct NNDescentStats {
     pub leaf_initialization_seconds: f64,
     pub candidate_seconds: Vec<f64>,
     pub update_seconds: Vec<f64>,
+    pub update_generation_seconds: Vec<f64>,
+    pub update_application_seconds: Vec<f64>,
     pub updates: Vec<usize>,
 }
 
@@ -199,7 +201,7 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
         println!("Initializing graph from {} leaves...", leaf_array.len());
     }
 
-    initialize_from_leaves(&mut neighbor_graph, &leaf_array, data, dim, distance);
+    initialize_from_leaves(&mut neighbor_graph, &leaf_array, data, dim, distance, params.leaf_size);
 
     let t_init = t_init_start.elapsed();
 
@@ -212,6 +214,8 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
 
     let mut candidate_seconds = Vec::with_capacity(params.n_iters);
     let mut update_seconds = Vec::with_capacity(params.n_iters);
+    let mut update_generation_seconds = Vec::with_capacity(params.n_iters);
+    let mut update_application_seconds = Vec::with_capacity(params.n_iters);
     let mut updates = Vec::with_capacity(params.n_iters);
     let mut actual_iters = 0;
 
@@ -228,8 +232,11 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
 
         // Generate and apply updates
         let t_upd_start = Instant::now();
-        let n_changes = update_iteration(&mut neighbor_graph, &candidates, data, dim, distance);
+        let (n_changes, generation_seconds, application_seconds) =
+            update_iteration(&mut neighbor_graph, &candidates, data, dim, distance);
         update_seconds.push(t_upd_start.elapsed().as_secs_f64());
+        update_generation_seconds.push(generation_seconds);
+        update_application_seconds.push(application_seconds);
         updates.push(n_changes);
 
         if params.verbose {
@@ -281,10 +288,21 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
         leaf_initialization_seconds: t_init.as_secs_f64(),
         candidate_seconds,
         update_seconds,
+        update_generation_seconds,
+        update_application_seconds,
         updates,
     };
 
     (neighbor_graph, forest, stats)
+}
+
+fn leaf_update_capacity(block_size: usize, max_leaf_size: usize, n_threads: usize) -> usize {
+    block_size
+        .saturating_mul(max_leaf_size)
+        .saturating_mul(max_leaf_size)
+        .checked_div(n_threads.saturating_mul(2))
+        .unwrap_or(0)
+        .clamp(1024, 1 << 20)
 }
 
 /// Initialize the neighbor graph from RP tree leaves (parallel version).
@@ -297,7 +315,12 @@ fn initialize_from_leaves<D: Distance<f32> + Sync>(
     data: &[f32],
     dim: usize,
     distance: &D,
+    leaf_size: usize,
 ) {
+    let leaves: Vec<&[i32]> = leaves.iter().flat_map(|leaf| {
+        let valid_len = leaf.iter().position(|&point| point < 0).unwrap_or(leaf.len());
+        leaf[..valid_len].chunks(leaf_size.max(1))
+    }).collect();
     let n_points = graph.n_points;
     let n_leaves = leaves.len();
 
@@ -308,8 +331,7 @@ fn initialize_from_leaves<D: Distance<f32> + Sync>(
     // Pre-allocate update storage per thread
     // Estimate max updates: block_size * leaf_size^2 / 2 per thread
     let max_leaf_size = leaves.iter().map(|l| l.len()).max().unwrap_or(0);
-    let updates_per_thread =
-        (block_size * max_leaf_size * max_leaf_size / (2 * n_threads)).max(1024);
+    let updates_per_thread = leaf_update_capacity(block_size, max_leaf_size, n_threads);
 
     let vertex_block_size = (n_points + n_threads - 1) / n_threads;
 
@@ -328,7 +350,24 @@ fn initialize_from_leaves<D: Distance<f32> + Sync>(
                 let end_leaf = (start_leaf + leaves_per_thread).min(leaf_block.len());
 
                 for leaf_idx in start_leaf..end_leaf {
-                    let leaf = &leaf_block[leaf_idx];
+                    let leaf = leaf_block[leaf_idx];
+
+                    if cfg!(feature = "batched-leaves") && D::USE_DISTANCE_FOUR && dim >= 32 {
+                        let valid_len = leaf.iter().position(|&point| point < 0).unwrap_or(leaf.len());
+                        for position in 0..valid_len {
+                            let point = leaf[position];
+                            let point_threshold = graph.max_distance(point as usize);
+                            candidate_distances(
+                                point, &leaf[position + 1..valid_len], false, data, dim, distance,
+                                |neighbor, value| {
+                                    if value < point_threshold.max(graph.max_distance(neighbor as usize)) {
+                                        thread_updates.push((point, neighbor, value));
+                                    }
+                                },
+                            );
+                        }
+                        continue;
+                    }
 
                     for i in 0..leaf.len() {
                         let p = leaf[i];
@@ -399,6 +438,49 @@ struct PotentialUpdate {
     distance: f32,
 }
 
+#[inline(always)]
+fn candidate_distances<D: Distance<f32>>(
+    point: i32,
+    candidates: &[i32],
+    skip_self: bool,
+    data: &[f32],
+    dim: usize,
+    distance: &D,
+    mut apply: impl FnMut(i32, f32),
+) {
+    let query = &data[point as usize * dim..(point as usize + 1) * dim];
+    let mut offset = 0;
+    if D::USE_DISTANCE_FOUR && dim >= 32 {
+        while offset + 4 <= candidates.len() {
+            let group = &candidates[offset..offset + 4];
+            if group.iter().all(|&neighbor| neighbor >= 0 && (!skip_self || neighbor != point)) {
+                let vectors = std::array::from_fn(|position| {
+                    let start = group[position] as usize * dim;
+                    &data[start..start + dim]
+                });
+                let distances = distance.distance_four(query, vectors);
+                for position in 0..4 {
+                    apply(group[position], distances[position]);
+                }
+                offset += 4;
+            } else {
+                let neighbor = candidates[offset];
+                if neighbor >= 0 && (!skip_self || neighbor != point) {
+                    let start = neighbor as usize * dim;
+                    apply(neighbor, distance.distance(query, &data[start..start + dim]));
+                }
+                offset += 1;
+            }
+        }
+    }
+    for &neighbor in &candidates[offset..] {
+        if neighbor >= 0 && (!skip_self || neighbor != point) {
+            let start = neighbor as usize * dim;
+            apply(neighbor, distance.distance(query, &data[start..start + dim]));
+        }
+    }
+}
+
 /// Run one iteration of NN-descent updates using block-based processing.
 ///
 /// Matches PyNNDescent's `process_candidates` / `generate_graph_update_array`:
@@ -415,7 +497,11 @@ fn update_iteration<D: Distance<f32> + Sync>(
     data: &[f32],
     dim: usize,
     distance: &D,
-) -> usize {
+) -> (usize, f64, f64) {
+    use std::time::Instant;
+
+    let mut generation_seconds = 0.0;
+    let mut application_seconds = 0.0;
     let n_points = graph.n_points;
     let n_threads = rayon::current_num_threads().max(1);
     let max_candidates = candidates.max_candidates;
@@ -463,6 +549,7 @@ fn update_iteration<D: Distance<f32> + Sync>(
         let thread_buckets_ref = &thread_buckets;
 
         // Generate updates and bucket by destination vertex block
+        let generation_started = Instant::now();
         (0..n_threads).into_par_iter().for_each(|t| {
             let row_start = block_start + t * rows_per_thread;
             let row_end = (row_start + rows_per_thread).min(block_end);
@@ -484,6 +571,33 @@ fn update_iteration<D: Distance<f32> + Sync>(
                     let data_p = &data[p_usize * dim..(p_usize + 1) * dim];
                     let thresh_p = graph.max_distance(p_usize);
 
+                    if D::USE_DISTANCE_FOUR && dim >= 32 {
+                        for (neighbors, skip_self) in
+                            [(&new_cands[j + 1..], false), (old_cands, true)]
+                        {
+                            candidate_distances(
+                                p, neighbors, skip_self, data, dim, distance,
+                                |neighbor, value| {
+                                    let neighbor_index = neighbor as usize;
+                                    if value <= thresh_p.max(graph.max_distance(neighbor_index)) {
+                                        let update = PotentialUpdate {
+                                            point: p,
+                                            neighbor,
+                                            distance: value,
+                                        };
+                                        let point_block = p_usize / vertex_block_size;
+                                        let neighbor_block = neighbor_index / vertex_block_size;
+                                        local_buckets[point_block.min(n_vertex_blocks - 1)].push(update);
+                                        if point_block != neighbor_block {
+                                            local_buckets[neighbor_block.min(n_vertex_blocks - 1)].push(update);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+                        continue;
+                    }
+
                     for k in (j + 1)..max_candidates {
                         let q = new_cands[k];
                         if q < 0 {
@@ -500,7 +614,6 @@ fn update_iteration<D: Distance<f32> + Sync>(
                                 neighbor: q,
                                 distance: d,
                             };
-                            // Bucket by p's vertex block
                             let p_block = p_usize / vertex_block_size;
                             let q_block = q_usize / vertex_block_size;
                             local_buckets[p_block.min(n_vertex_blocks - 1)].push(update);
@@ -538,9 +651,12 @@ fn update_iteration<D: Distance<f32> + Sync>(
             }
         });
 
+        generation_seconds += generation_started.elapsed().as_secs_f64();
+
         // Apply updates - each thread only reads buckets destined for its vertex block
         let thread_buckets_apply = &thread_buckets;
 
+        let application_started = Instant::now();
         (0..n_threads).into_par_iter().for_each(|t| {
             let v_block_start = t * vertex_block_size;
             let v_block_end = (v_block_start + vertex_block_size).min(n_points);
@@ -576,9 +692,10 @@ fn update_iteration<D: Distance<f32> + Sync>(
 
             total_changes.fetch_add(local_changes, Ordering::Relaxed);
         });
+        application_seconds += application_started.elapsed().as_secs_f64();
     }
 
-    total_changes.load(Ordering::Relaxed)
+    (total_changes.load(Ordering::Relaxed), generation_seconds, application_seconds)
 }
 
 #[cfg(test)]
@@ -594,6 +711,144 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn leaf_update_reserve_is_bounded_for_degenerate_leaves() {
+        assert_eq!(leaf_update_capacity(512, 64, 8), 131072);
+        assert_eq!(leaf_update_capacity(512, 73429, 8), 1 << 20);
+        assert_eq!(leaf_update_capacity(512, usize::MAX, 8), 1 << 20);
+        assert_eq!(leaf_update_capacity(128, 0, 1), 1024);
+    }
+
+    #[test]
+    fn leaf_initialization_matches_ordered_reference() {
+        for n_points in [3, 37] {
+            let dim = 100;
+            let data: Vec<f32> = (0..n_points * dim)
+                .map(|position| ((position * 17) % 23) as f32)
+                .collect();
+            let leaves: Vec<Vec<i32>> = (0..600)
+                .map(|leaf_index| {
+                    let mut leaf: Vec<i32> = (0..n_points.min(15))
+                        .map(|offset| ((leaf_index + offset) % n_points) as i32)
+                        .collect();
+                    leaf.push(-1);
+                    leaf
+                })
+                .collect();
+            for degree in [15, 30] {
+                let mut expected = NeighborHeap::new(n_points, degree);
+                for leaf in &leaves {
+                    for (position, &point) in leaf.iter().take_while(|&&point| point >= 0).enumerate() {
+                        for &neighbor in leaf[position + 1..].iter().take_while(|&&neighbor| neighbor >= 0) {
+                            let distance = SquaredEuclidean.distance(
+                                &data[point as usize * dim..(point as usize + 1) * dim],
+                                &data[neighbor as usize * dim..(neighbor as usize + 1) * dim],
+                            );
+                            expected.checked_flagged_push(point as usize, neighbor, distance, true);
+                            expected.checked_flagged_push(neighbor as usize, point, distance, true);
+                        }
+                    }
+                }
+                for threads in [1, 2, 4, 8] {
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                    let mut actual = NeighborHeap::new(n_points, degree);
+                    pool.install(|| initialize_from_leaves(&mut actual, &leaves, &data, dim, &SquaredEuclidean, 64));
+                    assert_eq!(actual.indices, expected.indices, "threads={threads}");
+                    assert_eq!(actual.distances, expected.distances, "threads={threads}");
+                    assert_eq!(actual.flags, expected.flags, "threads={threads}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_leaf_initialization_matches_bounded_groups() {
+        let n_points = 1025;
+        let dim = 100;
+        let data = create_test_data(n_points, dim);
+        let mut leaf: Vec<i32> = (0..n_points as i32).collect();
+        leaf.extend([-1, i32::MAX]);
+        let groups: Vec<Vec<i32>> = leaf[..n_points].chunks(16).map(|group| group.to_vec()).collect();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let mut expected = NeighborHeap::new(n_points, 15);
+            let mut actual = NeighborHeap::new(n_points, 15);
+            pool.install(|| {
+                initialize_from_leaves(&mut expected, &groups, &data, dim, &SquaredEuclidean, 16);
+                initialize_from_leaves(&mut actual, &[leaf.clone()], &data, dim, &SquaredEuclidean, 16);
+            });
+            assert_eq!(actual.indices, expected.indices);
+            assert_eq!(actual.distances, expected.distances);
+            assert_eq!(actual.flags, expected.flags);
+            for point in 0..n_points {
+                assert!(actual.indices[point * 15..(point + 1) * 15].iter()
+                    .all(|&neighbor| neighbor < 0 || neighbor as usize / 16 == point / 16));
+            }
+        }
+    }
+
+    #[test]
+    fn batched_updates_match_individual_distances() {
+        check_batched_updates(SquaredEuclidean, false);
+        check_batched_updates(crate::distance::Cosine, true);
+        check_batched_updates(crate::distance::AlternativeDot, true);
+        check_batched_updates(crate::distance::DirectNormalizedCosine, true);
+        check_batched_updates(crate::distance::InnerProduct, false);
+        check_batched_updates(crate::distance::Dot, true);
+    }
+
+    fn check_batched_updates<D: Distance<f32>>(distance: D, angular: bool) {
+        #[derive(Clone)]
+        struct Individual<D>(D);
+
+        impl<D: Distance<f32>> Distance<f32> for Individual<D> {
+            fn distance(&self, query: &[f32], candidate: &[f32]) -> f32 {
+                self.0.distance(query, candidate)
+            }
+
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+        }
+
+        for dimension in [31, 100, 784] {
+            let mut data_rng = FastRng::new(13);
+            let mut data: Vec<f32> = (0..128 * dimension).map(|_| (data_rng.next_float() - 0.5) / dimension as f32).collect();
+            data[..dimension].fill(0.0);
+            for degree in [15, 30] {
+                let params = NNDescentParams {
+                    n_neighbors: degree, n_trees: 2, leaf_size: 20, max_candidates: degree,
+                    n_iters: 5, delta: 0.001, angular, max_depth: 100, verbose: false,
+                };
+                for threads in [1, 4] {
+                    rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| {
+                        let (expected, _, expected_stats) = nn_descent(
+                            &data, 128, dimension, &Individual(distance.clone()), &params, &mut FastRng::new(42),
+                        );
+                        let (actual, _, actual_stats) = nn_descent(
+                            &data, 128, dimension, &distance, &params, &mut FastRng::new(42),
+                        );
+                        assert_eq!(actual.indices, expected.indices);
+                        assert_eq!(actual.distances, expected.distances);
+                        assert_eq!(actual.flags, expected.flags);
+                        assert_eq!(actual_stats.updates, expected_stats.updates);
+                        let iterations = actual_stats.updates.len();
+                        assert_eq!(actual_stats.update_seconds.len(), iterations);
+                        assert_eq!(actual_stats.update_generation_seconds.len(), iterations);
+                        assert_eq!(actual_stats.update_application_seconds.len(), iterations);
+                        for iteration in 0..iterations {
+                            let generation = actual_stats.update_generation_seconds[iteration];
+                            let application = actual_stats.update_application_seconds[iteration];
+                            assert!(generation.is_finite() && generation >= 0.0);
+                            assert!(application.is_finite() && application >= 0.0);
+                            assert!(generation + application <= actual_stats.update_seconds[iteration]);
+                        }
+                    });
+                }
+            }
+        }
     }
 
     #[test]

@@ -104,6 +104,13 @@ unsafe fn horizontal_sum_avx(value: std::arch::x86_64::__m256) -> f32 {
 }
 
 impl Distance<f32> for AlternativeDot {
+    const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
+
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        normalized_dot_four(query, candidates).map(alternative_dot_from_similarity)
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
@@ -131,6 +138,13 @@ impl Distance<f32> for AlternativeDot {
 pub struct DirectNormalizedCosine;
 
 impl Distance<f32> for DirectNormalizedCosine {
+    const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
+
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        normalized_dot_four(query, candidates).map(|similarity| 1.0 - similarity.clamp(-1.0, 1.0))
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
@@ -151,6 +165,49 @@ impl Distance<f32> for DirectNormalizedCosine {
     fn name(&self) -> &'static str {
         "direct_normalized_cosine"
     }
+}
+
+#[inline]
+fn normalized_dot_four(query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    for candidate in candidates {
+        assert_eq!(query.len(), candidate.len());
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        unsafe {
+            let first = normalized_dot_two_avx2(query, [candidates[0], candidates[1]]);
+            let second = normalized_dot_two_avx2(query, [candidates[2], candidates[3]]);
+            return [first[0], first[1], second[0], second[1]];
+        }
+    }
+    candidates.map(|candidate| normalized_dot_scalar(query, candidate))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn normalized_dot_two_avx2(query: &[f32], candidates: [&[f32]; 2]) -> [f32; 2] {
+    use std::arch::x86_64::*;
+
+    let mut sums = [[_mm256_setzero_ps(); 4]; 2];
+    let vector_end = query.len() / 32 * 32;
+    for offset in (0..vector_end).step_by(32) {
+        for lane in 0..4 {
+            let query_values = _mm256_loadu_ps(query.as_ptr().add(offset + lane * 8));
+            for candidate in 0..2 {
+                let values = _mm256_loadu_ps(candidates[candidate].as_ptr().add(offset + lane * 8));
+                sums[candidate][lane] = _mm256_fmadd_ps(query_values, values, sums[candidate][lane]);
+            }
+        }
+    }
+    let mut results = sums.map(|sum| {
+        horizontal_sum_avx(_mm256_add_ps(_mm256_add_ps(sum[0], sum[1]), _mm256_add_ps(sum[2], sum[3])))
+    });
+    for offset in vector_end..query.len() {
+        for candidate in 0..2 {
+            results[candidate] += query[offset] * candidates[candidate][offset];
+        }
+    }
+    results
 }
 
 /// Alternative inner product distance using reciprocal transform.

@@ -43,6 +43,32 @@ cargo test --release
 cargo bench --release
 ```
 
+### Default Optimizations
+
+Default Rust and Python builds enable `batched-euclidean`, `batched-angular`,
+`compact-candidates`, and `batched-leaves`. These enable distance batching,
+compact reverse-candidate storage, and batched leaf initialization. Unsupported
+SIMD platforms retain the existing distance fallbacks.
+
+To disable all four optimizations for a core-only build:
+
+```bash
+cargo build -p rinnd-core --release --no-default-features --features std,rayon
+```
+
+Rust dependencies can use `default-features = false, features = ["std", "rayon"]`
+and add individual optimization features as needed. Cargo features are additive;
+another dependency enabling core defaults will re-enable the optimizations.
+For Python:
+
+```bash
+maturin build --release -m crates/rinnd/Cargo.toml --no-default-features
+```
+
+The installed wheel determines the features; there is no runtime toggle.
+See [benchmark notes](benchmarks/README.md)
+for the measurements and remaining confirmation limitations.
+
 ## Python Bindings
 
 ### Install

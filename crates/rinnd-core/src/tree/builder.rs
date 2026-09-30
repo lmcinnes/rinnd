@@ -221,15 +221,30 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn build_recursive(&mut self, indices: &mut [i32], depth: usize, rng: &mut FastRng) -> i32 {
-        if indices.len() <= self.leaf_size || depth >= self.max_depth {
+        if indices.len() <= self.leaf_size.max(1) || depth >= self.max_depth {
             return self.store_leaf(indices);
         }
 
-        let (hyperplane, offset) = self.make_split(indices, rng);
-        let split_pos = self.partition_inplace(indices, &hyperplane, offset, rng);
-        if split_pos == 0 || split_pos == indices.len() {
-            return self.store_leaf(indices);
+        let mut selected = None;
+        for _attempt in 0..8 {
+            let (hyperplane, offset) = self.make_split(indices, rng);
+            if !offset.is_finite()
+                || hyperplane.iter().any(|value| !value.is_finite())
+            {
+                continue;
+            }
+            let split_pos = self.partition_inplace(indices, &hyperplane, offset, rng);
+            if split_pos > 0 && split_pos < indices.len() {
+                selected = Some((hyperplane, offset, split_pos));
+                break;
+            }
         }
+        let (hyperplane, offset, split_pos) = selected.unwrap_or_else(|| {
+            for position in (1..indices.len()).rev() {
+                indices.swap(position, rng.next_index(position + 1));
+            }
+            (vec![0.0; self.dim], 0.0, indices.len() / 2)
+        });
 
         let node_id = if self.retain_tree {
             let node_id = self.children.len() as i32;
@@ -355,6 +370,66 @@ impl<'a> TreeBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degenerate_nodes_have_bounded_leaves_and_matching_retained_trees() {
+        for angular in [false, true] {
+            for value in [0.0, 1.0, f32::MAX] {
+                let data = vec![value; 257 * 8];
+                let mut retained_rng = FastRng::new(105);
+                let mut leaf_rng = FastRng::new(105);
+                let tree = build_rp_tree(&data, 257, 8, 16, &mut retained_rng, angular, 20);
+                let leaves = build_rp_leaf_tree(&data, 257, 8, 16, &mut leaf_rng, angular, 20);
+                assert_eq!(leaves, rptree_leaf_array(&[tree.clone()]));
+                assert!(leaves.iter().all(|leaf| !leaf.is_empty() && leaf.len() <= 16));
+                let mut indices: Vec<_> = leaves.into_iter().flatten().collect();
+                indices.sort_unstable();
+                assert_eq!(indices, (0..257).collect::<Vec<i32>>());
+                assert!(tree.hyperplanes.iter().all(|value| value.is_finite()));
+                assert!(tree.offsets.iter().all(|value| value.is_finite()));
+                assert!(!tree.get_leaf_indices(&data[..8], &mut retained_rng).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn nearly_collinear_angular_splits_do_not_terminate_large_nodes() {
+        let dim = 100;
+        let n_points = 129;
+        let data: Vec<f32> = (0..n_points)
+            .flat_map(|point| std::iter::repeat(1.0 + (point % 7) as f32 * 1e-7).take(dim))
+            .collect();
+        let builder = TreeBuilder::new(&data, dim, 16, true, 20, false);
+        let mut empty_partitions = 0;
+        for seed in 0..32 {
+            let mut rng = FastRng::new(seed);
+            let mut indices: Vec<i32> = (0..n_points as i32).collect();
+            let (plane, offset) = builder.make_split(&indices, &mut rng);
+            let split = builder.partition_inplace(&mut indices, &plane, offset, &mut rng);
+            if split == 0 || split == n_points {
+                empty_partitions += 1;
+            }
+            let leaves = build_rp_leaf_tree(
+                &data, n_points, dim, 16, &mut FastRng::new(seed), true, 20,
+            );
+            assert!(leaves.iter().all(|leaf| !leaf.is_empty() && leaf.len() <= 16));
+        }
+        assert!(empty_partitions > 0);
+    }
+
+    #[test]
+    fn depth_limit_preserves_retained_leaf_and_point_coverage() {
+        let data = vec![1.0; 257 * 8];
+        for depth in [0, 1] {
+            let tree = build_rp_tree(&data, 257, 8, 16, &mut FastRng::new(42), true, depth);
+            let leaves = build_rp_leaf_tree(&data, 257, 8, 16, &mut FastRng::new(42), true, depth);
+            assert_eq!(leaves, rptree_leaf_array(&[tree]));
+            assert_eq!(leaves.len(), 1 << depth);
+            let mut indices: Vec<_> = leaves.into_iter().flatten().collect();
+            indices.sort_unstable();
+            assert_eq!(indices, (0..257).collect::<Vec<i32>>());
+        }
+    }
 
     #[test]
     fn test_build_single_tree() {

@@ -12,8 +12,11 @@ rust-version.workspace = true
 name = "rinnd"
 crate-type = ["cdylib"]
 
+[features]
+default = ["rinnd-core/default"]
+
 [dependencies]
-rinnd-core = { path = "../rinnd-core", features = ["rayon"] }
+rinnd-core = { path = "../rinnd-core", default-features = false, features = ["std", "rayon"] }
 rinnd-simd = { path = "../rinnd-simd" }
 pyo3 = { workspace = true }
 numpy = { workspace = true }

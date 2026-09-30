@@ -7,6 +7,45 @@ use crate::heap::NeighborHeap;
 use crate::rng::FastRng;
 use rayon::prelude::*;
 
+#[cfg(not(feature = "compact-candidates"))]
+type ReverseCandidate = (usize, i32, f32, bool);
+
+#[cfg(feature = "compact-candidates")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ReverseCandidate {
+    destination: i32,
+    flagged_candidate: i32,
+    priority: f32,
+}
+
+#[inline]
+fn reverse_candidate(destination: i32, candidate: i32, priority: f32, is_new: bool) -> ReverseCandidate {
+    #[cfg(feature = "compact-candidates")]
+    {
+        debug_assert!(destination >= 0 && candidate >= 0);
+        ReverseCandidate {
+            destination,
+            flagged_candidate: if is_new { !candidate } else { candidate },
+            priority,
+        }
+    }
+    #[cfg(not(feature = "compact-candidates"))]
+    (destination as usize, candidate, priority, is_new)
+}
+
+#[inline]
+fn unpack_reverse_candidate(record: ReverseCandidate) -> (usize, i32, f32, bool) {
+    #[cfg(feature = "compact-candidates")]
+    {
+        let is_new = record.flagged_candidate < 0;
+        let candidate = if is_new { !record.flagged_candidate } else { record.flagged_candidate };
+        (record.destination as usize, candidate, record.priority, is_new)
+    }
+    #[cfg(not(feature = "compact-candidates"))]
+    record
+}
+
 /// Candidate sets using flat arrays for cache efficiency.
 ///
 /// This separation is crucial for NN-Descent performance:
@@ -177,7 +216,7 @@ impl CandidateSets {
         // Phase 1: Each thread processes its own rows (forward edges) and collects
         // reverse edges bucketed by destination block.
         // reverse_buckets[src_thread][dest_block] = Vec of (dest_vertex, candidate, priority, is_new)
-        let reverse_buckets: Vec<Vec<Vec<(usize, i32, f32, bool)>>> = (0..n_threads)
+        let reverse_buckets: Vec<Vec<Vec<ReverseCandidate>>> = (0..n_threads)
             .into_par_iter()
             .map(|thread_idx| {
                 let block_start = thread_idx * block_size;
@@ -190,7 +229,7 @@ impl CandidateSets {
                 let mut local_rng = FastRng::new(thread_seeds[thread_idx]);
 
                 // Per-destination-block reverse edge buckets
-                let mut buckets: Vec<Vec<(usize, i32, f32, bool)>> = vec![Vec::new(); n_threads];
+                let mut buckets: Vec<Vec<ReverseCandidate>> = vec![Vec::new(); n_threads];
 
                 // SAFETY: Each thread writes to disjoint portions [block_start*mc .. block_end*mc)
                 let new_idx_ptr = new_indices.as_ptr() as *mut i32;
@@ -273,8 +312,8 @@ impl CandidateSets {
                                     }
                                 }
                             } else {
-                                buckets[dest_block].push((
-                                    neighbor_idx,
+                                buckets[dest_block].push(reverse_candidate(
+                                    neighbor,
                                     i as i32,
                                     priority,
                                     is_new,
@@ -306,9 +345,8 @@ impl CandidateSets {
                 if src_thread == thread_idx {
                     continue; // Already handled in Phase 1
                 }
-                for &(dest_vertex, candidate, priority, is_new) in
-                    &reverse_buckets[src_thread][thread_idx]
-                {
+                for &record in &reverse_buckets[src_thread][thread_idx] {
+                    let (dest_vertex, candidate, priority, is_new) = unpack_reverse_candidate(record);
                     let offset = dest_vertex * max_candidates;
                     if is_new {
                         unsafe {
@@ -486,6 +524,20 @@ fn checked_heap_push_flat(priorities: &mut [f32], indices: &mut [i32], priority:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_candidate_round_trip() {
+        for destination in [0, 19, i32::MAX] {
+            for candidate in [0, 31, i32::MAX] {
+                for is_new in [false, true] {
+                    let record = reverse_candidate(destination, candidate, 0.625, is_new);
+                    assert_eq!(unpack_reverse_candidate(record), (destination as usize, candidate, 0.625, is_new));
+                }
+            }
+        }
+        #[cfg(feature = "compact-candidates")]
+        assert_eq!(std::mem::size_of::<ReverseCandidate>(), 12);
+    }
 
     #[test]
     fn test_checked_heap_push_flat_basic() {

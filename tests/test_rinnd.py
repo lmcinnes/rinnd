@@ -130,6 +130,17 @@ def test_search_preparation_is_lazy_idempotent_and_automatic():
     index.prepare()
     assert index.is_prepared is True
     first_stats = dict(index.build_stats)
+    iteration_count = len(first_stats["updates"])
+    assert len(first_stats["update_generation_seconds"]) == iteration_count
+    assert len(first_stats["update_application_seconds"]) == iteration_count
+    for total, generation, application in zip(
+        first_stats["update_seconds"],
+        first_stats["update_generation_seconds"],
+        first_stats["update_application_seconds"],
+    ):
+        assert np.isfinite([total, generation, application]).all()
+        assert generation >= 0.0 and application >= 0.0
+        assert generation + application <= total
     index.prepare()
     assert dict(index.build_stats) == first_stats
 

@@ -98,6 +98,20 @@ unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
 }
 
 impl Distance<f32> for Cosine {
+    const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
+
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        for candidate in candidates {
+            assert_eq!(query.len(), candidate.len());
+        }
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { cosine_four_avx2(query, candidates) };
+        }
+        candidates.map(|candidate| scalar_cosine(query, candidate))
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
@@ -115,6 +129,45 @@ impl Distance<f32> for Cosine {
     fn name(&self) -> &'static str {
         "cosine"
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn cosine_four_avx2(query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+
+    let mut dots = [_mm256_setzero_ps(); 4];
+    let mut norms = [_mm256_setzero_ps(); 4];
+    let mut query_norm = _mm256_setzero_ps();
+    let vector_end = query.len() / 8 * 8;
+    for offset in (0..vector_end).step_by(8) {
+        let query_values = _mm256_loadu_ps(query.as_ptr().add(offset));
+        query_norm = _mm256_fmadd_ps(query_values, query_values, query_norm);
+        for candidate in 0..4 {
+            let values = _mm256_loadu_ps(candidates[candidate].as_ptr().add(offset));
+            dots[candidate] = _mm256_fmadd_ps(query_values, values, dots[candidate]);
+            norms[candidate] = _mm256_fmadd_ps(values, values, norms[candidate]);
+        }
+    }
+    let mut dots = dots.map(|sum| hsum256_ps(sum));
+    let mut norms = norms.map(|sum| hsum256_ps(sum));
+    let mut query_norm = hsum256_ps(query_norm);
+    for offset in vector_end..query.len() {
+        query_norm += query[offset] * query[offset];
+        for candidate in 0..4 {
+            let value = candidates[candidate][offset];
+            dots[candidate] += query[offset] * value;
+            norms[candidate] += value * value;
+        }
+    }
+    std::array::from_fn(|candidate| {
+        let denom = (query_norm * norms[candidate]).sqrt();
+        if denom < 1e-12 {
+            1.0
+        } else {
+            1.0 - (dots[candidate] / denom).clamp(-1.0, 1.0)
+        }
+    })
 }
 
 /// Normalize a vector to unit length in-place.

@@ -26,3 +26,4 @@ dist/
 
 # Benchmarking
 ann-benchmarks/
+/benchmarks/results/

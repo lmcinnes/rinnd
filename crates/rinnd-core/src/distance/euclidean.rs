@@ -243,7 +243,7 @@ mod tests {
                     .map(|position| ((position + candidate * 17) as f32 * 0.31).cos() * 255.0)
                     .collect()
             });
-            let slices = candidates.each_ref().map(|candidate| candidate.as_slice());
+            let slices: [&[f32]; 4] = std::array::from_fn(|i| candidates[i].as_slice());
             let actual = SquaredEuclidean.distance_four(&query, slices);
             let expected = slices.map(|candidate| SquaredEuclidean.distance(&query, candidate));
             assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits), "dimension={dimension}");

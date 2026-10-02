@@ -12,7 +12,7 @@ edition = "2021"
 authors = ["Leland McInnes <leland.mcinnes@gmail.com>"]
 license = "BSD-2-Clause"
 repository = "https://github.com/lmcinnes/rinnd"
-rust-version = "1.75"
+rust-version = "1.77"
 
 [workspace.dependencies]
 # Parallelism

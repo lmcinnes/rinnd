@@ -1413,6 +1413,18 @@ impl PyNNDescent {
             stats.nn_descent.candidate_seconds.clone(),
         )?;
         result.set_item("update_seconds", stats.nn_descent.update_seconds.clone())?;
+        let phases = &stats.nn_descent.candidate_phases;
+        let candidate_phases = PyDict::new_bound(py);
+        for (name, values) in [
+            ("initialization", phases.iter().map(|phase| phase.initialization_seconds).collect::<Vec<_>>()),
+            ("forward", phases.iter().map(|phase| phase.forward_seconds).collect()),
+            ("reverse", phases.iter().map(|phase| phase.reverse_seconds).collect()),
+            ("mark", phases.iter().map(|phase| phase.mark_seconds).collect()),
+            ("release", phases.iter().map(|phase| phase.release_seconds).collect()),
+        ] {
+            candidate_phases.set_item(name, values)?;
+        }
+        result.set_item("candidate_phases", candidate_phases)?;
         result.set_item(
             "update_generation_seconds",
             stats.nn_descent.update_generation_seconds.clone(),

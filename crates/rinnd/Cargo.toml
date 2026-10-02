@@ -14,6 +14,9 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["rinnd-core/default"]
+packed-updates = ["rinnd-core/packed-updates"]
+candidate-membership = ["rinnd-core/candidate-membership"]
+candidate-workspace = ["rinnd-core/candidate-workspace"]
 
 [dependencies]
 rinnd-core = { path = "../rinnd-core", default-features = false, features = ["std", "rayon"] }

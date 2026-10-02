@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves"]
+default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves", "candidate-membership", "candidate-workspace"]
 std = []
 rayon = ["dep:rayon"]
 mmap = ["dep:memmap2"]
@@ -18,7 +18,10 @@ bench-internals = ["dep:memmap2"]
 batched-euclidean = []
 batched-angular = []
 compact-candidates = []
+candidate-membership = []
+candidate-workspace = []
 batched-leaves = []
+packed-updates = []
 
 [dependencies]
 rayon = { workspace = true, optional = true }

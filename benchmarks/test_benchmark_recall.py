@@ -5,7 +5,53 @@ import numpy as np
 import pytest
 
 from ground_truth import exact_neighbors, generate, sample_ids
-from benchmark_recall import graph_recall, main, paired_gate, query_ids
+from benchmark_recall import graph_phase_seconds, graph_recall, main, paired_gate, query_ids
+
+
+def test_public_graph_distances_use_original_vectors():
+    from benchmark_recall import validate_graph_distances
+    data = np.array([[0.0], [1.0003], [2.0]], dtype=np.float32)
+    indices = np.array([[1, 2], [0, 2], [0, 1]])
+    distances = np.array([[1.0003, 2.0], [1.0003, 0.9997], [2.0, 0.9997]])
+    assert validate_graph_distances(data, [0], indices, distances, "euclidean", {})["edges"] == 2
+    distances[0, 0] = 1.0
+    with pytest.raises(ValueError, match="original-vector"):
+        validate_graph_distances(data, [0], indices, distances, "euclidean", {})
+
+
+def test_graph_phase_seconds_are_disjoint_and_complete():
+    record = {
+        "elapsed_seconds": 15.0,
+        "export_seconds": 0.5,
+        "build_stats": {
+            "updates": [100, 10],
+            "forest_seconds": 1.0,
+            "leaf_initialization_seconds": 2.0,
+            "candidate_seconds": [1.0, 1.0],
+            "update_seconds": [4.0, 3.0],
+            "update_generation_seconds": [2.0, 1.0],
+            "update_application_seconds": [1.0, 1.0],
+            "sort_seconds": 0.5,
+            "distance_correction_seconds": 0.5,
+        },
+    }
+    phases = graph_phase_seconds(record)
+    assert set(phases) == {
+        "forest", "leaf_initialization", "candidates", "update_generation",
+        "update_application", "update_bookkeeping", "sort", "distance_correction",
+        "export", "other",
+    }
+    assert phases["update_generation"] == 3.0
+    assert phases["update_application"] == 2.0
+    assert phases["update_bookkeeping"] == 2.0
+    assert phases["other"] == 1.5
+    assert sum(phases.values()) == record["elapsed_seconds"]
+    record["build_stats"]["update_seconds"] = [1.0, 1.0]
+    with pytest.raises(ValueError, match="exceed total update"):
+        graph_phase_seconds(record)
+    record["build_stats"]["update_seconds"] = [1.0]
+    with pytest.raises(ValueError, match="iteration count"):
+        graph_phase_seconds(record)
 
 
 def test_feature_matrix_enumerates_all_combinations():
@@ -19,6 +65,67 @@ def test_feature_matrix_enumerates_all_combinations():
         assert features(1 << bit) == [feature]
     with pytest.raises(ValueError):
         features(16)
+
+
+def test_candidate_profile_features_and_timing_partition():
+    from feature_matrix import FEATURES, candidate_phase_seconds, profile_features
+    assert profile_features("wide", "candidate-membership") == list(FEATURES)
+    assert profile_features("packed", "candidate-membership") == list(FEATURES) + ["candidate-membership"]
+    assert profile_features("wide", "candidate-workspace") == list(FEATURES)
+    assert profile_features("packed", "candidate-workspace") == list(FEATURES) + ["candidate-workspace"]
+    assert profile_features("wide", "candidate-combined") == list(FEATURES)
+    assert profile_features("packed", "candidate-combined") == list(FEATURES) + ["candidate-membership", "candidate-workspace"]
+    phases = {name: [0.1, 0.2] for name in ("initialization", "forward", "reverse", "mark", "release")}
+    record = {"build_stats": {"candidate_seconds": [1.0, 2.0], "candidate_phases": phases}}
+    totals = candidate_phase_seconds(record)
+    assert sum(totals.values()) == pytest.approx(3.0)
+    assert totals["other"] == pytest.approx(1.5)
+    phases["forward"][0] = 5.0
+    with pytest.raises(ValueError, match="exceed candidate"):
+        candidate_phase_seconds(record)
+    phases["forward"] = []
+    with pytest.raises(ValueError, match="iteration count"):
+        candidate_phase_seconds(record)
+
+
+@pytest.mark.parametrize("action,handler", [("build-profile", "build"), ("profile-updates", "profile_updates")])
+def test_combined_candidate_profile_cli(action, handler, monkeypatch, tmp_path):
+    import feature_matrix
+
+    calls = []
+    monkeypatch.setattr(feature_matrix, handler, calls.append)
+    monkeypatch.setattr("sys.argv", [
+        "feature_matrix.py", action, "--artifacts", str(tmp_path),
+        "--candidate-feature", "candidate-combined",
+    ])
+    feature_matrix.main()
+    assert len(calls) == 1
+    assert calls[0].candidate_feature == "candidate-combined"
+    assert feature_matrix.profile_features("packed", calls[0].candidate_feature) == (
+        list(feature_matrix.FEATURES) + ["candidate-membership", "candidate-workspace"]
+    )
+
+
+def test_update_profile_features_and_repeat_equality():
+    from copy import deepcopy
+    from feature_matrix import FEATURES, check_profile_fingerprint, profile_features
+
+    assert profile_features("wide") == list(FEATURES)
+    assert profile_features("packed") == list(FEATURES) + ["packed-updates"]
+    report = {"dataset_sha256": "data", "records": [{
+        "case": "graph-k15", "seed": 42, "graph_sha256": "same", "build_stats": {"updates": [10, 1]},
+    }]}
+    seen = {}
+    check_profile_fingerprint(seen, report)
+    check_profile_fingerprint(seen, deepcopy(report))
+    changed = deepcopy(report)
+    changed["records"][0]["graph_sha256"] = "different"
+    with pytest.raises(ValueError, match="across repeated builds"):
+        check_profile_fingerprint(seen, changed)
+    changed = deepcopy(report)
+    changed["records"][0]["build_stats"]["updates"] = [9, 1]
+    with pytest.raises(ValueError, match="across repeated builds"):
+        check_profile_fingerprint(seen, changed)
 
 
 def test_feature_matrix_requires_paired_identical_outputs():
@@ -96,6 +203,48 @@ def test_feature_matrix_confirmation_requires_complete_evidence():
     result = confirmation_endpoint(slower)
     assert result["recall"]["strict"]["status"] == "blocked"
     assert result["timing_status"] == "inconclusive_or_regressing"
+
+
+def test_graph_profile_summary_checks_counts_and_preserves_pairing():
+    from copy import deepcopy
+    from feature_matrix import graph_profile_summary
+
+    record = {
+        "case": "graph-k15", "seed": 42, "repetition": 0,
+        "elapsed_seconds": 15.0, "export_seconds": 0.5,
+        "graph_sha256": "same", "recalls": {},
+        "build_stats": {
+            "updates": [100, 10], "forest_seconds": 1.0,
+            "leaf_initialization_seconds": 2.0, "candidate_seconds": [1.0, 1.0],
+            "update_seconds": [4.0, 3.0], "update_generation_seconds": [2.0, 1.0],
+            "update_application_seconds": [1.0, 1.0], "sort_seconds": 0.5,
+            "distance_correction_seconds": 0.5,
+        },
+        "resources": {
+            "process_cpu_seconds": 60.0, "process_peak_rss_bytes": 10000,
+            "involuntary_context_switches": 10,
+            "host_load_before": [1, 2, 3], "host_load_after": [2, 3, 4],
+        },
+    }
+    baseline = {
+        "dataset": "fixture", "dataset_sha256": "data", "mode": "profile",
+        "threads": 8, "parameters": {}, "graph_only": True,
+        "detail": {"corpus_size": 100}, "records": [record],
+    }
+    candidate = deepcopy(baseline)
+    candidate["records"][0]["elapsed_seconds"] = 14.0
+    result = graph_profile_summary([(baseline, candidate)] * 3)
+    assert result["pairs"] == 3
+    assert result["delivery"]["median_paired_speedup"] == pytest.approx(15 / 14)
+    assert result["phases"]["update_generation"]["median_paired_speedup"] == 1
+    assert result["phases"]["update_bookkeeping"]["wide_median_seconds"] == 2
+    assert result["resources"]["wide"]["median_cpu_seconds_per_wall_second"] == 4
+    candidate["records"][0]["build_stats"]["updates"][0] += 1
+    with pytest.raises(ValueError, match="iteration updates"):
+        graph_profile_summary([(baseline, candidate)])
+    candidate["records"][0]["graph_sha256"] = "different"
+    with pytest.raises(ValueError, match="outputs or recalls"):
+        graph_profile_summary([(baseline, candidate)])
 
 
 def test_graph_recall_penalizes_missing_duplicate_self_and_invalid_ids():
@@ -180,6 +329,8 @@ def test_measurement_cli_end_to_end(tmp_path, monkeypatch, mode):
     if mode != "profile":
         generate(source, reference, size=35)
         argv += ["--reference", str(reference)]
+    else:
+        argv += ["--degrees", "30"]
     monkeypatch.setattr("sys.argv", argv)
     main()
     result = json.loads(output.read_text())
@@ -192,6 +343,12 @@ def test_measurement_cli_end_to_end(tmp_path, monkeypatch, mode):
             assert all(0 <= value <= 1 for value in recalls)
     if mode in ("graph", "profile"):
         assert all(len(record["graph_sha256"]) == 64 for record in result["records"])
+        for record in result["records"]:
+            assert sum(record["phase_seconds"].values()) == pytest.approx(record["elapsed_seconds"])
+            assert all(value >= 0 for value in record["phase_seconds"].values())
+            assert record["resources"]["process_cpu_seconds"] > 0
+            assert record["resources"]["process_peak_rss_bytes"] > 0
+            assert len(record["resources"]["host_load_before"]) == 3
         if mode == "profile":
             assert result["detail"] == {
                 "corpus_size": len(values),
@@ -199,7 +356,7 @@ def test_measurement_cli_end_to_end(tmp_path, monkeypatch, mode):
             }
             assert all(record["recalls"] == {} for record in result["records"])
             assert [record["returned_bytes"] for record in result["records"]] == [
-                len(values) * degree * 8 for degree in (15, 30)
+                len(values) * 30 * 8
             ]
     else:
         assert result["detail"]["invalid_truth_rows"] == []

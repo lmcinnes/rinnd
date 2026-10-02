@@ -259,6 +259,31 @@ impl Metric {
 mod tests {
     use super::*;
 
+    fn assert_four_matches_individual<D: Distance<f32>>(distance: D) {
+        for dim in (0..40).chain([63, 64, 65, 100, 127, 128, 129, 256, 784, 1024]) {
+            let query: Vec<f32> = (0..dim).map(|offset| (offset as f32 * 0.37).sin()).collect();
+            let other: Vec<f32> = (0..dim).map(|offset| (offset as f32 * 0.19).cos()).collect();
+            let opposite: Vec<f32> = query.iter().map(|value| -value).collect();
+            let zero = vec![0.0; dim];
+            let candidates = [query.as_slice(), other.as_slice(), opposite.as_slice(), zero.as_slice()];
+            for input in [query.as_slice(), zero.as_slice()] {
+                let actual = distance.distance_four(input, candidates);
+                let expected = candidates.map(|candidate| distance.distance(input, candidate));
+                assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits), "{} dim={dim}", distance.name());
+            }
+        }
+    }
+
+    #[test]
+    fn batched_metric_bits_match() {
+        assert_four_matches_individual(Cosine);
+        assert_four_matches_individual(InnerProduct);
+        assert_four_matches_individual(Dot);
+        assert_four_matches_individual(AlternativeDot);
+        assert_four_matches_individual(DirectNormalizedCosine);
+        assert_four_matches_individual(Euclidean);
+    }
+
     #[test]
     fn test_metric_from_str() {
         assert_eq!(Metric::from_str("euclidean"), Some(Metric::Euclidean));

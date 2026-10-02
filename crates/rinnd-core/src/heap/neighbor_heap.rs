@@ -153,26 +153,32 @@ impl NeighborHeap {
         distance: f32,
         is_new: bool,
     ) -> bool {
-        let offset = self.offset(point);
+        let (indices, distances, flags) = self.get_row_mut(point);
+        Self::checked_flagged_push_row(indices, distances, flags, neighbor, distance, is_new)
+    }
 
-        // Check if the new distance is smaller than the max (root)
-        if distance >= self.distances[offset] {
+    #[inline]
+    pub(crate) fn checked_flagged_push_row(
+        indices: &mut [i32],
+        distances: &mut [f32],
+        flags: &mut [u8],
+        neighbor: i32,
+        distance: f32,
+        is_new: bool,
+    ) -> bool {
+        if distance >= distances[0] {
             return false;
         }
 
-        // Check for duplicates
-        for i in 0..self.k {
-            if self.indices[offset + i] == neighbor {
-                return false;
-            }
+        if indices.contains(&neighbor) {
+            return false;
         }
 
-        // Replace root and sift down
-        self.distances[offset] = distance;
-        self.indices[offset] = neighbor;
-        self.flags[offset] = is_new as u8;
+        distances[0] = distance;
+        indices[0] = neighbor;
+        flags[0] = is_new as u8;
 
-        self.sift_down(offset, 0);
+        Self::sift_down_row(indices, distances, flags, 0);
         true
     }
 
@@ -205,11 +211,26 @@ impl NeighborHeap {
     /// (2 ops per level × 3 arrays = 6 ops, plus 1 final write × 3 = 3 ops).
     #[inline]
     fn sift_down(&mut self, offset: usize, start_pos: usize) {
-        let end = self.k;
-        // Save the value being sifted
-        let val_dist = self.distances[offset + start_pos];
-        let val_idx = self.indices[offset + start_pos];
-        let val_flag = self.flags[offset + start_pos];
+        let end = offset + self.k;
+        Self::sift_down_row(
+            &mut self.indices[offset..end],
+            &mut self.distances[offset..end],
+            &mut self.flags[offset..end],
+            start_pos,
+        );
+    }
+
+    #[inline]
+    fn sift_down_row(
+        indices: &mut [i32],
+        distances: &mut [f32],
+        flags: &mut [u8],
+        start_pos: usize,
+    ) {
+        let end = indices.len();
+        let val_dist = distances[start_pos];
+        let val_idx = indices[start_pos];
+        let val_flag = flags[start_pos];
 
         let mut pos = start_pos;
         let mut child = 2 * pos + 1;
@@ -217,29 +238,25 @@ impl NeighborHeap {
         while child < end {
             let right = child + 1;
 
-            // Find the larger child
-            if right < end && self.distances[offset + child] < self.distances[offset + right] {
+            if right < end && distances[child] < distances[right] {
                 child = right;
             }
 
-            // If the value is larger than or equal to the larger child, we're done
-            if val_dist >= self.distances[offset + child] {
+            if val_dist >= distances[child] {
                 break;
             }
 
-            // Move child up to parent position
-            self.distances[offset + pos] = self.distances[offset + child];
-            self.indices[offset + pos] = self.indices[offset + child];
-            self.flags[offset + pos] = self.flags[offset + child];
+            distances[pos] = distances[child];
+            indices[pos] = indices[child];
+            flags[pos] = flags[child];
 
             pos = child;
             child = 2 * pos + 1;
         }
 
-        // Place value at final position
-        self.distances[offset + pos] = val_dist;
-        self.indices[offset + pos] = val_idx;
-        self.flags[offset + pos] = val_flag;
+        distances[pos] = val_dist;
+        indices[pos] = val_idx;
+        flags[pos] = val_flag;
     }
 
     /// Mark all neighbors for a point as "old".

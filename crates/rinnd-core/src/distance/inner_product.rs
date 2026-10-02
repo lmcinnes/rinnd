@@ -94,6 +94,13 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl Distance<f32> for InnerProduct {
+    const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
+
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        dot_product_four(query, candidates).map(|dot| -dot)
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         let dot = dot_product(a, b);
@@ -113,6 +120,13 @@ impl Distance<f32> for InnerProduct {
 pub struct Dot;
 
 impl Distance<f32> for Dot {
+    const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
+
+    #[inline]
+    fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+        dot_product_four(query, candidates).map(|dot| if dot <= 0.0 { 1.0 } else { 1.0 - dot })
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         let dot = dot_product(a, b);
@@ -126,6 +140,41 @@ impl Distance<f32> for Dot {
     fn name(&self) -> &'static str {
         "dot"
     }
+}
+
+#[inline]
+fn dot_product_four(query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    for candidate in candidates {
+        assert_eq!(query.len(), candidate.len());
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return unsafe { dot_four_avx2(query, candidates) };
+    }
+    candidates.map(|candidate| scalar_dot(query, candidate))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_four_avx2(query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let vector_end = query.len() / 8 * 8;
+    for offset in (0..vector_end).step_by(8) {
+        let query_values = _mm256_loadu_ps(query.as_ptr().add(offset));
+        for candidate in 0..4 {
+            let values = _mm256_loadu_ps(candidates[candidate].as_ptr().add(offset));
+            sums[candidate] = _mm256_fmadd_ps(query_values, values, sums[candidate]);
+        }
+    }
+    let mut results = sums.map(|sum| hsum256_ps(sum));
+    for offset in vector_end..query.len() {
+        for candidate in 0..4 {
+            results[candidate] += query[offset] * candidates[candidate][offset];
+        }
+    }
+    results
 }
 
 /// Raw dot product (not negated).

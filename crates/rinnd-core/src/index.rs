@@ -2,7 +2,6 @@
 
 use crate::distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 use crate::graph::{NeighborGraph, SearchGraph};
-use crate::heap::NeighborHeap;
 use crate::nndescent::{nn_descent, nn_descent_graph, NNDescentParams, NNDescentStats};
 use crate::rng::FastRng;
 use crate::search::{
@@ -1119,6 +1118,64 @@ mod tests {
         assert!(result.stats.raw_graph_seconds > 0.0);
         assert_eq!(result.stats.search_graph_seconds, 0.0);
         assert_eq!(result.stats.layout_seconds, 0.0);
+    }
+
+    #[test]
+    fn custom_distances_preserve_graph_outputs() {
+        #[derive(Clone)]
+        struct ExactSquared;
+        impl Distance<f32> for ExactSquared {
+            const USE_DISTANCE_FOUR: bool = SquaredEuclidean::USE_DISTANCE_FOUR;
+            fn distance(&self, first: &[f32], second: &[f32]) -> f32 {
+                SquaredEuclidean.distance(first, second)
+            }
+            fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+                SquaredEuclidean.distance_four(query, candidates)
+            }
+            fn name(&self) -> &'static str { "custom_exact_squared" }
+        }
+        let points = 50;
+        let dimension = 8;
+        let data: Vec<f32> = (0..points * dimension).map(|position| (position % 97) as f32 * 100000.0).collect();
+        let build = || NNDescentBuilder::new(&data, points, dimension).n_neighbors(10).n_trees(2).n_iters(3);
+        let custom = build().build_graph_with_distance(ExactSquared, None);
+        let built_in = build().build_graph_with_distance(SquaredEuclidean, None);
+        assert_eq!(custom.graph.indices, built_in.graph.indices);
+        assert_eq!(custom.graph.distances, built_in.graph.distances);
+    }
+
+    #[test]
+    fn graph_builders_export_original_distances_in_sorted_order() {
+        fn check<D: Distance<f32>>(metric: D, correction: fn(f32) -> f32) {
+            let points = 80;
+            let dimension = 35;
+            let degree = 15;
+            let data = create_test_data(points, dimension);
+            let build = || NNDescentBuilder::new(&data, points, dimension)
+                .n_neighbors(degree).n_trees(2).n_iters(4);
+            let graph = build().build_graph_with_distance(metric.clone(), Some(correction));
+            let index = build().build_unprepared_with_distance(metric.clone(), Some(correction));
+            for (indices, distances) in [
+                (&graph.graph.indices, &graph.graph.distances),
+                (&index.neighbor_indices, &index.neighbor_distances),
+            ] {
+                for point in 0..points {
+                    let row = &distances[point * degree..(point + 1) * degree];
+                    assert!(row.windows(2).all(|pair| pair[0] <= pair[1]));
+                    for slot in 0..degree {
+                        let neighbor = indices[point * degree + slot] as usize;
+                        let exact = correction(metric.distance(
+                            &data[point * dimension..(point + 1) * dimension],
+                            &data[neighbor * dimension..(neighbor + 1) * dimension],
+                        ));
+                        assert_eq!(row[slot].to_bits(), exact.to_bits());
+                    }
+                }
+            }
+        }
+        check(SquaredEuclidean, f32::sqrt);
+        check(crate::distance::AlternativeDot, crate::distance::correct_alternative_cosine);
+        check(crate::distance::DirectNormalizedCosine, |value| value);
     }
 
     #[test]

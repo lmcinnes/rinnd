@@ -5,6 +5,8 @@
 /// Implementations should be thread-safe (Send + Sync) to support
 /// parallel computation.
 pub trait Distance<T>: Send + Sync + Clone {
+    const USE_DISTANCE_FOUR: bool = false;
+
     /// Compute the distance between two vectors.
     ///
     /// # Arguments
@@ -14,6 +16,10 @@ pub trait Distance<T>: Send + Sync + Clone {
     /// # Returns
     /// The distance as a f32. Lower values indicate more similarity.
     fn distance(&self, a: &[T], b: &[T]) -> f32;
+
+    fn distance_four(&self, query: &[T], candidates: [&[T]; 4]) -> [f32; 4] {
+        candidates.map(|candidate| self.distance(query, candidate))
+    }
 
     /// Compute distances from one query to multiple data points.
     ///

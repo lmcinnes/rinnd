@@ -65,6 +65,42 @@ def test_n_jobs_applies_to_construction_preparation_and_batch_query():
     assert np.all(np.isfinite(distances))
 
 
+@pytest.mark.parametrize("graph_only", [False, True])
+@pytest.mark.parametrize("n_jobs", [1, 4])
+def test_candidate_phase_statistics_partition_candidate_time(graph_only, n_jobs):
+    index = rinnd.RINND(
+        make_data(n_points=300),
+        n_neighbors=30,
+        n_trees=2,
+        n_iters=3,
+        random_state=42,
+        graph_only=graph_only,
+        n_jobs=n_jobs,
+    )
+    stats = dict(index.build_stats)
+    phases = stats["candidate_phases"]
+    assert set(phases) == {"initialization", "forward", "reverse", "mark", "release"}
+    count = len(stats["updates"])
+    assert count > 0
+    assert len(stats["candidate_seconds"]) == count
+    for values in phases.values():
+        assert len(values) == count
+        assert np.isfinite(values).all()
+        assert np.all(np.asarray(values) >= 0.0)
+    for iteration, total in enumerate(stats["candidate_seconds"]):
+        assert sum(values[iteration] for values in phases.values()) <= total
+    if n_jobs == 1:
+        assert phases["reverse"] == [0.0] * count
+    expected = (
+        stats["forest_seconds"]
+        + stats["leaf_initialization_seconds"]
+        + sum(stats["candidate_seconds"])
+        + sum(stats["update_seconds"])
+    )
+    assert stats["nn_descent_seconds"] == pytest.approx(expected)
+    assert dict(index.build_stats) == stats
+
+
 @pytest.mark.parametrize("n_jobs", [None, -1, 2])
 def test_n_jobs_accepts_all_cores_and_positive_limits(n_jobs):
     data = make_data()
@@ -130,6 +166,17 @@ def test_search_preparation_is_lazy_idempotent_and_automatic():
     index.prepare()
     assert index.is_prepared is True
     first_stats = dict(index.build_stats)
+    iteration_count = len(first_stats["updates"])
+    assert len(first_stats["update_generation_seconds"]) == iteration_count
+    assert len(first_stats["update_application_seconds"]) == iteration_count
+    for total, generation, application in zip(
+        first_stats["update_seconds"],
+        first_stats["update_generation_seconds"],
+        first_stats["update_application_seconds"],
+    ):
+        assert np.isfinite([total, generation, application]).all()
+        assert generation >= 0.0 and application >= 0.0
+        assert generation + application <= total
     index.prepare()
     assert dict(index.build_stats) == first_stats
 

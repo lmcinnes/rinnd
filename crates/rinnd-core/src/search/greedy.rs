@@ -162,6 +162,25 @@ fn fill_random<F: Fn(i32) -> f32>(
     }
 }
 
+#[inline]
+fn consider_neighbor(
+    neighbor: i32,
+    value: f32,
+    epsilon: f32,
+    min_distance: f32,
+    bound: &mut f32,
+    workspace: &mut SearchWorkspace,
+) {
+    if value < *bound {
+        let inserted = workspace.result_heap.push(value, neighbor);
+        workspace.seed_set.push(value, neighbor);
+        if inserted {
+            let maximum = workspace.result_heap.max_distance();
+            *bound = maximum + epsilon * (maximum - min_distance);
+        }
+    }
+}
+
 fn traverse<T, F: Fn(i32) -> f32>(
     data: Option<&[T]>,
     dim: usize,
@@ -200,6 +219,53 @@ fn traverse<T, F: Fn(i32) -> f32>(
     }
 }
 
+fn traverse_four<D: Distance<f32>>(
+    query: &[f32],
+    data: &[f32],
+    dim: usize,
+    graph: &SearchGraph,
+    epsilon: f32,
+    min_distance: f32,
+    distance: &D,
+    workspace: &mut SearchWorkspace,
+) {
+    let maximum = workspace.result_heap.max_distance();
+    let mut bound = maximum + epsilon * (maximum - min_distance);
+    while let Some((vertex_distance, vertex)) = workspace.seed_set.pop() {
+        if workspace.result_heap.is_full() && vertex_distance >= bound {
+            break;
+        }
+        let neighbors = graph.neighbors(vertex as usize);
+        let mut pending = [0; 4];
+        let mut count = 0;
+        for (position, &neighbor) in neighbors.iter().enumerate() {
+            if let Some(&upcoming) = neighbors.get(position + PREFETCH_LOOKAHEAD) {
+                prefetch(data, upcoming, dim);
+            }
+            if neighbor < 0 || workspace.visited.check_and_mark(neighbor) {
+                continue;
+            }
+            pending[count] = neighbor;
+            count += 1;
+            if count == 4 {
+                let vectors = pending.map(|candidate| {
+                    &data[candidate as usize * dim..(candidate as usize + 1) * dim]
+                });
+                let distances = distance.distance_four(query, vectors);
+                for candidate in 0..4 {
+                    consider_neighbor(pending[candidate], distances[candidate], epsilon, min_distance,
+                                      &mut bound, workspace);
+                }
+                count = 0;
+            }
+        }
+        for &neighbor in &pending[..count] {
+            let value = distance.distance(query, &data[neighbor as usize * dim..(neighbor as usize + 1) * dim]);
+            consider_neighbor(neighbor, value, epsilon, min_distance, &mut bound, workspace);
+        }
+    }
+}
+
 fn search<D: Distance<f32>>(
     query: &[f32],
     data: &[f32],
@@ -228,15 +294,13 @@ fn search<D: Distance<f32>>(
     let distance_to =
         |idx: i32| distance.distance(query, &data[idx as usize * dim..(idx as usize + 1) * dim]);
     fill_random(graph.n_vertices, k, &distance_to, rng, workspace);
-    traverse(
-        Some(data),
-        dim,
-        graph,
-        epsilon,
-        min_distance,
-        &distance_to,
-        workspace,
-    );
+    if D::USE_DISTANCE_FOUR && dim >= 32 {
+        traverse_four(query, data, dim, graph, epsilon, min_distance, distance, workspace);
+    } else {
+        traverse(
+            Some(data), dim, graph, epsilon, min_distance, &distance_to, workspace,
+        );
+    }
     workspace.result_heap.clone()
 }
 
@@ -565,4 +629,66 @@ pub fn batch_search<D: Distance<f32> + Sync>(
         distances.extend(std::iter::repeat(f32::INFINITY).take(padding));
     }
     (indices, distances)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distance::SquaredEuclidean;
+
+    #[test]
+    fn batched_traversal_matches_individual_results() {
+        check_batched_traversal(SquaredEuclidean);
+        check_batched_traversal(crate::distance::Cosine);
+        check_batched_traversal(crate::distance::AlternativeDot);
+        check_batched_traversal(crate::distance::DirectNormalizedCosine);
+        check_batched_traversal(crate::distance::InnerProduct);
+        check_batched_traversal(crate::distance::Dot);
+    }
+
+    fn check_batched_traversal<D: Distance<f32>>(distance: D) {
+        #[derive(Clone)]
+        struct Individual<D>(D);
+
+        impl<D: Distance<f32>> Distance<f32> for Individual<D> {
+            fn distance(&self, query: &[f32], candidate: &[f32]) -> f32 {
+                self.0.distance(query, candidate)
+            }
+
+            fn name(&self) -> &'static str { self.0.name() }
+        }
+
+        let points = 97;
+        let mut graph = SearchGraph::new(points);
+        for point in 0..points {
+            for offset in 0..19 {
+                graph.indices.push(((point * 7 + offset * 3) % points) as i32);
+            }
+            graph.indices.push(-1);
+            graph.indices.push(graph.indices[graph.indices.len() - 2]);
+            graph.indptr[point + 1] = graph.indices.len() as i32;
+        }
+        for dimension in [31, 100, 784] {
+            let mut rng = FastRng::new(77);
+            let mut data: Vec<f32> = (0..points * dimension).map(|_| (rng.next_float() - 0.5) / dimension as f32).collect();
+            data[..dimension].fill(0.0);
+            let mut workspace = SearchWorkspace::new(points, 10);
+            for epsilon in [0.0, 0.1, 0.3, 0.6, 1.0] {
+                for query_row in 0..8 {
+                    let query = &data[query_row * dimension..(query_row + 1) * dimension];
+                    let expected = greedy_search_with_workspace(
+                        query, &data, dimension, &graph, &[], 1, &Individual(distance.clone()), 10,
+                        epsilon, 0.0, &mut FastRng::new(42), &mut workspace,
+                    );
+                    let actual = greedy_search_with_workspace(
+                        query, &data, dimension, &graph, &[], 1, &distance, 10,
+                        epsilon, 0.0, &mut FastRng::new(42), &mut workspace,
+                    );
+                    assert_eq!(actual.0, expected.0);
+                    assert_eq!(actual.1.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                               expected.1.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
 }

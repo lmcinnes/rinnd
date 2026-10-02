@@ -30,15 +30,52 @@ fn bench_euclidean(c: &mut Criterion) {
 fn bench_squared_euclidean(c: &mut Criterion) {
     let mut group = c.benchmark_group("squared_euclidean");
 
-    for dim in [32, 64, 128, 256, 512, 768, 1024].iter() {
+    for dim in [32, 64, 128, 256, 512, 768, 784, 1024].iter() {
         let (a, b) = generate_vectors(1, *dim);
 
         group.bench_with_input(BenchmarkId::new("scalar", dim), dim, |bench, _| {
             bench.iter(|| black_box(SquaredEuclidean.distance(&a, &b)))
         });
+        let (_, candidate_data) = generate_vectors(4, *dim);
+        let candidates: [&[f32]; 4] = std::array::from_fn(|candidate| {
+            &candidate_data[candidate * dim..(candidate + 1) * dim]
+        });
+        group.bench_with_input(BenchmarkId::new("sequential_four", dim), dim, |bench, _| {
+            bench.iter(|| {
+                black_box(black_box(candidates).map(|candidate| {
+                    SquaredEuclidean.distance(black_box(&a), candidate)
+                }))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("four", dim), dim, |bench, _| {
+            bench.iter(|| black_box(SquaredEuclidean.distance_four(black_box(&a), black_box(candidates))))
+        });
     }
 
     group.finish();
+}
+
+fn bench_four<D: Distance<f32>>(criterion: &mut Criterion, distance: D) {
+    let mut group = criterion.benchmark_group(format!("batched_{}", distance.name()));
+    for dim in [100, 256, 784] {
+        let (query, candidates) = generate_vectors(4, dim);
+        let query = &query[..dim];
+        let candidates = std::array::from_fn(|candidate| &candidates[candidate * dim..(candidate + 1) * dim]);
+        group.bench_function(BenchmarkId::new("sequential", dim), |bench| {
+            bench.iter(|| black_box(black_box(candidates).map(|candidate| distance.distance(black_box(query), candidate))))
+        });
+        group.bench_function(BenchmarkId::new("four", dim), |bench| {
+            bench.iter(|| black_box(distance.distance_four(black_box(query), black_box(candidates))))
+        });
+    }
+    group.finish();
+}
+
+fn bench_batched_metrics(criterion: &mut Criterion) {
+    bench_four(criterion, Cosine);
+    bench_four(criterion, InnerProduct);
+    bench_four(criterion, AlternativeDot);
+    bench_four(criterion, DirectNormalizedCosine);
 }
 
 fn bench_cosine(c: &mut Criterion) {
@@ -202,6 +239,7 @@ criterion_group!(
     bench_euclidean,
     bench_squared_euclidean,
     bench_cosine,
+    bench_batched_metrics,
     bench_inner_product,
     bench_alternative_dot,
     bench_quantized_i8_dot,

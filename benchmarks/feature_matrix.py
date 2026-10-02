@@ -58,8 +58,10 @@ def execute(command, log, env=None):
 def build(args):
     configurations = [(f"mask-{mask:02d}", features(mask)) for mask in args.masks]
     if args.action == "build-profile":
-        configurations = [(variant, profile_features(variant, args.candidate_feature))
-                          for variant in ("wide", "packed")]
+        configurations = [
+            (variant, profile_features(variant, args.candidate_feature))
+            for variant in ("wide", "packed")
+        ]
     for label, selected_features in configurations:
         folder = args.artifacts / label
         folder.mkdir(parents=True, exist_ok=True)
@@ -271,9 +273,15 @@ def candidate_phase_seconds(record):
     if phases is None:
         return {}
     required = {"initialization", "forward", "reverse", "mark", "release"}
-    if set(phases) != required or any(len(values) != len(stats["candidate_seconds"]) for values in phases.values()):
+    if set(phases) != required or any(
+        len(values) != len(stats["candidate_seconds"]) for values in phases.values()
+    ):
         raise ValueError("candidate phases do not match iteration count or names")
-    if any(not np.isfinite(value) or value < 0 for values in phases.values() for value in values):
+    if any(
+        not np.isfinite(value) or value < 0
+        for values in phases.values()
+        for value in values
+    ):
         raise ValueError("invalid candidate phase timing")
     for iteration, total in enumerate(stats["candidate_seconds"]):
         if sum(values[iteration] for values in phases.values()) > total + 1e-9:
@@ -303,7 +311,9 @@ def graph_profile_summary(pairs):
         raise ValueError("one dataset per summary required")
 
     def timing(values):
-        ratios = [before / after for before, after in values if before > 0 and after > 0]
+        ratios = [
+            before / after for before, after in values if before > 0 and after > 0
+        ]
         return {
             "wide_median_seconds": statistics.median(before for before, _ in values),
             "packed_median_seconds": statistics.median(after for _, after in values),
@@ -312,24 +322,49 @@ def graph_profile_summary(pairs):
         }
 
     seeds = sorted({before["seed"] for before, _ in records})
-    phases = [(graph_phase_seconds(before), graph_phase_seconds(after)) for before, after in records]
-    candidate_phases = [(candidate_phase_seconds(before), candidate_phase_seconds(after)) for before, after in records]
-    if any(set(before) != set(candidate_phases[0][0]) or set(after) != set(candidate_phases[0][0])
-           for before, after in candidate_phases):
+    phases = [
+        (graph_phase_seconds(before), graph_phase_seconds(after))
+        for before, after in records
+    ]
+    candidate_phases = [
+        (candidate_phase_seconds(before), candidate_phase_seconds(after))
+        for before, after in records
+    ]
+    if any(
+        set(before) != set(candidate_phases[0][0])
+        or set(after) != set(candidate_phases[0][0])
+        for before, after in candidate_phases
+    ):
         raise ValueError("incompatible candidate phase instrumentation")
     resources = {}
     for position, variant in enumerate(("wide", "packed")):
         observed = [pair[position] for pair in records]
         resources[variant] = {
-            "median_process_cpu_seconds": statistics.median(record["resources"]["process_cpu_seconds"] for record in observed),
-            "median_cpu_seconds_per_wall_second": statistics.median(
-                record["resources"]["process_cpu_seconds"] / record["elapsed_seconds"] for record in observed
+            "median_process_cpu_seconds": statistics.median(
+                record["resources"]["process_cpu_seconds"] for record in observed
             ),
-            "median_process_peak_rss_bytes": statistics.median(record["resources"]["process_peak_rss_bytes"] for record in observed),
-            "median_involuntary_context_switches": statistics.median(record["resources"]["involuntary_context_switches"] for record in observed),
+            "median_cpu_seconds_per_wall_second": statistics.median(
+                record["resources"]["process_cpu_seconds"] / record["elapsed_seconds"]
+                for record in observed
+            ),
+            "median_process_peak_rss_bytes": statistics.median(
+                record["resources"]["process_peak_rss_bytes"] for record in observed
+            ),
+            "median_involuntary_context_switches": statistics.median(
+                record["resources"]["involuntary_context_switches"]
+                for record in observed
+            ),
             "host_one_minute_load_range": [
-                min(record["resources"][key][0] for record in observed for key in ("host_load_before", "host_load_after")),
-                max(record["resources"][key][0] for record in observed for key in ("host_load_before", "host_load_after")),
+                min(
+                    record["resources"][key][0]
+                    for record in observed
+                    for key in ("host_load_before", "host_load_after")
+                ),
+                max(
+                    record["resources"][key][0]
+                    for record in observed
+                    for key in ("host_load_before", "host_load_after")
+                ),
             ],
         }
     return {
@@ -338,12 +373,30 @@ def graph_profile_summary(pairs):
         "case": records[0][0]["case"],
         "pairs": len(records),
         "identical_graphs_and_updates": True,
-        "delivery": timing([(before["elapsed_seconds"], after["elapsed_seconds"]) for before, after in records]),
-        "phases": {phase: timing([(before[phase], after[phase]) for before, after in phases]) for phase in phases[0][0]},
-        "candidate_phases": {phase: timing([(before[phase], after[phase]) for before, after in candidate_phases])
-                     for phase in candidate_phases[0][0]},
+        "delivery": timing(
+            [
+                (before["elapsed_seconds"], after["elapsed_seconds"])
+                for before, after in records
+            ]
+        ),
+        "phases": {
+            phase: timing([(before[phase], after[phase]) for before, after in phases])
+            for phase in phases[0][0]
+        },
+        "candidate_phases": {
+            phase: timing(
+                [(before[phase], after[phase]) for before, after in candidate_phases]
+            )
+            for phase in candidate_phases[0][0]
+        },
         "per_seed_delivery": {
-            str(seed): timing([(before["elapsed_seconds"], after["elapsed_seconds"]) for before, after in records if before["seed"] == seed])
+            str(seed): timing(
+                [
+                    (before["elapsed_seconds"], after["elapsed_seconds"])
+                    for before, after in records
+                    if before["seed"] == seed
+                ]
+            )
             for seed in seeds
         },
         "resources": resources,
@@ -366,7 +419,9 @@ def check_profile_fingerprint(seen, report):
         key = (report["dataset_sha256"], record["case"], record["seed"])
         fingerprint = (record["graph_sha256"], record["build_stats"]["updates"])
         if seen.setdefault(key, fingerprint) != fingerprint:
-            raise ValueError(f"graph or iteration updates changed across repeated builds: {key}")
+            raise ValueError(
+                f"graph or iteration updates changed across repeated builds: {key}"
+            )
 
 
 def profile_updates(args):
@@ -400,12 +455,20 @@ def profile_updates(args):
         "threads": args.threads,
         "degrees": [15, 30],
         "candidate_feature": args.candidate_feature,
-        "variant_labels": {"wide": "baseline", "packed": args.candidate_feature or "packed-updates"},
+        "variant_labels": {
+            "wide": "baseline",
+            "packed": args.candidate_feature or "packed-updates",
+        },
         "warmup_pairs_per_degree": 1,
         "order": "alternate variants every paired repetition; one build per process",
-        "harness_hashes": {str(path): file_hash(path) for path in (
-            Path(__file__), ROOT / "benchmarks/benchmark_recall.py", ROOT / "benchmarks/ground_truth.py",
-        )},
+        "harness_hashes": {
+            str(path): file_hash(path)
+            for path in (
+                Path(__file__),
+                ROOT / "benchmarks/benchmark_recall.py",
+                ROOT / "benchmarks/ground_truth.py",
+            )
+        },
         "affinity": sorted(os.sched_getaffinity(0)),
     }
     with (args.output / "profile.json").open("x") as output:
@@ -414,7 +477,11 @@ def profile_updates(args):
     seen = {}
     for dataset_number, name in enumerate(args.datasets):
         for degree_number, degree in enumerate((15, 30)):
-            jobs = [(args.seeds[0], -1)] + [(seed, repetition) for seed in args.seeds for repetition in range(args.repeats)]
+            jobs = [(args.seeds[0], -1)] + [
+                (seed, repetition)
+                for seed in args.seeds
+                for repetition in range(args.repeats)
+            ]
             pairs = []
             for pair_number, (seed, repetition) in enumerate(jobs):
                 order = ["wide", "packed"]
@@ -422,26 +489,52 @@ def profile_updates(args):
                     order.reverse()
                 reports = {}
                 for variant in order:
-                    result = args.output / f"{name}-k{degree}-s{seed}-r{repetition}-{variant}.json"
+                    result = (
+                        args.output
+                        / f"{name}-k{degree}-s{seed}-r{repetition}-{variant}.json"
+                    )
                     command = [
-                        str(args.python), str(ROOT / "benchmarks/benchmark_recall.py"), "profile",
-                        str(ROOT / "ann-benchmarks/data" / f"{name}.hdf5"), str(result),
-                        "--threads", str(args.threads), "--seeds", str(seed),
-                        "--repeats", "1", "--degrees", str(degree),
+                        str(args.python),
+                        str(ROOT / "benchmarks/benchmark_recall.py"),
+                        "profile",
+                        str(ROOT / "ann-benchmarks/data" / f"{name}.hdf5"),
+                        str(result),
+                        "--threads",
+                        str(args.threads),
+                        "--seeds",
+                        str(seed),
+                        "--repeats",
+                        "1",
+                        "--degrees",
+                        str(degree),
                     ]
-                    environment = dict(os.environ, PYTHONPATH=str(args.artifacts / variant / "python"))
+                    environment = dict(
+                        os.environ, PYTHONPATH=str(args.artifacts / variant / "python")
+                    )
                     execute(command, result.with_suffix(".log"), environment)
                     report = json.loads(result.read_text())
-                    if report["provenance"]["binary_hashes"] != builds[variant]["binary_hashes"]:
+                    if (
+                        report["provenance"]["binary_hashes"]
+                        != builds[variant]["binary_hashes"]
+                    ):
                         raise ValueError(f"unexpected imported binary: {result}")
                     check_profile_fingerprint(seen, report)
                     reports[variant] = report
                 summary = graph_profile_summary([(reports["wide"], reports["packed"])])
-                print(json.dumps({
-                    "dataset": name, "degree": degree, "seed": seed,
-                    "repetition": repetition, "warmup": repetition < 0,
-                    "identical": True, "delivery": summary["delivery"],
-                }), flush=True)
+                print(
+                    json.dumps(
+                        {
+                            "dataset": name,
+                            "degree": degree,
+                            "seed": seed,
+                            "repetition": repetition,
+                            "warmup": repetition < 0,
+                            "identical": True,
+                            "delivery": summary["delivery"],
+                        }
+                    ),
+                    flush=True,
+                )
                 if repetition >= 0:
                     pairs.append((reports["wide"], reports["packed"]))
             endpoint = graph_profile_summary(pairs)
@@ -631,7 +724,17 @@ def confirm(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("build", "build-profile", "run", "summarize", "confirm", "profile-updates"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "build",
+            "build-profile",
+            "run",
+            "summarize",
+            "confirm",
+            "profile-updates",
+        ),
+    )
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument(
         "--output", type=Path, default=ROOT / "benchmarks/results/feature-matrix-screen"
@@ -651,7 +754,10 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[42])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--candidate-feature", choices=("candidate-membership", "candidate-workspace", "candidate-combined"))
+    parser.add_argument(
+        "--candidate-feature",
+        choices=("candidate-membership", "candidate-workspace", "candidate-combined"),
+    )
     parser.add_argument("--split", choices=("tuning", "confirmation"), default="tuning")
     parser.add_argument("--query-limit", type=int, default=200)
     parser.add_argument(
@@ -659,13 +765,20 @@ def main():
     )
     parser.add_argument("--reference-suffix", default="n10000-k30")
     args = parser.parse_args()
-    if args.candidate_feature and args.action not in ("build-profile", "profile-updates"):
+    if args.candidate_feature and args.action not in (
+        "build-profile",
+        "profile-updates",
+    ):
         parser.error("candidate feature requires build-profile/profile-updates")
     args.artifacts, args.output = args.artifacts.resolve(), args.output.resolve()
-    {"build": build, "build-profile": build, "run": run, "summarize": summarize, "confirm": confirm,
-     "profile-updates": profile_updates}[
-        args.action
-    ](args)
+    {
+        "build": build,
+        "build-profile": build,
+        "run": run,
+        "summarize": summarize,
+        "confirm": confirm,
+        "profile-updates": profile_updates,
+    }[args.action](args)
 
 
 if __name__ == "__main__":

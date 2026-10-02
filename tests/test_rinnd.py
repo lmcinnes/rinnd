@@ -69,8 +69,13 @@ def test_n_jobs_applies_to_construction_preparation_and_batch_query():
 @pytest.mark.parametrize("n_jobs", [1, 4])
 def test_candidate_phase_statistics_partition_candidate_time(graph_only, n_jobs):
     index = rinnd.RINND(
-        make_data(n_points=300), n_neighbors=30, n_trees=2, n_iters=3,
-        random_state=42, graph_only=graph_only, n_jobs=n_jobs,
+        make_data(n_points=300),
+        n_neighbors=30,
+        n_trees=2,
+        n_iters=3,
+        random_state=42,
+        graph_only=graph_only,
+        n_jobs=n_jobs,
     )
     stats = dict(index.build_stats)
     phases = stats["candidate_phases"]
@@ -86,9 +91,12 @@ def test_candidate_phase_statistics_partition_candidate_time(graph_only, n_jobs)
         assert sum(values[iteration] for values in phases.values()) <= total
     if n_jobs == 1:
         assert phases["reverse"] == [0.0] * count
-    expected = (stats["forest_seconds"]
-                + stats["leaf_initialization_seconds"] + sum(stats["candidate_seconds"])
-                + sum(stats["update_seconds"]))
+    expected = (
+        stats["forest_seconds"]
+        + stats["leaf_initialization_seconds"]
+        + sum(stats["candidate_seconds"])
+        + sum(stats["update_seconds"])
+    )
     assert stats["nn_descent_seconds"] == pytest.approx(expected)
     assert dict(index.build_stats) == stats
 

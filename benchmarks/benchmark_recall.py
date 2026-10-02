@@ -76,20 +76,33 @@ def validate_graph_distances(data, rows, indices, distances, metric, parameters)
         if np.any(neighbors[valid] >= len(data)):
             raise ValueError("public graph contains out-of-range IDs")
         expected = metric_distances(
-            data[row:row + 1].astype(np.float64),
-            data[neighbors[valid]].astype(np.float64), metric,
+            data[row : row + 1].astype(np.float64),
+            data[neighbors[valid]].astype(np.float64),
+            metric,
         )[0]
-        if metric == "angular" and parameters.get("cosine_distance_mode", "log") == "log":
+        if (
+            metric == "angular"
+            and parameters.get("cosine_distance_mode", "log") == "log"
+        ):
             expected = np.minimum(expected, 1.0)
         actual = distances[row, valid]
         if not np.allclose(actual, expected, rtol=5e-5, atol=5e-6):
-            raise ValueError("public graph distances differ from original-vector metric")
+            raise ValueError(
+                "public graph distances differ from original-vector metric"
+            )
         if np.any(np.diff(distances[row]) < 0):
             raise ValueError("public graph distances are not sorted")
-        maximum_error = max(maximum_error, float(np.max(np.abs(actual - expected), initial=0.0)))
+        maximum_error = max(
+            maximum_error, float(np.max(np.abs(actual - expected), initial=0.0))
+        )
         checked += len(actual)
-    return {"status": "validated", "edges": checked, "max_absolute_error": maximum_error,
-            "rtol": 5e-5, "atol": 5e-6}
+    return {
+        "status": "validated",
+        "edges": checked,
+        "max_absolute_error": maximum_error,
+        "rtol": 5e-5,
+        "atol": 5e-6,
+    }
 
 
 def provenance():
@@ -140,12 +153,16 @@ def graph_phase_seconds(record):
     stats = record["build_stats"]
     iterations = len(stats["updates"])
     vectors = (
-        "candidate_seconds", "update_seconds", "update_generation_seconds",
+        "candidate_seconds",
+        "update_seconds",
+        "update_generation_seconds",
         "update_application_seconds",
     )
     if any(len(stats[key]) != iterations for key in vectors):
         raise ValueError("phase timings do not match iteration count")
-    if any(not np.isfinite(value) or value < 0 for key in vectors for value in stats[key]):
+    if any(
+        not np.isfinite(value) or value < 0 for key in vectors for value in stats[key]
+    ):
         raise ValueError("invalid phase timing")
     generation = sum(stats["update_generation_seconds"])
     application = sum(stats["update_application_seconds"])
@@ -247,13 +264,19 @@ def measure_graph(args, dataset, metric):
                     "recalls": recalls,
                     "resources": {
                         "process_cpu_seconds": (
-                            usage_after.ru_utime + usage_after.ru_stime
-                            - usage_before.ru_utime - usage_before.ru_stime
+                            usage_after.ru_utime
+                            + usage_after.ru_stime
+                            - usage_before.ru_utime
+                            - usage_before.ru_stime
                         ),
-                        "involuntary_context_switches": usage_after.ru_nivcsw - usage_before.ru_nivcsw,
-                        "voluntary_context_switches": usage_after.ru_nvcsw - usage_before.ru_nvcsw,
-                        "minor_page_faults": usage_after.ru_minflt - usage_before.ru_minflt,
-                        "major_page_faults": usage_after.ru_majflt - usage_before.ru_majflt,
+                        "involuntary_context_switches": usage_after.ru_nivcsw
+                        - usage_before.ru_nivcsw,
+                        "voluntary_context_switches": usage_after.ru_nvcsw
+                        - usage_before.ru_nvcsw,
+                        "minor_page_faults": usage_after.ru_minflt
+                        - usage_before.ru_minflt,
+                        "major_page_faults": usage_after.ru_majflt
+                        - usage_before.ru_majflt,
                         "process_peak_rss_bytes": usage_after.ru_maxrss * 1024,
                         "host_load_before": load_before,
                         "host_load_after": load_after,
@@ -262,7 +285,12 @@ def measure_graph(args, dataset, metric):
                 record["phase_seconds"] = graph_phase_seconds(record)
                 if not profiling:
                     record["public_distances"] = validate_graph_distances(
-                        data, rows, indices, distances, metric, args.parameters,
+                        data,
+                        rows,
+                        indices,
+                        distances,
+                        metric,
+                        args.parameters,
                     )
                 records.append(record)
                 print(
@@ -410,7 +438,9 @@ def main():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--degrees", type=int, nargs="+", choices=(15, 30), default=[15, 30])
+    parser.add_argument(
+        "--degrees", type=int, nargs="+", choices=(15, 30), default=[15, 30]
+    )
     parser.add_argument("--parameters", type=json.loads, default={})
     parser.add_argument("--ordinary-index", action="store_false", dest="graph_only")
     parser.add_argument(

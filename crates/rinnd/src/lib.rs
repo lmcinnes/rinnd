@@ -1426,6 +1426,10 @@ impl PyNNDescent {
         }
         result.set_item("candidate_phases", candidate_phases)?;
         result.set_item(
+            "candidate_active_vertices",
+            phases.iter().map(|phase| phase.active_vertices).collect::<Vec<_>>(),
+        )?;
+        result.set_item(
             "update_generation_seconds",
             stats.nn_descent.update_generation_seconds.clone(),
         )?;

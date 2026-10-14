@@ -6,7 +6,14 @@ Graph delivery and single-query throughput are separate workloads. The current
 priority is full-corpus graph delivery, especially for large datasets; query timing
 is not an adoption gate for lossless construction changes with identical graphs.
 
-## Current default decision (2026-10-02)
+## Current default decision (2026-10-14)
+
+Default builds now also enable `active-candidates` (seven features in total),
+approved on 2026-10-14 after the exact full-corpus profile in
+[Active-set candidates](#active-set-candidates-2026-10-14). The 2026-10-02 decision
+below otherwise still applies.
+
+## Previous default decision (2026-10-02)
 
 Default Rust and Python builds now enable six optimization features:
 `batched-euclidean`, `batched-angular`, `compact-candidates`, `batched-leaves`,
@@ -75,6 +82,80 @@ FP16/direct-packing feature flags, buffer tuning, and their dedicated benchmark
 options are no longer available in the current source.
 
 ## Optimization experiments
+
+### Active-set candidates (2026-10-14)
+
+**Decision: promoted to default.** In late iterations candidate construction
+dominated (GloVe k30: about 0.6 s per iteration against 0.04-0.4 s of update
+generation in iterations 6-11), although few vertices still had new candidates. The
+join skips old-old pairs, so a vertex without new candidates generates nothing and
+its old list is never read. `build_from_graph_parallel_active` builds new lists,
+marks active vertices, then replays each worker's RNG seed to push old edges only
+into active rows (forward if the source is active, reverse if the destination is).
+Per-row push order is unchanged, so outputs are bit-identical; a unit test checks
+new lists, active old lists, flags and RNG state against the default build.
+
+Active fraction per iteration, GloVe k30 seed 42: 1.0, 1.0, 1.0, 0.995, 0.94,
+0.80, 0.60, 0.39, 0.23, 0.12, 0.06; candidate time fell from 0.74 to 0.12 s by the
+last iteration. Early, fully active iterations cost the same as before.
+
+Full paired profile, baseline = previous six defaults, candidate = plus
+`active-candidates`; 4 datasets, k15/k30, seeds 42-44, 3 repeats, one warm-up pair
+per endpoint, 8 physical cores. All 72 measured and 8 warm-up pairs had identical
+graph hashes and per-iteration update counts.
+
+| Endpoint | Baseline s | Active s | Median speedup | Range | Peak RSS MB |
+| --- | --- | --- | --- | --- | --- |
+| MNIST k15 | 0.766 | 0.743 | 1.019x | 0.988-1.032 | 360 -> 354 |
+| MNIST k30 | 1.542 | 1.528 | 1.012x | 0.999-1.025 | 521 -> 517 |
+| Fashion-MNIST k15 | 0.807 | 0.790 | 1.018x | 1.001-1.027 | 361 -> 353 |
+| Fashion-MNIST k30 | 1.530 | 1.519 | 1.009x | 0.999-1.018 | 517 -> 513 |
+| GloVe k15 | 15.089 | 13.913 | 1.082x | 1.073-1.099 | 1963 -> 1884 |
+| GloVe k30 | 30.427 | 28.426 | 1.071x | 1.066-1.075 | 2693 -> 2628 |
+| NYTimes k15 | 4.387 | 4.098 | 1.067x | 1.059-1.079 | 928 -> 900 |
+| NYTimes k30 | 9.253 | 8.716 | 1.065x | 1.049-1.072 | 1139 -> 1138 |
+
+Median process CPU time also fell everywhere (GloVe k30 221.2 -> 205.6 s). A few
+image pairs were within noise of 1.0x (minimum 0.988x). Artifacts:
+`target/active-candidates-confirm-v1/{wide,packed}` (`packed` is the legacy runner
+label for the candidate variant), results in
+`results/active-candidates-confirm-v1/`; the earlier 3-seed screen is in
+`results/active-candidates-v1/`. This is an exact-output engineering default, not a
+ten-seed statistical confirmation; query timing was not measured.
+
+Promotion validation: 159 release core tests with defaults, 158 with
+`--no-default-features --features std,rayon`, 160 with all features; all targets
+compile with all features. The default CPython 3.10 wheel in
+`target/wheels/default-active-candidates-v1/` is installed into
+`ann-benchmarks/.venv`; its imported binary matches the wheel and 52 Python API and
+harness tests pass without `PYTHONPATH`.
+
+```bash
+conda run -n uv --no-capture-output uv run --directory ann-benchmarks \
+  python ../benchmarks/feature_matrix.py build-profile \
+  --artifacts ../target/active-candidates-new --candidate-feature active-candidates
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  taskset -c 0,2,4,6,8,10,12,14 \
+  conda run -n uv --no-capture-output uv run --directory ann-benchmarks \
+  python ../benchmarks/feature_matrix.py profile-updates \
+  --artifacts ../target/active-candidates-new \
+  --output ../benchmarks/results/active-candidates-new \
+  --candidate-feature active-candidates --seeds 42 43 44 --repeats 3
+```
+
+The `active-candidates` runner option compares against the current default feature
+set, unlike the older candidate options, whose baseline is the original four.
+
+### Leaf-order permutation (2026-10-14, rejected)
+
+Permuting data into first-RP-tree leaf order before NN-descent cost about 0.1 s on
+GloVe, but the build was 9-16% slower: contiguous ownership blocks concentrated
+updates on one thread (leaf initialization 3.7 -> 6.3 s, application 3.8 -> 5.0 s
+at k30) while CPU time fell only about 4%. Only 7.6% of GloVe k-NN edges (about 20%
+for NYTimes) fell within 16,384 positions after reordering; reverse Cuthill-McKee on
+the final graph reached 17%. Owner-aligned scheduling recovered part of the loss but
+shifted the imbalance into generation. The experiment code was removed; results
+are in `results/leaf-order-v{1,2,3}/`.
 
 ### Lossless candidate-reference updates (2026-09-30)
 

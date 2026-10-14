@@ -102,6 +102,12 @@ def test_candidate_profile_features_and_timing_partition():
         "candidate-membership",
         "candidate-workspace",
     ]
+    from feature_matrix import CURRENT_DEFAULTS
+
+    assert profile_features("wide", "active-candidates") == list(CURRENT_DEFAULTS)
+    assert profile_features("packed", "active-candidates") == list(
+        CURRENT_DEFAULTS
+    ) + ["active-candidates"]
     phases = {
         name: [0.1, 0.2]
         for name in ("initialization", "forward", "reverse", "mark", "release")

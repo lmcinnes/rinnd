@@ -15,6 +15,8 @@ pub struct CandidateBuildStats {
     pub reverse_seconds: f64,
     pub mark_seconds: f64,
     pub release_seconds: f64,
+    /// Vertices with at least one new candidate.
+    pub active_vertices: usize,
 }
 
 #[cfg(not(feature = "compact-candidates"))]
@@ -180,6 +182,9 @@ impl CandidateSets {
 
         // Use the parallel version if we have enough vertices
         if n_vertices >= 256 && n_threads > 1 {
+            #[cfg(feature = "active-candidates")]
+            return Self::build_from_graph_parallel_active::<PROFILE, REUSE>(graph, max_candidates, rng, n_threads, workspace);
+            #[cfg(not(feature = "active-candidates"))]
             Self::build_from_graph_parallel::<PROFILE, REUSE>(graph, max_candidates, rng, n_threads, workspace)
         } else {
             Self::build_from_graph_sequential::<PROFILE, REUSE>(graph, max_candidates, rng, workspace)
@@ -291,6 +296,7 @@ impl CandidateSets {
     /// Phase 2: Each thread applies reverse edges destined for its block.
     ///
     /// This is O(n*k) total scan work instead of O(n_threads * n*k).
+    #[cfg_attr(all(feature = "active-candidates", not(test)), allow(dead_code))]
     fn build_from_graph_parallel<const PROFILE: bool, const REUSE: bool>(
         graph: &mut NeighborHeap,
         max_candidates: usize,
@@ -513,6 +519,149 @@ impl CandidateSets {
         }, stats)
     }
 
+    /// Parallel candidate build that fills old lists only for active vertices.
+    ///
+    /// The join never reads old candidates of a vertex without new candidates, so
+    /// new lists are built first and each thread's RNG stream is replayed for old
+    /// lists. Every active row sees the same push sequence as the default build,
+    /// so outputs are identical; inactive rows' old lists are left empty.
+    #[cfg(feature = "active-candidates")]
+    fn build_from_graph_parallel_active<const PROFILE: bool, const REUSE: bool>(
+        graph: &mut NeighborHeap,
+        max_candidates: usize,
+        rng: &mut FastRng,
+        n_threads: usize,
+        workspace: &mut CandidateWorkspace,
+    ) -> (Self, CandidateBuildStats) {
+        let mut stats = CandidateBuildStats::default();
+        let started = PROFILE.then(Instant::now);
+        let n_vertices = graph.n_points;
+        let k = graph.k;
+        let block_size = (n_vertices + n_threads - 1) / n_threads;
+
+        let size = n_vertices * max_candidates;
+        let (mut new_indices, mut new_priority, mut old_indices, mut old_priority) = if REUSE {
+            workspace.take_arrays(size)
+        } else {
+            (vec![-1; size], vec![f32::INFINITY; size], vec![-1; size], vec![f32::INFINITY; size])
+        };
+        let thread_seeds: Vec<u64> = (0..n_threads).map(|_| rng.next_u64()).collect();
+        let graph_indices = &graph.indices;
+        let graph_flags = &graph.flags;
+        let new_heaps = RawHeaps::new(&mut new_indices, &mut new_priority, max_candidates);
+        let old_heaps = RawHeaps::new(&mut old_indices, &mut old_priority, max_candidates);
+
+        stats.initialization_seconds = started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+
+        // Scan this thread's rows, replaying its RNG; push edges with the requested flag
+        // whose destination passes `active`, bucketing cross-block reverse edges.
+        let scan = |thread_idx: usize, want_new: bool, active: &(dyn Fn(usize) -> bool + Sync)| {
+            let block_start = thread_idx * block_size;
+            let block_end = ((thread_idx + 1) * block_size).min(n_vertices);
+            let mut buckets: Vec<Vec<ReverseCandidate>> = vec![Vec::new(); n_threads];
+            if block_start >= n_vertices {
+                return buckets;
+            }
+            let heaps = if want_new { new_heaps } else { old_heaps };
+            let mut local_rng = FastRng::new(thread_seeds[thread_idx]);
+            for i in block_start..block_end {
+                let source_active = active(i);
+                let row_start = i * k;
+                for j in 0..k {
+                    let neighbor = graph_indices[row_start + j];
+                    if neighbor < 0 {
+                        continue;
+                    }
+                    let priority = local_rng.next_float();
+                    if (graph_flags[row_start + j] != 0) != want_new {
+                        continue;
+                    }
+                    // SAFETY: rows in [block_start, block_end) are written only by this thread.
+                    if source_active {
+                        unsafe { heaps.push(i, priority, neighbor) };
+                    }
+                    let neighbor_idx = neighbor as usize;
+                    if !active(neighbor_idx) {
+                        continue;
+                    }
+                    let dest_block = neighbor_idx / block_size;
+                    if dest_block == thread_idx {
+                        unsafe { heaps.push(neighbor_idx, priority, i as i32) };
+                    } else {
+                        buckets[dest_block].push(reverse_candidate(neighbor, i as i32, priority, want_new));
+                    }
+                }
+            }
+            buckets
+        };
+        let apply = |buckets: &[Vec<Vec<ReverseCandidate>>], want_new: bool| {
+            let heaps = if want_new { new_heaps } else { old_heaps };
+            (0..n_threads).into_par_iter().for_each(|thread_idx| {
+                for (src_thread, source) in buckets.iter().enumerate() {
+                    if src_thread == thread_idx {
+                        continue;
+                    }
+                    for &record in &source[thread_idx] {
+                        let (dest_vertex, candidate, priority, _) = unpack_reverse_candidate(record);
+                        // SAFETY: bucket `thread_idx` only holds rows owned by this thread.
+                        unsafe { heaps.push(dest_vertex, priority, candidate) };
+                    }
+                }
+            });
+        };
+
+        let started = PROFILE.then(Instant::now);
+        let new_buckets: Vec<_> = (0..n_threads)
+            .into_par_iter()
+            .map(|thread_idx| scan(thread_idx, true, &|_| true))
+            .collect();
+        let mut forward_seconds = started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+
+        let started = PROFILE.then(Instant::now);
+        apply(&new_buckets, true);
+        drop(new_buckets);
+        let mut reverse_seconds = started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+
+        let started = PROFILE.then(Instant::now);
+        let active: Vec<bool> = new_indices
+            .par_chunks(max_candidates.max(1))
+            .map(|row| row.iter().any(|&candidate| candidate >= 0))
+            .collect();
+        stats.active_vertices = active.iter().filter(|&&value| value).count();
+        let old_buckets: Vec<_> = (0..n_threads)
+            .into_par_iter()
+            .map(|thread_idx| scan(thread_idx, false, &|vertex| active[vertex]))
+            .collect();
+        forward_seconds += started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+
+        let started = PROFILE.then(Instant::now);
+        apply(&old_buckets, false);
+        reverse_seconds += started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+        stats.forward_seconds = forward_seconds;
+        stats.reverse_seconds = reverse_seconds;
+
+        let started = PROFILE.then(Instant::now);
+        Self::mark_old_flags(graph, &new_indices, max_candidates);
+        stats.mark_seconds = started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+        let started = PROFILE.then(Instant::now);
+        drop(old_buckets);
+        if REUSE {
+            workspace.new_priority = new_priority;
+            workspace.old_priority = old_priority;
+        } else {
+            drop(new_priority);
+            drop(old_priority);
+        }
+        stats.release_seconds = started.map_or(0.0, |time| time.elapsed().as_secs_f64());
+
+        (Self {
+            new_indices,
+            old_indices,
+            n_vertices,
+            max_candidates,
+        }, stats)
+    }
+
     /// Mark flags in graph as old for neighbors that appear in new_indices.
     fn mark_old_flags(graph: &mut NeighborHeap, new_indices: &[i32], max_candidates: usize) {
         let n_vertices = graph.n_points;
@@ -587,6 +736,40 @@ impl CandidateSets {
     /// Get total number of old candidates across all vertices.
     pub fn total_old(&self) -> usize {
         self.old_indices.iter().filter(|&&x| x >= 0).count()
+    }
+}
+
+/// Shared raw view of flat candidate heaps for row-disjoint parallel writes.
+#[cfg(feature = "active-candidates")]
+#[derive(Clone, Copy)]
+struct RawHeaps {
+    indices: *mut i32,
+    priorities: *mut f32,
+    width: usize,
+}
+
+#[cfg(feature = "active-candidates")]
+unsafe impl Send for RawHeaps {}
+#[cfg(feature = "active-candidates")]
+unsafe impl Sync for RawHeaps {}
+
+#[cfg(feature = "active-candidates")]
+impl RawHeaps {
+    fn new(indices: &mut [i32], priorities: &mut [f32], width: usize) -> Self {
+        debug_assert_eq!(indices.len(), priorities.len());
+        Self { indices: indices.as_mut_ptr(), priorities: priorities.as_mut_ptr(), width }
+    }
+
+    /// SAFETY: the caller must have exclusive access to `row` and `row` must be in bounds.
+    #[inline(always)]
+    unsafe fn push(self, row: usize, priority: f32, index: i32) {
+        let offset = row * self.width;
+        checked_heap_push_flat(
+            std::slice::from_raw_parts_mut(self.priorities.add(offset), self.width),
+            std::slice::from_raw_parts_mut(self.indices.add(offset), self.width),
+            priority,
+            index,
+        );
     }
 }
 
@@ -764,6 +947,50 @@ mod tests {
                         assert!(phases.iter().all(|value| value.is_finite() && *value >= 0.0));
                         assert!(phases.iter().sum::<f64>() <= elapsed);
                     }
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "active-candidates")]
+    #[test]
+    fn active_candidates_match_default_for_active_rows() {
+        for threads in [2, 4, 8] {
+            rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| {
+                for (points, width, new_period) in [(513, 30, 3), (513, 15, 17), (1031, 30, 97), (300, 60, 1), (257, 1, 5)] {
+                    let mut initial = NeighborHeap::new(points, 30);
+                    for point in 0..points {
+                        for slot in 0..30 {
+                            if (point + slot) % 11 != 0 {
+                                initial.checked_flagged_push(point, ((point * 17 + slot * 7) % points) as i32,
+                                    (slot + 1) as f32, (point * 7 + slot) % new_period == 0);
+                            }
+                        }
+                    }
+                    let mut default_graph = initial.clone();
+                    let mut active_graph = initial;
+                    let mut default_rng = FastRng::new(42);
+                    let mut active_rng = FastRng::new(42);
+                    let mut workspace = CandidateWorkspace::default();
+                    let (expected, _) = CandidateSets::build_from_graph_parallel::<false, false>(
+                        &mut default_graph, width, &mut default_rng, threads, &mut workspace,
+                    );
+                    let (actual, stats) = CandidateSets::build_from_graph_parallel_active::<true, false>(
+                        &mut active_graph, width, &mut active_rng, threads, &mut workspace,
+                    );
+                    assert_eq!(expected.new_indices, actual.new_indices);
+                    assert_eq!(default_graph.flags, active_graph.flags);
+                    assert_eq!(default_rng.next_u64(), active_rng.next_u64());
+                    let mut active = 0;
+                    for vertex in 0..points {
+                        if expected.get_new(vertex).iter().any(|&candidate| candidate >= 0) {
+                            active += 1;
+                            assert_eq!(expected.get_old(vertex), actual.get_old(vertex));
+                        } else {
+                            assert!(actual.get_old(vertex).iter().all(|&candidate| candidate < 0));
+                        }
+                    }
+                    assert_eq!(stats.active_vertices, active);
                 }
             });
         }

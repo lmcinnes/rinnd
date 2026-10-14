@@ -23,6 +23,8 @@ FEATURES = (
     "batched-leaves",
 )
 
+CURRENT_DEFAULTS = FEATURES + ("candidate-membership", "candidate-workspace")
+
 
 def features(mask):
     if not 0 <= mask < 16:
@@ -405,6 +407,11 @@ def graph_profile_summary(pairs):
 
 
 def profile_features(variant, candidate_feature=None):
+    if candidate_feature == "active-candidates":
+        # Compared against the current default build, not the original four features.
+        return list(CURRENT_DEFAULTS) + (
+            ["active-candidates"] if variant == "packed" else []
+        )
     selected = list(FEATURES)
     if variant == "packed":
         if candidate_feature == "candidate-combined":
@@ -756,7 +763,12 @@ def main():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument(
         "--candidate-feature",
-        choices=("candidate-membership", "candidate-workspace", "candidate-combined"),
+        choices=(
+            "candidate-membership",
+            "candidate-workspace",
+            "candidate-combined",
+            "active-candidates",
+        ),
     )
     parser.add_argument("--split", choices=("tuning", "confirmation"), default="tuning")
     parser.add_argument("--query-limit", type=int, default=200)

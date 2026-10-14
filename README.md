@@ -46,13 +46,14 @@ cargo bench --release
 ### Default Optimizations
 
 Default Rust and Python builds enable `batched-euclidean`, `batched-angular`,
-`compact-candidates`, `batched-leaves`, `candidate-membership`, and
-`candidate-workspace`. These enable distance batching, compact reverse-candidate
-storage, batched leaf initialization, vectorizable duplicate checks, and candidate
-array reuse with worker-side update-bucket allocation. Unsupported SIMD platforms
+`compact-candidates`, `batched-leaves`, `candidate-membership`,
+`candidate-workspace`, and `active-candidates`. These enable distance batching, compact reverse-candidate
+storage, batched leaf initialization, vectorizable duplicate checks, candidate
+array reuse with worker-side update-bucket allocation, and old-candidate lists built
+only for vertices with new candidates. Unsupported SIMD platforms
 retain the existing distance fallbacks.
 
-To disable all six optimizations for a core-only build:
+To disable all seven optimizations for a core-only build:
 
 ```bash
 cargo build -p rinnd-core --release --no-default-features --features std,rayon
@@ -152,6 +153,23 @@ this fix, were promoted to defaults on 2026-10-02. Full graph indices and distan
 bits remained identical in the tested builds, so graph quality was unchanged.
 Timing varies and some workloads use slightly more peak memory; this is not a
 universal speed or memory guarantee. Candidate-reference packing remains opt-in.
+
+### Active Candidates
+
+The default-enabled `active-candidates` feature builds new-candidate lists first, then
+replays each worker's RNG stream to build old-candidate lists only for vertices that
+have at least one new candidate. The local join never reads the old list of a vertex
+without new candidates, and every active vertex receives the same push sequence as
+before, so graph indices, distance bits, flags and RNG state are unchanged. It applies
+to the parallel candidate build (at least 256 points and more than one thread).
+`build_stats["candidate_active_vertices"]` reports the active count per iteration
+(zero when the feature is disabled or the sequential build is used).
+
+The full-corpus paired profile (four datasets, k15/k30, three seeds, three repeats)
+found identical graphs and update counts in all 72 measured pairs, with median
+graph-delivery speedups of 1.07-1.08x on GloVe, 1.065-1.067x on NYTimes and
+1.01-1.02x on the image datasets, and lower peak RSS at every endpoint. See the
+[active-candidate results](benchmarks/README.md#active-set-candidates-2026-10-14).
 
 ## Python Bindings
 

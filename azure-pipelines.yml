@@ -20,7 +20,7 @@ pr:
       - README.rst
 
 variables:
-  rustToolchain: '1.77.0'
+  rustToolchain: '1.89.0'
   packageDirectory: 'crates/rinnd'
 
 stages:

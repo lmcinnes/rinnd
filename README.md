@@ -47,13 +47,15 @@ cargo bench --release
 
 Default Rust and Python builds enable `batched-euclidean`, `batched-angular`,
 `compact-candidates`, `batched-leaves`, `candidate-membership`,
-`candidate-workspace`, and `active-candidates`. These enable distance batching, compact reverse-candidate
+`candidate-workspace`, `active-candidates`, `hybrid-forest`, and `tiled-leaves`. These enable distance batching, compact reverse-candidate
 storage, batched leaf initialization, vectorizable duplicate checks, candidate
-array reuse with worker-side update-bucket allocation, and old-candidate lists built
-only for vertices with new candidates. Unsupported SIMD platforms
-retain the existing distance fallbacks.
+array reuse with worker-side update-bucket allocation, old-candidate lists built
+only for vertices with new candidates, a cache-local finish for graph-only RP
+forests, and register-tiled leaf initialization. Unsupported SIMD platforms
+retain the existing distance fallbacks. The minimum supported Rust version is 1.89
+(stable AVX-512 target features).
 
-To disable all seven optimizations for a core-only build:
+To disable all nine optimizations for a core-only build:
 
 ```bash
 cargo build -p rinnd-core --release --no-default-features --features std,rayon
@@ -172,6 +174,37 @@ found identical graphs and update counts in all 72 measured pairs, with median
 graph-delivery speedups of 1.07-1.08x on GloVe, 1.065-1.067x on NYTimes and
 1.01-1.02x on the image datasets, and lower peak RSS at every endpoint. See the
 [active-candidate results](benchmarks/README.md#active-set-candidates-2026-10-14).
+
+### Hybrid Forest
+
+The default-enabled `hybrid-forest` feature replaces the breadth-first RP forest used
+by graph-only builds. It runs breadth-first levels while nodes are large, then
+gathers each node of at most 4 MiB of vectors into a contiguous buffer and finishes
+its subtree locally. Seeds, splits, the dot-product kernel, tie rule and partition
+match the breadth-first builder, and leaves are emitted in the same order, so leaves
+and graphs are identical. Index builds with retained search trees are unaffected.
+
+The full-corpus paired profile found identical graphs in all measured pairs and
+forest time 10-35% lower; see the
+[hybrid forest results](benchmarks/README.md#hybrid-forest-2026-10-15). The opt-in
+`blocked-candidates` feature (hash-priority, cache-blocked candidate construction)
+is experimental: it changes the sampled candidates and replaces the active-set build.
+
+### Tiled Leaves
+
+The default-enabled `tiled-leaves` feature computes each leaf's pairwise distances
+with register-tiled kernels: 6x4 tiles on CPUs with AVX-512F/VL (for the extra
+vector registers; arithmetic stays 256-bit) and 2x4 AVX2 tiles otherwise. Each pair
+keeps the accumulator layout, reduction order and scalar tail of the single-pair
+kernel, and updates are emitted in the original pair order, so graphs are identical.
+It covers squared Euclidean (all dimensions) and the normalized-dot cosine
+distances at dimension 128 or more; other cases use the previous path.
+
+The full-corpus paired profile found identical graphs in all measured pairs, leaf
+initialization 1.15-1.36x faster, and graph delivery 1.06-1.07x faster on the image
+datasets and 1.02-1.03x on NYTimes; GloVe (d = 100, below the cosine threshold)
+was unchanged. See the
+[tiled leaf results](benchmarks/README.md#tiled-leaf-initialization-2026-10-15).
 
 ## Python Bindings
 

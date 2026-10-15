@@ -146,6 +146,14 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 The `active-candidates` runner option compares against the current default feature
 set, unlike the older candidate options, whose baseline is the original four.
 
+Follow-up (2026-10-14): with `candidate-workspace`, the active build records its
+active rows and the next iteration resets only those rows of the four candidate
+arrays (every push lands in an active row). Paired against the promoted default
+wheel (GloVe/NYTimes, k15/k30, seeds 42-44, one build per process, alternating
+order), all 12 pairs had identical graphs and update counts and were faster:
+GloVe 1.023x/1.019x, NYTimes 1.016x/1.008x (k15/k30 medians). Candidate reset time
+fell from 0.57 to 0.18 s on GloVe k30. Results are in `results/dirty-reset-v1/`.
+
 ### Leaf-order permutation (2026-10-14, rejected)
 
 Permuting data into first-RP-tree leaf order before NN-descent cost about 0.1 s on

@@ -163,7 +163,9 @@ without new candidates, and every active vertex receives the same push sequence 
 before, so graph indices, distance bits, flags and RNG state are unchanged. It applies
 to the parallel candidate build (at least 256 points and more than one thread).
 `build_stats["candidate_active_vertices"]` reports the active count per iteration
-(zero when the feature is disabled or the sequential build is used).
+(zero when the feature is disabled or the sequential build is used). With
+`candidate-workspace`, each iteration resets only the rows that were active in the
+previous one, since no other rows are written.
 
 The full-corpus paired profile (four datasets, k15/k30, three seeds, three repeats)
 found identical graphs and update counts in all 72 measured pairs, with median

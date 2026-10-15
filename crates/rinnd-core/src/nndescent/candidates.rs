@@ -83,10 +83,17 @@ pub(crate) struct CandidateWorkspace {
     old_indices: Vec<i32>,
     new_priority: Vec<f32>,
     old_priority: Vec<f32>,
+    /// Rows the last active-set build may have written; `None` means all rows.
+    #[cfg(feature = "active-candidates")]
+    dirty_rows: Option<Vec<bool>>,
 }
 
 impl CandidateWorkspace {
     fn take_arrays(&mut self, size: usize) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>) {
+        #[cfg(feature = "active-candidates")]
+        {
+            self.dirty_rows = None;
+        }
         fn reset<T: Clone>(stored: &mut Vec<T>, size: usize, value: T) -> Vec<T> {
             let mut values = std::mem::take(stored);
             values.truncate(size);
@@ -100,6 +107,40 @@ impl CandidateWorkspace {
             reset(&mut self.old_indices, size, -1),
             reset(&mut self.old_priority, size, f32::INFINITY),
         )
+    }
+
+    /// Like `take_arrays`, but only resets rows written by the previous active-set build.
+    #[cfg(feature = "active-candidates")]
+    fn take_arrays_active(&mut self, size: usize, width: usize) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>) {
+        let reusable = |dirty: &Vec<bool>| {
+            width > 0
+                && dirty.len() * width == size
+                && self.new_indices.len() == size
+                && self.new_priority.len() == size
+                && self.old_indices.len() == size
+                && self.old_priority.len() == size
+        };
+        let Some(dirty) = self.dirty_rows.take().filter(reusable) else {
+            return self.take_arrays(size);
+        };
+        let mut new_indices = std::mem::take(&mut self.new_indices);
+        let mut new_priority = std::mem::take(&mut self.new_priority);
+        let mut old_indices = std::mem::take(&mut self.old_indices);
+        let mut old_priority = std::mem::take(&mut self.old_priority);
+        new_indices
+            .par_chunks_mut(width)
+            .zip(new_priority.par_chunks_mut(width))
+            .zip(old_indices.par_chunks_mut(width))
+            .zip(old_priority.par_chunks_mut(width))
+            .zip(dirty.par_iter())
+            .filter(|(_, dirty)| **dirty)
+            .for_each(|((((new_index, new_rank), old_index), old_rank), _)| {
+                new_index.fill(-1);
+                new_rank.fill(f32::INFINITY);
+                old_index.fill(-1);
+                old_rank.fill(f32::INFINITY);
+            });
+        (new_indices, new_priority, old_indices, old_priority)
     }
 
     #[cfg(any(feature = "candidate-workspace", test))]
@@ -541,7 +582,7 @@ impl CandidateSets {
 
         let size = n_vertices * max_candidates;
         let (mut new_indices, mut new_priority, mut old_indices, mut old_priority) = if REUSE {
-            workspace.take_arrays(size)
+            workspace.take_arrays_active(size, max_candidates)
         } else {
             (vec![-1; size], vec![f32::INFINITY; size], vec![-1; size], vec![f32::INFINITY; size])
         };
@@ -648,6 +689,8 @@ impl CandidateSets {
         if REUSE {
             workspace.new_priority = new_priority;
             workspace.old_priority = old_priority;
+            // Every push lands in an active row, so only those rows need resetting next time.
+            workspace.dirty_rows = Some(active);
         } else {
             drop(new_priority);
             drop(old_priority);

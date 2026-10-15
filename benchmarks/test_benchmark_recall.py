@@ -108,6 +108,18 @@ def test_candidate_profile_features_and_timing_partition():
     assert profile_features("packed", "active-candidates") == list(CURRENT_DEFAULTS) + [
         "active-candidates"
     ]
+    from feature_matrix import ACTIVE_DEFAULTS
+
+    assert profile_features("wide", "hybrid-forest") == list(ACTIVE_DEFAULTS)
+    assert profile_features("packed", "hybrid-forest") == list(ACTIVE_DEFAULTS) + [
+        "hybrid-forest"
+    ]
+    from feature_matrix import HYBRID_DEFAULTS
+
+    assert profile_features("wide", "tiled-leaves") == list(HYBRID_DEFAULTS)
+    assert profile_features("packed", "tiled-leaves") == list(HYBRID_DEFAULTS) + [
+        "tiled-leaves"
+    ]
     phases = {
         name: [0.1, 0.2]
         for name in ("initialization", "forward", "reverse", "mark", "release")

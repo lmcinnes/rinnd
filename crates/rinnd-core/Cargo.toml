@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves", "candidate-membership", "candidate-workspace", "active-candidates"]
+default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves", "candidate-membership", "candidate-workspace", "active-candidates", "hybrid-forest", "tiled-leaves"]
 std = []
 rayon = ["dep:rayon"]
 mmap = ["dep:memmap2"]
@@ -19,9 +19,15 @@ batched-euclidean = []
 batched-angular = []
 compact-candidates = []
 candidate-membership = []
+# Cache-blocked candidate construction (see nndescent/candidates.rs, mod blocked).
+blocked-candidates = []
+# Hybrid breadth-first / cache-local RP forest for graph-only builds (identical leaves).
+hybrid-forest = []
 candidate-workspace = []
 active-candidates = []
 batched-leaves = []
+# Register-tiled leaf-initialization kernels (bit-identical distances).
+tiled-leaves = []
 packed-updates = []
 
 [dependencies]

@@ -6,7 +6,22 @@ Graph delivery and single-query throughput are separate workloads. The current
 priority is full-corpus graph delivery, especially for large datasets; query timing
 is not an adoption gate for lossless construction changes with identical graphs.
 
-## Current default decision (2026-10-14)
+## Current default decision (2026-10-15, tiled leaves)
+
+Default builds now also enable `tiled-leaves` (nine features in total), approved on
+2026-10-15 after the exact full-corpus profile in
+[Tiled leaf initialization](#tiled-leaf-initialization-2026-10-15). The minimum
+supported Rust version was raised from 1.77 to 1.89 for stable AVX-512 target
+features. Earlier decisions below otherwise still apply.
+
+## Default decision (2026-10-15)
+
+Default builds now also enable `hybrid-forest` (eight features in total), approved
+on 2026-10-15 after the exact full-corpus profile in
+[Hybrid forest](#hybrid-forest-2026-10-15). `compact-join-rows` was rejected and
+removed. The 2026-10-14 and 2026-10-02 decisions below otherwise still apply.
+
+## Default decision (2026-10-14)
 
 Default builds now also enable `active-candidates` (seven features in total),
 approved on 2026-10-14 after the exact full-corpus profile in
@@ -82,6 +97,93 @@ FP16/direct-packing feature flags, buffer tuning, and their dedicated benchmark
 options are no longer available in the current source.
 
 ## Optimization experiments
+
+### Tiled leaf initialization (2026-10-15)
+
+**Decision: `tiled-leaves` promoted to default.** Leaf initialization is a dense,
+cache-resident all-pairs block, the cleanest target for register tiling (direction 8).
+`Distance::distance_upper` fills a leaf's upper-triangle distance table; leaf
+initialization then emits updates in the original pair order with the original
+thresholds. Tiles keep each pair's accumulator layout, horizontal-sum order and
+scalar tail, so distances are bit-identical (unit-tested against single-pair
+distances for d = 8-784 and leaf sizes 2-64, and AVX2 vs AVX-512 tiles).
+
+Preliminary measurements, with instrumentation since removed
+(`results/edge-stats-v1/`): only 10-26% of join pairs pass the threshold, and
+known-edge skipping (direction 7) was rejected because mutual edges are 2.6% of
+GloVe pairs and membership checks roughly doubled generation time. A single-core
+kernel microbenchmark gave bit-identical tile speedups of 1.06-1.15x at d = 100,
+1.9-1.96x at d = 256 (dot) and 1.6-1.7x at d = 784 (L2).
+
+AVX2 2x4 tiles (MSRV 1.77) gave leaf initialization 1.14-1.28x. With MSRV raised
+to 1.89, AVX-512F/VL 6x4 tiles (32 vector registers, 256-bit arithmetic) improved
+this to 1.15-1.36x. Cosine tiles stay limited to d >= 128: at d = 100 (GloVe) 6x4
+tiles gave leaf initialization 0.94x at k15 and 1.04x at k30. Screens are in
+`results/tiled-leaves-v{1,2,3}/`.
+
+Full paired profile against the eight previous defaults (4 datasets, k15/k30,
+seeds 42-44, 3 repeats, one warm-up pair per endpoint, 8 physical cores): all 72
+measured and 8 warm-up pairs had identical graphs and update counts.
+
+| Endpoint | Speedup | Range | Leaf init s | Peak RSS MB |
+| --- | --- | --- | --- | --- |
+| MNIST k15 / k30 | 1.059 / 1.067 | 1.053-1.078 | 0.184->0.143 / 0.346->0.256 | 384->378 / 545->541 |
+| Fashion k15 / k30 | 1.062 / 1.069 | 1.050-1.071 | 0.185->0.145 / 0.348->0.258 | 376->373 / 525->524 |
+| NYTimes k15 / k30 | 1.022 / 1.033 | 1.014-1.036 | 0.603->0.524 / 1.203->0.930 | 904->904 / 1134->1138 |
+| GloVe k15 / k30 | 0.999 / 0.999 | 0.995-1.002 | 1.969->1.970 / 3.678->3.684 | 1900->1900 / 2626->2635 |
+
+Every image and NYTimes pair was faster; GloVe takes the unchanged per-pair path
+and is within noise. Results: `results/tiled-leaves-confirm-v1/`, artifacts
+`target/tiled-leaves-confirm-v1/{wide,packed}`. The runner option
+`--candidate-feature tiled-leaves` compares the eight previous defaults against the
+same plus `tiled-leaves`.
+
+### Hybrid forest (2026-10-15)
+
+**Decision: `hybrid-forest` promoted to default; `compact-join-rows` rejected and
+removed; `blocked-candidates` kept opt-in.** These came from an externally prepared
+cache-blocking patch, merged onto the active-candidate code with `git apply --3way`.
+
+`hybrid-forest` finishes graph-only RP subtrees of at most 4 MiB of vectors from a
+contiguous copy, with output identical to the breadth-first builder.
+`compact-join-rows` compacted each join row into one 4-wide kernel call; output was
+identical. `blocked-candidates` scatters reverse edges into L2-sized destination
+blocks with hash priorities; output changes and it bypasses the active-set build.
+
+Screen (one wheel, runtime switches, 2 seeds, 8 cores; results in
+`results/cache-blocking-v1/t8/`): blocked candidates gave GloVe k30 1.045x but
+0.98-0.99x on images and mixed NYTimes, with k15 recall moves of -0.002 to -0.003
+(noise-level at two seeds).
+
+Full paired profile of `hybrid-forest,compact-join-rows` against the seven
+defaults (4 datasets, k15/k30, seeds 42-44, 3 repeats, one warm-up pair per
+endpoint, 8 physical cores): all 72 measured and 8 warm-up pairs had identical
+graphs and update counts.
+
+| Endpoint | Speedup | Range | Forest s | Generation s |
+| --- | --- | --- | --- | --- |
+| MNIST k15 / k30 | 1.084 / 1.029 | 1.024-1.116 | 0.22->0.18 / 0.18->0.17 | 0.25->0.23 / 0.76->0.73 |
+| Fashion k15 / k30 | 1.151 / 1.041 | 1.026-1.164 | 0.28->0.18 / 0.21->0.17 | 0.23->0.22 / 0.71->0.70 |
+| NYTimes k15 / k30 | 1.024 / 0.998 | 0.993-1.036 | 0.47->0.39 / 0.37->0.37 | 1.55->1.54 / 4.33->4.34 |
+| GloVe k15 / k30 | 1.024 / 0.995 | 0.992-1.036 | 2.06->1.63 / 1.77->1.56 | 4.63->4.65 / 12.36->12.55 |
+
+GloVe k30 was slower in all nine pairs because compacted join rows raised update
+generation by about 0.19 s, cancelling the forest saving; the compacted join helped
+only on images. Forest time fell at every endpoint except NYTimes k30, so the hybrid
+forest was promoted alone without a separate timing run (its output is identical).
+Peak RSS was 15-28 MB higher on images and GloVe in the combined profile, plausibly
+from subtree buffers; not attributed separately. Results:
+`results/hybrid-compact-confirm-v1/`, artifacts
+`target/hybrid-compact-confirm-v1/{wide,packed}`.
+
+Promotion: the runtime switches (`RINND_HYBRID_FOREST`, `RINND_FOREST_LOCAL_BYTES`)
+were removed; the subtree budget is fixed at 4 MiB and opt-out is via Cargo
+features. 162 release core tests pass with defaults, 158 with
+`--no-default-features --features std,rayon`, 165 with all features. The default
+wheel `target/wheels/default-hybrid-forest-v1/` is installed into
+`ann-benchmarks/.venv`; its binary matches the wheel and 52 Python tests pass. The
+runner option `--candidate-feature hybrid-forest` compares the previous seven
+defaults against the same plus `hybrid-forest`.
 
 ### Active-set candidates (2026-10-14)
 

@@ -5,7 +5,7 @@ use crate::rng::FastRng;
 use rayon::prelude::*;
 
 const NO_NODE: usize = usize::MAX;
-const MAX_TREE_BATCH_WIDTH: usize = 8;
+pub(super) const MAX_TREE_BATCH_WIDTH: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 struct FrontierNode {
@@ -16,9 +16,9 @@ struct FrontierNode {
 }
 
 #[derive(Debug)]
-struct Split {
-    hyperplane: Vec<f32>,
-    offset: f32,
+pub(super) struct Split {
+    pub(super) hyperplane: Vec<f32>,
+    pub(super) offset: f32,
 }
 
 struct TreeState {
@@ -225,7 +225,7 @@ pub(crate) fn build_breadth_first_leaf_forest(
 }
 
 #[inline]
-fn batched_dot_products(
+pub(super) fn batched_dot_products(
     point: &[f32],
     hyperplanes: &[Option<&[f32]>; MAX_TREE_BATCH_WIDTH],
     width: usize,
@@ -292,7 +292,7 @@ unsafe fn batched_dot_products_avx2(
     sums
 }
 
-fn make_split(
+pub(super) fn make_split(
     data: &[f32],
     dim: usize,
     indices: &[i32],
@@ -373,7 +373,7 @@ fn mix64(mut value: u64) -> u64 {
 }
 
 #[inline]
-fn child_seed(seed: u64, right: bool) -> u64 {
+pub(super) fn child_seed(seed: u64, right: bool) -> u64 {
     mix64(
         seed ^ if right {
             0xd1b54a32d192ed03
@@ -384,7 +384,7 @@ fn child_seed(seed: u64, right: bool) -> u64 {
 }
 
 #[inline]
-fn tie_side(seed: u64, point_index: usize) -> u8 {
+pub(super) fn tie_side(seed: u64, point_index: usize) -> u8 {
     (mix64(seed ^ point_index as u64) & 1) as u8
 }
 

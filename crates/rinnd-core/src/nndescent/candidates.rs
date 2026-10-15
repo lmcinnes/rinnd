@@ -221,6 +221,11 @@ impl CandidateSets {
         let n_vertices = graph.n_points;
         let n_threads = rayon::current_num_threads().max(1);
 
+        #[cfg(feature = "blocked-candidates")]
+        if blocked::enabled() {
+            return blocked::build::<PROFILE, REUSE>(graph, max_candidates, rng, workspace);
+        }
+
         // Use the parallel version if we have enough vertices
         if n_vertices >= 256 && n_threads > 1 {
             #[cfg(feature = "active-candidates")]
@@ -813,6 +818,280 @@ impl RawHeaps {
             priority,
             index,
         );
+    }
+}
+
+/// Cache-blocked candidate construction (feature `blocked-candidates`).
+///
+/// The classic build pushes every reverse edge into the heap row of its
+/// destination, a random row of n x max_candidates arrays. Here:
+///
+/// 1. Scatter: rows are streamed in order and each reverse edge becomes an
+///    8-byte record (destination, source | new-flag) in a bucket for its
+///    destination block. Blocks are sized so a block's candidate heaps fit in
+///    L2 (`RINND_CAND_BLOCK_BYTES`, default 512 KiB).
+/// 2. Per block: forward pushes, then the block's reverse records, then the
+///    graph flags of the block's rows are marked, all while the block's heaps
+///    are cache-resident. Priority scratch is per block, not n x max_candidates.
+///
+/// Priorities are a hash of (seed, source, destination) with one seed drawn
+/// from the RNG per build, so records carry no priority and the result does
+/// not depend on the thread count: records reach each block in source-row
+/// order however rows are split across threads.
+///
+/// `RINND_BLOCKED_CANDIDATES=0` selects the original algorithm at runtime.
+#[cfg(feature = "blocked-candidates")]
+pub(crate) mod blocked {
+    use super::{checked_heap_push_flat, CandidateBuildStats, CandidateSets, CandidateWorkspace};
+    use crate::heap::NeighborHeap;
+    use crate::rng::FastRng;
+    use rayon::prelude::*;
+    use std::time::Instant;
+
+    const NEW_BIT: u32 = 0x8000_0000;
+
+    pub(crate) fn enabled() -> bool {
+        !matches!(std::env::var("RINND_BLOCKED_CANDIDATES").as_deref(), Ok("0"))
+    }
+
+    /// Rows per destination block: a power of two whose candidate heaps
+    /// (new + old indices and priorities) fit the byte budget.
+    pub(crate) fn block_rows(max_candidates: usize) -> usize {
+        let budget = std::env::var("RINND_CAND_BLOCK_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512 * 1024);
+        let per_row = 16 * max_candidates.max(1);
+        let rows = (budget / per_row).max(1);
+        (1usize << (usize::BITS - 1 - rows.leading_zeros())).clamp(64, 1 << 16)
+    }
+
+    #[inline(always)]
+    fn priority(seed: u64, source: u32, destination: u32) -> f32 {
+        let mut z = seed ^ (((source as u64) << 32) | destination as u64);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 40) as f32 * (1.0 / (1u64 << 24) as f32)
+    }
+
+    pub(crate) fn build<const PROFILE: bool, const REUSE: bool>(
+        graph: &mut NeighborHeap,
+        max_candidates: usize,
+        rng: &mut FastRng,
+        workspace: &mut CandidateWorkspace,
+    ) -> (CandidateSets, CandidateBuildStats) {
+        let rows_per_block = block_rows(max_candidates);
+        build_with_block_rows::<PROFILE, REUSE>(graph, max_candidates, rng, workspace, rows_per_block)
+    }
+
+    pub(crate) fn build_with_block_rows<const PROFILE: bool, const REUSE: bool>(
+        graph: &mut NeighborHeap,
+        max_candidates: usize,
+        rng: &mut FastRng,
+        workspace: &mut CandidateWorkspace,
+        rows_per_block: usize,
+    ) -> (CandidateSets, CandidateBuildStats) {
+        let mut stats = CandidateBuildStats::default();
+        let started = PROFILE.then(Instant::now);
+        let n = graph.n_points;
+        let k = graph.k;
+        let mc = max_candidates;
+        let seed = rng.next_u64();
+        let n_blocks = n.div_ceil(rows_per_block).max(1);
+        let n_threads = rayon::current_num_threads().max(1);
+        let rows_per_thread = n.div_ceil(n_threads).max(1);
+
+        // Output arrays: reuse allocations without a full fill (each block
+        // initializes its own rows).
+        let size = n * mc;
+        let take = |v: &mut Vec<i32>| {
+            let mut v = if REUSE { std::mem::take(v) } else { Vec::new() };
+            v.resize(size, -1);
+            v.truncate(size);
+            v
+        };
+        let mut new_indices = take(&mut workspace.new_indices);
+        let mut old_indices = take(&mut workspace.old_indices);
+        #[cfg(feature = "active-candidates")]
+        {
+            workspace.dirty_rows = None;
+        }
+        stats.initialization_seconds = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+
+        // Phase 1: scatter reverse edges into destination-block buckets.
+        let started = PROFILE.then(Instant::now);
+        let indices = &graph.indices;
+        let flags = &graph.flags;
+        let expected = (n * k) / (n_blocks * n_threads) + 16;
+        let buckets: Vec<Vec<Vec<u64>>> = (0..n_threads)
+            .into_par_iter()
+            .map(|t| {
+                let mut out: Vec<Vec<u64>> = (0..n_blocks).map(|_| Vec::with_capacity(expected + expected / 4)).collect();
+                let start = (t * rows_per_thread).min(n);
+                let end = ((t + 1) * rows_per_thread).min(n);
+                for i in start..end {
+                    let row = &indices[i * k..(i + 1) * k];
+                    let row_flags = &flags[i * k..(i + 1) * k];
+                    for (&neighbor, &flag) in row.iter().zip(row_flags) {
+                        if neighbor < 0 {
+                            continue;
+                        }
+                        let source = i as u32 | if flag != 0 { NEW_BIT } else { 0 };
+                        out[neighbor as usize / rows_per_block].push(((neighbor as u64) << 32) | source as u64);
+                    }
+                }
+                out
+            })
+            .collect();
+        stats.forward_seconds = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+
+        // Phase 2: per destination block, build heaps and mark flags in cache.
+        let started = PROFILE.then(Instant::now);
+        let indices = &graph.indices;
+        let flags = &mut graph.flags;
+        new_indices
+            .par_chunks_mut(rows_per_block * mc)
+            .zip(old_indices.par_chunks_mut(rows_per_block * mc))
+            .zip(flags.par_chunks_mut(rows_per_block * k))
+            .enumerate()
+            .for_each_init(
+                || (vec![f32::INFINITY; rows_per_block * mc], vec![f32::INFINITY; rows_per_block * mc]),
+                |(new_priority, old_priority), (block, ((new_rows, old_rows), block_flags))| {
+                    let first_row = block * rows_per_block;
+                    let rows = new_rows.len() / mc;
+                    new_rows.fill(-1);
+                    old_rows.fill(-1);
+                    new_priority[..rows * mc].fill(f32::INFINITY);
+                    old_priority[..rows * mc].fill(f32::INFINITY);
+                    let mut push = |row: usize, candidate: i32, prio: f32, is_new: bool| {
+                        let range = row * mc..(row + 1) * mc;
+                        if is_new {
+                            checked_heap_push_flat(&mut new_priority[range.clone()], &mut new_rows[range], prio, candidate);
+                        } else {
+                            checked_heap_push_flat(&mut old_priority[range.clone()], &mut old_rows[range], prio, candidate);
+                        }
+                    };
+                    // Forward edges of this block's rows.
+                    for r in 0..rows {
+                        let i = first_row + r;
+                        for j in 0..k {
+                            let neighbor = indices[i * k + j];
+                            if neighbor < 0 {
+                                continue;
+                            }
+                            let p = priority(seed, i as u32, neighbor as u32);
+                            push(r, neighbor, p, block_flags[r * k + j] != 0);
+                        }
+                    }
+                    // Reverse edges, in source-row order.
+                    for producer in &buckets {
+                        for &record in &producer[block] {
+                            let destination = (record >> 32) as u32;
+                            let source = record as u32;
+                            let candidate = source & !NEW_BIT;
+                            let p = priority(seed, candidate, destination);
+                            push(destination as usize - first_row, candidate as i32, p, source & NEW_BIT != 0);
+                        }
+                    }
+                    // Mark sampled new neighbours as old.
+                    for r in 0..rows {
+                        let i = first_row + r;
+                        let new_row = &new_rows[r * mc..(r + 1) * mc];
+                        for j in 0..k {
+                            let flag = &mut block_flags[r * k + j];
+                            if *flag != 0 {
+                                let neighbor = indices[i * k + j];
+                                if neighbor >= 0 && new_row.contains(&neighbor) {
+                                    *flag = 0;
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        stats.reverse_seconds = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        let started = PROFILE.then(Instant::now);
+        drop(buckets);
+        stats.release_seconds = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+
+        (CandidateSets { new_indices, old_indices, n_vertices: n, max_candidates: mc }, stats)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        fn random_graph(n: usize, k: usize, seed: u64) -> NeighborHeap {
+            let mut rng = FastRng::new(seed);
+            let mut graph = NeighborHeap::new(n, k);
+            for i in 0..n {
+                for _ in 0..k + 3 {
+                    let j = rng.next_index(n);
+                    if j != i {
+                        graph.checked_flagged_push(i, j as i32, rng.next_float(), rng.next_bool());
+                    }
+                }
+            }
+            graph
+        }
+
+        /// Each row holds exactly min(mc, distinct) candidates drawn from the
+        /// forward and reverse edges of the right flag, without duplicates, and
+        /// graph flags are cleared exactly for new neighbours that were sampled.
+        #[test]
+        fn blocked_candidates_are_valid_samples() {
+            for &(n, k, mc, block) in &[(3000, 12, 12, 64), (2500, 20, 15, 2048), (700, 8, 8, 128), (900, 6, 6, 4096)] {
+                let mut graph = random_graph(n, k, n as u64);
+                let before = graph.clone();
+                let mut expected_new = vec![HashSet::new(); n];
+                let mut expected_old = vec![HashSet::new(); n];
+                for i in 0..n {
+                    for j in 0..k {
+                        let nb = before.indices[i * k + j];
+                        if nb < 0 { continue; }
+                        let a = if before.flags[i * k + j] != 0 { &mut expected_new } else { &mut expected_old };
+                        a[i].insert(nb);
+                        a[nb as usize].insert(i as i32);
+                    }
+                }
+                let (c, _) = build_with_block_rows::<false, false>(&mut graph, mc, &mut FastRng::new(1), &mut CandidateWorkspace::default(), block);
+                for i in 0..n {
+                    for (row, expected) in [(c.get_new(i), &expected_new[i]), (c.get_old(i), &expected_old[i])] {
+                        let got: Vec<i32> = row.iter().copied().filter(|&x| x >= 0).collect();
+                        let set: HashSet<i32> = got.iter().copied().collect();
+                        assert_eq!(set.len(), got.len(), "duplicate in row {i}");
+                        assert!(set.is_subset(expected), "row {i} has a non-candidate");
+                        assert_eq!(got.len(), expected.len().min(mc), "row {i} size");
+                    }
+                    for j in 0..k {
+                        let nb = before.indices[i * k + j];
+                        if nb < 0 { continue; }
+                        let was_new = before.flags[i * k + j] != 0;
+                        let sampled = c.get_new(i).contains(&nb);
+                        assert_eq!(graph.flags[i * k + j] != 0, was_new && !sampled, "flag {i},{j}");
+                    }
+                }
+            }
+        }
+
+        /// Output does not depend on the thread count.
+        #[test]
+        fn blocked_candidates_are_thread_independent() {
+            let base = random_graph(4000, 10, 3);
+            let run = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                pool.install(|| {
+                    let mut g = base.clone();
+                    let (c, _) = build_with_block_rows::<false, false>(&mut g, 10, &mut FastRng::new(5), &mut CandidateWorkspace::default(), 256);
+                    (c.new_indices, c.old_indices, g.flags)
+                })
+            };
+            let one = run(1);
+            assert_eq!(one, run(3));
+            assert_eq!(one, run(8));
+        }
     }
 }
 

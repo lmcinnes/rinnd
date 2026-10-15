@@ -41,6 +41,8 @@ mod hellinger;
 mod inner_product;
 mod minkowski;
 pub mod quantized;
+#[cfg(feature = "tiled-leaves")]
+mod tile;
 mod traits;
 
 pub use cosine::Cosine;

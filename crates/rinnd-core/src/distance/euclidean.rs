@@ -43,6 +43,11 @@ impl Distance<f32> for SquaredEuclidean {
         candidates.map(|candidate| scalar_l2_sqr(query, candidate))
     }
 
+    #[cfg(feature = "tiled-leaves")]
+    fn distance_upper(&self, rows: &[&[f32]], out: &mut [f32]) -> bool {
+        super::tile::l2_upper(rows, out)
+    }
+
     fn name(&self) -> &'static str {
         "squared_euclidean"
     }

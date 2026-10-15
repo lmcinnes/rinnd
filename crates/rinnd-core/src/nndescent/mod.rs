@@ -12,10 +12,11 @@ pub use update::{apply_updates, UpdateArray};
 use crate::distance::Distance;
 use crate::heap::NeighborHeap;
 use crate::rng::FastRng;
-use crate::tree::{
-    build_breadth_first_leaf_forest, build_rp_forest, build_rp_leaf_forest, rptree_leaf_array,
-    FlatTree,
-};
+use crate::tree::{build_rp_forest, build_rp_leaf_forest, rptree_leaf_array, FlatTree};
+#[cfg(not(feature = "hybrid-forest"))]
+use crate::tree::build_breadth_first_leaf_forest;
+#[cfg(feature = "hybrid-forest")]
+use crate::tree::{build_hybrid_leaf_forest, local_points_for};
 
 use rayon::prelude::*;
 
@@ -166,6 +167,20 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
         let leaf_array = rptree_leaf_array(&forest);
         (forest, leaf_array)
     } else if let Some(batch_width) = breadth_first_batch_width {
+        #[cfg(feature = "hybrid-forest")]
+        let leaves = build_hybrid_leaf_forest(
+            data,
+            n_points,
+            dim,
+            params.n_trees,
+            params.leaf_size,
+            rng,
+            params.angular,
+            params.max_depth,
+            batch_width,
+            local_points_for(dim),
+        );
+        #[cfg(not(feature = "hybrid-forest"))]
         let leaves = build_breadth_first_leaf_forest(
             data,
             n_points,
@@ -372,12 +387,41 @@ fn initialize_from_leaves<D: Distance<f32> + Sync>(
                 let leaves_per_thread = (leaf_block.len() + n_threads - 1) / n_threads;
                 let start_leaf = t * leaves_per_thread;
                 let end_leaf = (start_leaf + leaves_per_thread).min(leaf_block.len());
+                #[cfg(feature = "tiled-leaves")]
+                let (mut leaf_rows, mut leaf_distances): (Vec<&[f32]>, Vec<f32>) = (Vec::new(), Vec::new());
+                #[cfg(feature = "tiled-leaves")]
+                let mut use_tiles = true;
 
                 for leaf_idx in start_leaf..end_leaf {
                     let leaf = leaf_block[leaf_idx];
 
                     if cfg!(feature = "batched-leaves") && D::USE_DISTANCE_FOUR && dim >= 32 {
                         let valid_len = leaf.iter().position(|&point| point < 0).unwrap_or(leaf.len());
+                        #[cfg(feature = "tiled-leaves")]
+                        if use_tiles && valid_len >= 2 {
+                            leaf_rows.clear();
+                            leaf_rows.extend(leaf[..valid_len].iter().map(|&point| {
+                                &data[point as usize * dim..(point as usize + 1) * dim]
+                            }));
+                            leaf_distances.resize(valid_len * valid_len, 0.0);
+                            if distance.distance_upper(&leaf_rows, &mut leaf_distances) {
+                                // Same pair order and thresholds as the per-pair path below.
+                                for position in 0..valid_len {
+                                    let point = leaf[position];
+                                    let point_threshold = graph.max_distance(point as usize);
+                                    let row = &leaf_distances[position * valid_len..(position + 1) * valid_len];
+                                    for other in position + 1..valid_len {
+                                        let neighbor = leaf[other];
+                                        let value = row[other];
+                                        if value < point_threshold.max(graph.max_distance(neighbor as usize)) {
+                                            thread_updates.push((point, neighbor, value));
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            use_tiles = false;
+                        }
                         for position in 0..valid_len {
                             let point = leaf[position];
                             let point_threshold = graph.max_distance(point as usize);

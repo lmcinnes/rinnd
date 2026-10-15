@@ -21,6 +21,12 @@ pub trait Distance<T>: Send + Sync + Clone {
         candidates.map(|candidate| self.distance(query, candidate))
     }
 
+    /// Distances for all pairs `i < j` of `rows`, written to `out[i * rows.len() + j]`,
+    /// bit-identical to `distance(rows[i], rows[j])`. Returns false if no block kernel applies.
+    fn distance_upper(&self, _rows: &[&[T]], _out: &mut [f32]) -> bool {
+        false
+    }
+
     /// Compute distances from one query to multiple data points.
     ///
     /// Default implementation calls `distance` in a loop.

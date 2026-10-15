@@ -111,6 +111,12 @@ impl Distance<f32> for AlternativeDot {
         normalized_dot_four(query, candidates).map(alternative_dot_from_similarity)
     }
 
+    #[cfg(feature = "tiled-leaves")]
+    fn distance_upper(&self, rows: &[&[f32]], out: &mut [f32]) -> bool {
+        let computed = super::tile::dot_upper(rows, out);
+        map_upper(rows.len(), out, computed, alternative_dot_from_similarity)
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
@@ -145,6 +151,12 @@ impl Distance<f32> for DirectNormalizedCosine {
         normalized_dot_four(query, candidates).map(|similarity| 1.0 - similarity.clamp(-1.0, 1.0))
     }
 
+    #[cfg(feature = "tiled-leaves")]
+    fn distance_upper(&self, rows: &[&[f32]], out: &mut [f32]) -> bool {
+        let computed = super::tile::dot_upper(rows, out);
+        map_upper(rows.len(), out, computed, |similarity| 1.0 - similarity.clamp(-1.0, 1.0))
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
@@ -165,6 +177,19 @@ impl Distance<f32> for DirectNormalizedCosine {
     fn name(&self) -> &'static str {
         "direct_normalized_cosine"
     }
+}
+
+/// Map tiled similarities in the upper triangle to distances.
+#[cfg(feature = "tiled-leaves")]
+fn map_upper(m: usize, out: &mut [f32], computed: bool, transform: impl Fn(f32) -> f32) -> bool {
+    if computed {
+        for i in 0..m {
+            for value in &mut out[i * m + i + 1..(i + 1) * m] {
+                *value = transform(*value);
+            }
+        }
+    }
+    computed
 }
 
 #[inline]

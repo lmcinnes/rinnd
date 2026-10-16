@@ -6,7 +6,18 @@ Graph delivery and single-query throughput are separate workloads. The current
 priority is full-corpus graph delivery, especially for large datasets; query timing
 is not an adoption gate for lossless construction changes with identical graphs.
 
-## Current default decision (2026-10-16, generation prefetch)
+## Current default decision (2026-10-16, forest scaling)
+
+The hybrid forest's parallel restructuring and per-level overhead reduction
+([Forest scaling at 64 threads](#forest-scaling-at-64-threads-2026-10-16)) are now
+the default code path (no new feature flag; `hybrid-forest` remains the gate).
+Approved on 2026-10-16 after 32 exact full default builds against the previous
+default wheel. The default wheel is `target/wheels/default-forest-level-v1/`,
+installed into `ann-benchmarks/.venv` (native binary hash matches the wheel); 165
+default and 168 all-feature core tests and 52 Python tests pass. Earlier decisions
+below otherwise still apply.
+
+## Default decision (2026-10-16, generation prefetch)
 
 Default builds now also enable `generation-prefetch` (ten features in total),
 approved on 2026-10-16 after the exact full-corpus profile in
@@ -105,6 +116,76 @@ FP16/direct-packing feature flags, buffer tuning, and their dedicated benchmark
 options are no longer available in the current source.
 
 ## Optimization experiments
+
+### Forest scaling at 64 threads (2026-10-16)
+
+At 64 threads the forest was 23% of GloVe k15, 16% of NYTimes k15 and 40% of MNIST
+k15 graph delivery, because it stopped scaling at about 16 threads (GloVe k15 forest
+7.86 s at 1 thread, 1.63 s at 8, 1.31-1.41 s at 16-64) while other phases kept
+scaling. Internal timing showed serial per-point node-assignment writes in
+`classify`, partitioning parallel only across the six trees of a batch, sequential
+tree batches, and a per-tree subtree phase.
+
+The hybrid forest now writes assignments in parallel over disjoint permutation
+ranges (and drops the redundant write after partitioning), partitions nodes in
+parallel, classifies trees in parallel, builds tree batches concurrently, solves
+all trees' deferred subtrees in one parallel pass, and reuses the sides buffer.
+Leaves and their order are unchanged (hybrid-vs-breadth-first exactness tests;
+graph hashes matched in every pair below). Seed 42, two alternating pairs per cell
+(`results/forest-parallel-v1/`):
+
+| Endpoint | 8 threads forest / total | 64 threads forest / total | 64-thread forest share |
+| --- | --- | --- | --- |
+| GloVe k15 | 1.65x / 1.058x | 2.88x / 1.148x | 23% -> 9% |
+| GloVe k30 | 1.67x / 1.022x | 2.79x / 1.047x | 13% -> 5% |
+| NYTimes k15 | 1.30x / 1.023x | 1.90x / 1.096x | 16% -> 9% |
+| NYTimes k30 | 1.31x / 1.010x | 1.84x / 1.017x | 10% -> 5% |
+| MNIST k15 | 1.15x / 1.036x | 1.57x / 1.207x | 39% -> 30% |
+| MNIST k30 | 1.17x / 1.015x | 1.53x / 1.097x | 24% -> 17% |
+
+A 64-thread parameter sweep (n_trees 4/6/8/12 x leaf_size default/2x, seed 42,
+`results/forest-balance-v1/sweep/`) found the defaults near the recall/time
+frontier for GloVe and NYTimes: fewer trees cost 0.005-0.06 recall for at most
+1.1x. MNIST tolerated n_trees=6 (1.14-1.22x, recall -0.0001 to -0.002), measured
+before the forest parallelization.
+
+Per-level overhead. Timing the parallel version on MNIST at 64 threads showed
+concurrently running tree batches stalling each other: a level could wait about
+20 ms behind another batch's subtree task. The subtree phase then dominated, with
+4 MiB row copies per subtree too large for per-core cache at 64 threads. Changes:
+one breadth-first level loop over all trees (margins still computed in groups of
+`tree_batch_width` trees, so arithmetic is unchanged), 1 MiB cache-local subtrees
+(was 4 MiB), and row gathering only when `dim <= 128`. A sweep of 256 KiB-4 MiB
+with and without gathering found 1 MiB best everywhere; gathering helped only
+GloVe (d=100). Restricting the sides pass to still-active points was slower and
+was dropped. Forest medians of five k15 builds, seed 42, against the previous
+parallel version (identical hashes):
+
+| Dataset | 64 threads | 8 threads |
+| --- | --- | --- |
+| GloVe | 0.470 -> 0.366 s (1.28x) | 0.985 -> 0.965 s (1.02x) |
+| NYTimes | 0.165 -> 0.107 s (1.55x) | 0.291 -> 0.239 s (1.22x) |
+| MNIST | 0.093 -> 0.057 s (1.64x) | 0.145 -> 0.106 s (1.37x) |
+
+Promotion check (`results/forest-level-v1/`): full default builds (graph indices
+and distances hashed) on GloVe, NYTimes, MNIST and Fashion-MNIST, k15/k30, seeds
+42/43, at 64 and 8 threads, against the previous default wheel
+`default-generation-prefetch-v1`. All 32 pairs were identical. Single runs, so
+wall times are indicative only:
+
+| Endpoint | 64 threads forest / wall | 8 threads forest / wall |
+| --- | --- | --- |
+| GloVe k15 | 1.32 -> 0.38 s / 8.32 -> 7.33 s | 1.62 -> 0.97 s / 29.2 -> 28.6 s |
+| GloVe k30 | 1.26 -> 0.38 s / 19.3 -> 18.7 s | 1.56 -> 0.89 s / 81.2 -> 80.7 s |
+| NYTimes k15 | 0.33 -> 0.14 s / 3.49 -> 3.32 s | 0.38 -> 0.24 s / 14.5 -> 14.3 s |
+| NYTimes k30 | 0.34 -> 0.12 s / 8.92 -> 8.78 s | 0.36 -> 0.22 s / 42.7 -> 42.6 s |
+| MNIST k15 | 0.16 -> 0.07 s / 0.40 -> 0.30 s | 0.17 -> 0.11 s / 0.63 -> 0.57 s |
+| MNIST k30 | 0.16 -> 0.06 s / 0.61 -> 0.52 s | 0.16 -> 0.09 s / 1.38 -> 1.31 s |
+| Fashion k15 | 0.16 -> 0.08 s / 0.38 -> 0.31 s | 0.18 -> 0.11 s / 0.64 -> 0.57 s |
+| Fashion k30 | 0.15 -> 0.07 s / 0.58 -> 0.57 s | 0.17 -> 0.10 s / 1.35 -> 1.28 s |
+
+(Seed means. The 64-thread parallel-forest table above was measured against the
+older forest; these numbers include both forest changes.)
 
 ### Generation prefetch (2026-10-16)
 

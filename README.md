@@ -309,6 +309,9 @@ retain the input data or query structures, so `query()`, `prepare()`,
 Graph-only indexes use breadth-first RP forest construction with a tree batch
 width of 6 by default. Set `tree_build_strategy="depth_first"` to use the
 legacy builder, or set `tree_batch_width` to tune breadth-first batching.
+Search-capable indexes use the same breadth-first forest by default and keep its
+first `n_search_trees` trees for query seeding, so their k-NN graph matches the
+graph-only build for the same parameters.
 
 ## Rust Usage
 

@@ -288,10 +288,30 @@ def test_graph_only_accepts_breadth_first_forest():
     assert np.all(distances[:, 1:] >= distances[:, :-1])
 
 
-def test_breadth_first_forest_requires_graph_only():
+def test_search_index_uses_breadth_first_forest_by_default():
     data = make_data()
-    with pytest.raises(ValueError, match="currently requires graph_only=True"):
-        rinnd.RINND(data, tree_build_strategy="breadth_first")
+    common = dict(n_neighbors=6, n_trees=4, n_iters=3, random_state=42, tree_batch_width=4)
+    default_index = rinnd.RINND(data, **common)
+    explicit_index = rinnd.RINND(data, tree_build_strategy="breadth_first", **common)
+    graph_index = rinnd.RINND(data, graph_only=True, **common)
+
+    indices, distances = default_index.neighbor_graph
+    for other in (explicit_index, graph_index):
+        other_indices, other_distances = other.neighbor_graph
+        np.testing.assert_array_equal(indices, other_indices)
+        np.testing.assert_array_equal(distances, other_distances)
+
+    query_indices, _ = default_index.query(data[:10], k=6)
+    assert np.all(query_indices[:, 0] == np.arange(10))
+
+    legacy = rinnd.RINND(data, tree_build_strategy="depth_first", **common)
+    assert legacy.query(data[:10], k=6)[0].shape == (10, 6)
+
+
+def test_breadth_first_forest_rejects_invalid_batch_width():
+    data = make_data()
+    with pytest.raises(ValueError, match="tree_batch_width must be in 1..=8"):
+        rinnd.RINND(data, tree_build_strategy="breadth_first", tree_batch_width=0)
 
     with pytest.raises(ValueError, match="tree_batch_width must be in 1..=8"):
         rinnd.RINND(

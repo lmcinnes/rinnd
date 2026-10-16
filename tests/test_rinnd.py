@@ -290,7 +290,9 @@ def test_graph_only_accepts_breadth_first_forest():
 
 def test_search_index_uses_breadth_first_forest_by_default():
     data = make_data()
-    common = dict(n_neighbors=6, n_trees=4, n_iters=3, random_state=42, tree_batch_width=4)
+    common = dict(
+        n_neighbors=6, n_trees=4, n_iters=3, random_state=42, tree_batch_width=4
+    )
     default_index = rinnd.RINND(data, **common)
     explicit_index = rinnd.RINND(data, tree_build_strategy="breadth_first", **common)
     graph_index = rinnd.RINND(data, graph_only=True, **common)

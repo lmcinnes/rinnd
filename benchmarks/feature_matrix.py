@@ -26,6 +26,7 @@ FEATURES = (
 CURRENT_DEFAULTS = FEATURES + ("candidate-membership", "candidate-workspace")
 ACTIVE_DEFAULTS = CURRENT_DEFAULTS + ("active-candidates",)
 HYBRID_DEFAULTS = ACTIVE_DEFAULTS + ("hybrid-forest",)
+TILED_DEFAULTS = HYBRID_DEFAULTS + ("tiled-leaves",)
 
 
 def features(mask):
@@ -420,6 +421,10 @@ def profile_features(variant, candidate_feature=None):
         )
     if candidate_feature == "tiled-leaves":
         return list(HYBRID_DEFAULTS) + (["tiled-leaves"] if variant == "packed" else [])
+    if candidate_feature == "generation-prefetch":
+        return list(TILED_DEFAULTS) + (
+            ["generation-prefetch"] if variant == "packed" else []
+        )
     selected = list(FEATURES)
     if variant == "packed":
         if candidate_feature == "candidate-combined":
@@ -778,6 +783,7 @@ def main():
             "active-candidates",
             "hybrid-forest",
             "tiled-leaves",
+            "generation-prefetch",
         ),
     )
     parser.add_argument("--split", choices=("tuning", "confirmation"), default="tuning")

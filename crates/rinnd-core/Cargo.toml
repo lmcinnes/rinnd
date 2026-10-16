@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves", "candidate-membership", "candidate-workspace", "active-candidates", "hybrid-forest", "tiled-leaves"]
+default = ["std", "rayon", "batched-euclidean", "batched-angular", "compact-candidates", "batched-leaves", "candidate-membership", "candidate-workspace", "active-candidates", "hybrid-forest", "tiled-leaves", "generation-prefetch"]
 std = []
 rayon = ["dep:rayon"]
 mmap = ["dep:memmap2"]
@@ -28,6 +28,8 @@ active-candidates = []
 batched-leaves = []
 # Register-tiled leaf-initialization kernels (bit-identical distances).
 tiled-leaves = []
+# Prefetch next hub's candidate vectors during update generation (dim <= 256).
+generation-prefetch = []
 packed-updates = []
 
 [dependencies]

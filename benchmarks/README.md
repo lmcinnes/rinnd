@@ -6,7 +6,15 @@ Graph delivery and single-query throughput are separate workloads. The current
 priority is full-corpus graph delivery, especially for large datasets; query timing
 is not an adoption gate for lossless construction changes with identical graphs.
 
-## Current default decision (2026-10-15, tiled leaves)
+## Current default decision (2026-10-16, generation prefetch)
+
+Default builds now also enable `generation-prefetch` (ten features in total),
+approved on 2026-10-16 after the exact full-corpus profile in
+[Generation prefetch](#generation-prefetch-2026-10-16). Query tree-leaf seeding now
+also uses the batched 1x4 kernels without a separate feature flag. Earlier
+decisions below otherwise still apply.
+
+## Default decision (2026-10-15, tiled leaves)
 
 Default builds now also enable `tiled-leaves` (nine features in total), approved on
 2026-10-15 after the exact full-corpus profile in
@@ -97,6 +105,47 @@ FP16/direct-packing feature flags, buffer tuning, and their dedicated benchmark
 options are no longer available in the current source.
 
 ## Optimization experiments
+
+### Generation prefetch (2026-10-16)
+
+**Decision: `generation-prefetch` promoted to default (vectors of at most 256
+dimensions); batched query seeding adopted unconditionally.**
+
+The earlier prefetch experiment (`angular-prefetch-v1`) ran on subsets and prefetched
+generation and application together. This one prefetches only in update
+generation, with modes screened from one binary on full corpora (2 seeds, 8 cores;
+`results/gen-prefetch-v1/`): whole candidate vectors plus heap roots for the next
+hub, the current hub, or two hubs ahead all gave GloVe generation 1.12-1.24x
+(delivery 1.05-1.075x) and NYTimes 1.02-1.14x; first-line-only prefetch gave
+1.00-1.03x. MNIST and Fashion-MNIST (784-d, 49 lines per vector) were slower in
+every pair (delivery 0.98-0.99x), hence the 256-dimension limit.
+
+Several screen runs coincided with external host load (one-minute load 15-36,
+40k-130k involuntary context switches against about 100-900 normally); they were
+rerun and the originals kept as `*.contaminated.json`. Check
+`resources.involuntary_context_switches` before trusting a run on this shared host.
+
+Full paired profile against the nine previous defaults (4 datasets, k15/k30,
+seeds 42-44, 3 repeats, one warm-up pair per endpoint, 8 physical cores): all 72
+measured and 8 warm-up pairs had identical graphs and update counts.
+
+| Endpoint | Speedup | Range | Generation s |
+| --- | --- | --- | --- |
+| MNIST k15 / k30 | 1.001 / 0.999 | 0.989-1.013 | 0.24->0.24 / 0.76->0.76 |
+| Fashion k15 / k30 | 1.001 / 0.999 | 0.982-1.009 | 0.23->0.23 / 0.71->0.71 |
+| NYTimes k15 / k30 | 1.014 / 1.012 | 0.955-1.060 | 1.55->1.49 / 4.31->4.22 |
+| GloVe k15 / k30 | 1.075 / 1.053 | 0.987-1.088 | 4.64->3.74 / 12.34->10.97 |
+
+Image builds skip prefetch and are within noise. Five records (GloVe k15 and
+NYTimes k15) had 5k-24k involuntary context switches and account for the low ends
+of those ranges; medians are unaffected. Results: `results/gen-prefetch-confirm-v1/`.
+
+Query traversal already used the batched kernels (`traverse_four`); only RP-tree
+leaf seeding computed single-pair distances. Batching it, with unchanged push
+order, gave identical query results and QPS 1.003-1.028x on GloVe, 1.008-1.038x on
+Fashion-MNIST and 0.986-1.023x on NYTimes across epsilon 0-1 (1000 tuning queries,
+3 repeats, alternating order; NYTimes from a clean rerun). Results:
+`results/batched-seed-v1/`.
 
 ### Tiled leaf initialization (2026-10-15)
 

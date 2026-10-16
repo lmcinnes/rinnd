@@ -21,6 +21,7 @@ active-candidates = ["rinnd-core/active-candidates"]
 blocked-candidates = ["rinnd-core/blocked-candidates"]
 hybrid-forest = ["rinnd-core/hybrid-forest"]
 tiled-leaves = ["rinnd-core/tiled-leaves"]
+generation-prefetch = ["rinnd-core/generation-prefetch"]
 
 [dependencies]
 rinnd-core = { path = "../rinnd-core", default-features = false, features = ["std", "rayon"] }

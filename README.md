@@ -47,15 +47,16 @@ cargo bench --release
 
 Default Rust and Python builds enable `batched-euclidean`, `batched-angular`,
 `compact-candidates`, `batched-leaves`, `candidate-membership`,
-`candidate-workspace`, `active-candidates`, `hybrid-forest`, and `tiled-leaves`. These enable distance batching, compact reverse-candidate
+`candidate-workspace`, `active-candidates`, `hybrid-forest`, `tiled-leaves`, and `generation-prefetch`. These enable distance batching, compact reverse-candidate
 storage, batched leaf initialization, vectorizable duplicate checks, candidate
 array reuse with worker-side update-bucket allocation, old-candidate lists built
 only for vertices with new candidates, a cache-local finish for graph-only RP
-forests, and register-tiled leaf initialization. Unsupported SIMD platforms
+forests, register-tiled leaf initialization, and candidate-vector prefetch during
+update generation. Unsupported SIMD platforms
 retain the existing distance fallbacks. The minimum supported Rust version is 1.89
 (stable AVX-512 target features).
 
-To disable all nine optimizations for a core-only build:
+To disable all ten optimizations for a core-only build:
 
 ```bash
 cargo build -p rinnd-core --release --no-default-features --features std,rayon
@@ -205,6 +206,23 @@ initialization 1.15-1.36x faster, and graph delivery 1.06-1.07x faster on the im
 datasets and 1.02-1.03x on NYTimes; GloVe (d = 100, below the cosine threshold)
 was unchanged. See the
 [tiled leaf results](benchmarks/README.md#tiled-leaf-initialization-2026-10-15).
+
+### Generation Prefetch
+
+The default-enabled `generation-prefetch` feature prefetches every cache line of the
+next hub's candidate vectors, plus their heap-root distances, while update
+generation processes the current hub. It applies only to vectors of at most 256
+dimensions: at 784 dimensions the prefetch traffic slowed generation by about 3%,
+and the hardware prefetcher already handles long vectors. Outputs are unchanged.
+
+The full-corpus paired profile found identical graphs in all measured pairs and
+graph delivery 1.05-1.08x faster on GloVe and about 1.01x on NYTimes; the image
+datasets are unaffected. See the
+[generation prefetch results](benchmarks/README.md#generation-prefetch-2026-10-16).
+
+Query seeding from RP-tree leaves uses the same batched 1x4 distance kernels as
+graph traversal when the batched distance features are enabled, with unchanged
+results (query QPS 1.00-1.04x on GloVe and Fashion-MNIST, neutral on NYTimes).
 
 ## Python Bindings
 

@@ -86,6 +86,31 @@ fn initialize_fp32<D: Distance<f32>>(
             &mut workspace.tree_leaves,
         );
         for &(start, end) in &workspace.tree_leaves {
+            if D::USE_DISTANCE_FOUR && dim >= 32 {
+                let mut pending = [0i32; 4];
+                let mut count = 0;
+                for &idx in &tree.indices[start..end] {
+                    if idx >= 0 && !workspace.visited.check_and_mark(idx) {
+                        pending[count] = idx;
+                        count += 1;
+                        if count == 4 {
+                            let vectors = pending.map(|c| &data[c as usize * dim..(c as usize + 1) * dim]);
+                            let distances = distance.distance_four(query, vectors);
+                            for slot in 0..4 {
+                                workspace.result_heap.push(distances[slot], pending[slot]);
+                                workspace.seed_set.push(distances[slot], pending[slot]);
+                            }
+                            count = 0;
+                        }
+                    }
+                }
+                for &idx in &pending[..count] {
+                    let d = distance.distance(query, &data[idx as usize * dim..(idx as usize + 1) * dim]);
+                    workspace.result_heap.push(d, idx);
+                    workspace.seed_set.push(d, idx);
+                }
+                continue;
+            }
             for &idx in &tree.indices[start..end] {
                 if idx >= 0 && !workspace.visited.check_and_mark(idx) {
                     let d = distance

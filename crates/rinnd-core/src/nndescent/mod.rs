@@ -508,6 +508,31 @@ struct PotentialUpdate {
 
 const UPDATE_BLOCK_SIZE: usize = 16384;
 
+// Above this, whole-vector prefetch (49 lines at d = 784) slowed generation; the hardware prefetcher suffices.
+const GENERATION_PREFETCH_MAX_DIM: usize = 256;
+
+/// Prefetch every cache line of a hub's candidate vectors and their heap roots.
+#[inline(always)]
+fn prefetch_hub(candidates: &CandidateSets, hub: usize, data: &[f32], dim: usize, graph: &NeighborHeap) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let lines = (dim * 4).div_ceil(64);
+        for &candidate in candidates.get_new(hub).iter().chain(candidates.get_old(hub)) {
+            if candidate < 0 {
+                continue;
+            }
+            let vector = data.as_ptr().add(candidate as usize * dim) as *const i8;
+            for line in 0..lines {
+                _mm_prefetch(vector.add(line * 64), _MM_HINT_T0);
+            }
+            _mm_prefetch(graph.distances.as_ptr().add(candidate as usize * graph.k) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (candidates, hub, data, dim, graph);
+}
+
 trait UpdateRecord: Copy + Send + Sync {
     fn encode(
         update: PotentialUpdate,
@@ -770,11 +795,15 @@ fn update_iteration_observed<D: Distance<f32> + Sync, Record: UpdateRecord>(
 
         // Generate updates and bucket by destination vertex block
         let generation_started = Instant::now();
+        let prefetch_hubs = cfg!(feature = "generation-prefetch") && dim <= GENERATION_PREFETCH_MAX_DIM;
         thread_buckets.par_iter_mut().enumerate().for_each(|(t, local_buckets)| {
             let row_start = block_start + t * rows_per_thread;
             let row_end = (row_start + rows_per_thread).min(block_end);
 
             for i in row_start..row_end {
+                if prefetch_hubs && i + 1 < row_end {
+                    prefetch_hub(candidates, i + 1, data, dim, graph);
+                }
                 let new_cands = candidates.get_new(i);
                 let old_cands = candidates.get_old(i);
 

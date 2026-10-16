@@ -9,7 +9,7 @@ mod flat_tree;
 #[cfg(not(feature = "hybrid-forest"))]
 pub(crate) use breadth_first::build_breadth_first_leaf_forest;
 #[cfg(feature = "hybrid-forest")]
-pub(crate) use hybrid_forest::{build_hybrid_leaf_forest, local_points_for};
+pub(crate) use hybrid_forest::{build_hybrid_forest, build_hybrid_leaf_forest, local_points_for};
 pub use builder::{build_rp_forest, build_rp_tree, rptree_leaf_array};
 pub(crate) use builder::{build_rp_leaf_forest, build_rp_leaf_tree};
 pub use flat_tree::{FlatTree, QuantizedFlatTree};

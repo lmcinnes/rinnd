@@ -16,7 +16,7 @@ use crate::tree::{build_rp_forest, build_rp_leaf_forest, rptree_leaf_array, Flat
 #[cfg(not(feature = "hybrid-forest"))]
 use crate::tree::build_breadth_first_leaf_forest;
 #[cfg(feature = "hybrid-forest")]
-use crate::tree::{build_hybrid_leaf_forest, local_points_for};
+use crate::tree::{build_hybrid_forest, build_hybrid_leaf_forest, local_points_for};
 
 use rayon::prelude::*;
 
@@ -109,7 +109,24 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
     params: &NNDescentParams,
     rng: &mut FastRng,
 ) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
-    nn_descent_impl(data, n_points, dim, distance, params, rng, true, None)
+    nn_descent_impl(data, n_points, dim, distance, params, rng, true, None, params.n_trees)
+}
+
+/// Like [`nn_descent`], but returns only the first `n_retained` trees. With a batch
+/// width, the forest is built by the hybrid builder, so the graph matches
+/// `nn_descent_graph` with the same width.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn nn_descent_retained<D: Distance<f32> + Sync>(
+    data: &[f32],
+    n_points: usize,
+    dim: usize,
+    distance: &D,
+    params: &NNDescentParams,
+    rng: &mut FastRng,
+    breadth_first_batch_width: Option<usize>,
+    n_retained: usize,
+) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
+    nn_descent_impl(data, n_points, dim, distance, params, rng, true, breadth_first_batch_width, n_retained)
 }
 
 pub(crate) fn nn_descent_graph<D: Distance<f32> + Sync>(
@@ -130,9 +147,35 @@ pub(crate) fn nn_descent_graph<D: Distance<f32> + Sync>(
         rng,
         false,
         breadth_first_batch_width,
+        0,
     )
 }
 
+/// Depth-first forest; leaves come from every tree, only the first `n_retained` are kept.
+fn build_retained_rp_forest(
+    data: &[f32],
+    n_points: usize,
+    dim: usize,
+    params: &NNDescentParams,
+    rng: &mut FastRng,
+    n_retained: usize,
+) -> (Vec<FlatTree>, Vec<Vec<i32>>) {
+    let mut forest = build_rp_forest(
+        data,
+        n_points,
+        dim,
+        params.n_trees,
+        params.leaf_size,
+        rng,
+        params.angular,
+        params.max_depth,
+    );
+    let leaf_array = rptree_leaf_array(&forest);
+    forest.truncate(n_retained);
+    (forest, leaf_array)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn nn_descent_impl<D: Distance<f32> + Sync>(
     data: &[f32],
     n_points: usize,
@@ -142,6 +185,7 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
     rng: &mut FastRng,
     retain_trees: bool,
     breadth_first_batch_width: Option<usize>,
+    n_retained: usize,
 ) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
     use std::time::Instant;
 
@@ -154,18 +198,26 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
     }
 
     let (forest, leaf_array) = if retain_trees {
-        let forest = build_rp_forest(
-            data,
-            n_points,
-            dim,
-            params.n_trees,
-            params.leaf_size,
-            rng,
-            params.angular,
-            params.max_depth,
-        );
-        let leaf_array = rptree_leaf_array(&forest);
-        (forest, leaf_array)
+        #[cfg(feature = "hybrid-forest")]
+        if let Some(batch_width) = breadth_first_batch_width {
+            build_hybrid_forest(
+                data,
+                n_points,
+                dim,
+                params.n_trees,
+                params.leaf_size,
+                rng,
+                params.angular,
+                params.max_depth,
+                batch_width,
+                local_points_for(dim),
+                n_retained,
+            )
+        } else {
+            build_retained_rp_forest(data, n_points, dim, params, rng, n_retained)
+        }
+        #[cfg(not(feature = "hybrid-forest"))]
+        build_retained_rp_forest(data, n_points, dim, params, rng, n_retained)
     } else if let Some(batch_width) = breadth_first_batch_width {
         #[cfg(feature = "hybrid-forest")]
         let leaves = build_hybrid_leaf_forest(

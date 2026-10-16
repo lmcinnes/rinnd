@@ -6,7 +6,21 @@ Graph delivery and single-query throughput are separate workloads. The current
 priority is full-corpus graph delivery, especially for large datasets; query timing
 is not an adoption gate for lossless construction changes with identical graphs.
 
-## Current default decision (2026-10-16, forest scaling)
+## Current default decision (2026-10-16, hybrid forest for search indexes)
+
+Search-capable indexes now build their forest with the hybrid builder (Python
+`tree_build_strategy="auto"`), keeping the first `n_search_trees` trees as query
+trees, and both breadth-first builders force splits instead of leaving oversized
+leaves ([Hybrid forest for search-capable indexes](#hybrid-forest-for-search-capable-indexes-2026-10-16)).
+This is not output-exact against the previous default; it was approved on
+2026-10-16 on equal graph and query recall. The default wheel is
+`target/wheels/default-regular-hybrid-v1/` (rinnd 0.4.1), installed into
+`ann-benchmarks/.venv`; its native binary matches the validated
+`target/regular-hybrid-v6` build. 167 default, 170 all-feature and 158
+optimizations-off core tests and 53 Python tests pass. Earlier decisions below
+otherwise still apply.
+
+## Default decision (2026-10-16, forest scaling)
 
 The hybrid forest's parallel restructuring and per-level overhead reduction
 ([Forest scaling at 64 threads](#forest-scaling-at-64-threads-2026-10-16)) are now
@@ -116,6 +130,65 @@ FP16/direct-packing feature flags, buffer tuning, and their dedicated benchmark
 options are no longer available in the current source.
 
 ## Optimization experiments
+
+### Hybrid forest for search-capable indexes (2026-10-16)
+
+Search-capable builds used the depth-first builder, which keeps every tree as a
+`FlatTree` (only `n_search_trees`, default 1, survive) and runs one tree per
+thread. Its sequential RNG makes it impossible to reproduce level by level. The
+hybrid builder now optionally records split nodes for the first `n_search_trees`
+trees and assembles them into `FlatTree`s numbered breadth first. Leaves are
+unchanged, so the k-NN graph of a search-capable build equals the graph-only graph
+for the same parameters. Only the query tree is a different (equally random)
+tree. Tests check the leaf sets per retained tree, `n_nodes = 2 * leaves - 1`, and
+that every training point routes to its own leaf. Python `tree_build_strategy`
+`"auto"` now selects it for search indexes too, `"depth_first"` restores the
+legacy builder, and `NNDescentBuilder` uses it unless `depth_first_tree_build()`
+is set.
+
+Default k30 builds, seeds 42/43, 10,000 test queries (`results/regular-hybrid-v1/`,
+seed means, single runs):
+
+| Dataset | Threads | Forest | Build | Recall@10 eps 0 / 0.1 / 0.2 |
+| --- | --- | --- | --- | --- |
+| GloVe | 64 | 2.08 -> 0.40 s | 25.2 -> 22.0 s | .437/.645/.798 -> .438/.642/.798 |
+| GloVe | 8 | 2.23 -> 0.91 s | 82.6 -> 82.2 s | .438/.645/.798 -> .439/.644/.797 |
+| NYTimes | 64 | 0.46 -> 0.12 s | 10.7 -> 10.3 s | .505/.645/.762 -> .507/.645/.762 |
+| NYTimes | 8 | 0.73 -> 0.24 s | 44.1 -> 42.9 s | .507/.645/.762 -> .507/.647/.760 |
+| Fashion | 64 | 0.21 -> 0.06 s | 0.80 -> 0.59 s | .871/.969/.994 -> .873/.969/.994 |
+| Fashion | 8 | 0.33 -> 0.10 s | 1.56 -> 1.32 s | .871/.969/.994 -> .873/.969/.994 |
+
+The GloVe 64-thread seed-42 baseline (27.0 s build, 2.5 s forest) looks
+perturbed. Recall and QPS differences are within seed-to-seed variation.
+
+Forced splitting (same day). The breadth-first/hybrid builders turned a node into
+an oversized leaf when no split was found (zero-norm or identical sample points)
+or the split put every point on one side; NYTimes query trees had 13 leaves above
+`leaf_size`, up to 817 points. Both builders now retry like the depth-first
+builder: up to 8 seeds for the split itself, then (after a one-sided partition) 7
+more seeds partitioned serially, then a shuffled half split with a zero hyperplane
+(queries take a random side). Tie breaking uses the seed of the split actually
+chosen. Datasets without failed splits (GloVe, Fashion) give identical graphs;
+graph-only output changes only where splits failed, which on NYTimes is mainly
+caused by zero vectors. Every leaf now holds at most `leaf_size` points unless
+the depth limit is reached (NYTimes query-tree max 150).
+
+A 3-seed graph-recall check against exact k30 ground truth
+(`results/regular-hybrid-v3/`) first suggested NYTimes was 0.004 below the
+depth-first builder (0.8001 vs 0.7960, seeds 42-44). Individual trees were
+equally good (same-leaf rate for true neighbours 0.0327 depth-first, 0.0332
+hybrid), and neither depth-first leaf order nor depth-first zero-plane split
+semantics changed the result. Eight more seeds (45-52, `results/regular-hybrid-v4/`)
+reversed the gap: depth-first 0.7960 (sd 0.0016) and breadth-first 0.7973 (sd 0.0009).
+The builders are equivalent in graph quality. GloVe 0.7773/0.7770 and Fashion
+0.9984/0.9982 match within noise.
+
+Query recall, 3 seeds, 64 threads (final wheel `target/regular-hybrid-v6`): GloVe
+.438/.645/.798 -> .437/.643/.798, NYTimes .504/.644/.762 -> .505/.645/.762,
+Fashion .871/.969/.994 -> .872/.969/.994. QPS measured with old and new runs
+alternating, best of three, is within the ±10% run-to-run spread on this host.
+Numbering query-tree nodes in preorder instead of breadth first gave no gain.
+Promoted to the default wheel on 2026-10-16.
 
 ### Forest scaling at 64 threads (2026-10-16)
 

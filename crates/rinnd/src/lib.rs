@@ -881,15 +881,8 @@ impl PyNNDescent {
         }
 
         let breadth_first_batch_width = match tree_build_strategy {
-            "auto" if graph_only => Some(tree_batch_width),
-            "auto" => None,
+            "auto" | "breadth_first" => Some(tree_batch_width),
             "depth_first" => None,
-            "breadth_first" if !graph_only => {
-                return Err(PyValueError::new_err(
-                    "tree_build_strategy='breadth_first' currently requires graph_only=True",
-                ));
-            }
-            "breadth_first" => Some(tree_batch_width),
             other => {
                 return Err(PyValueError::new_err(format!(
                     "Unknown tree_build_strategy: {other}; expected 'auto', 'depth_first', or 'breadth_first'"
@@ -997,6 +990,7 @@ impl PyNNDescent {
                 diversify_prob,
                 pruning_degree_multiplier,
                 verbose,
+                breadth_first_batch_width,
             )
         })?;
 
@@ -1694,6 +1688,7 @@ impl PyNNDescent {
         diversify_prob: f32,
         pruning_degree_multiplier: f32,
         verbose: bool,
+        breadth_first_batch_width: Option<usize>,
     ) -> PyResult<Box<dyn AnyIndex>> {
         // Compute default n_trees matching PyNNDescent: max(3, min(12, round(2*log10(n))))
         let effective_n_trees = n_trees.unwrap_or_else(|| {
@@ -1722,6 +1717,10 @@ impl PyNNDescent {
         if let Some(ni) = n_iters {
             builder = builder.n_iters(ni);
         }
+        builder = match breadth_first_batch_width {
+            Some(width) => builder.breadth_first_tree_batch_width(width),
+            None => builder.depth_first_tree_build(),
+        };
         // Dispatch to the correct concrete distance type for each metric.
         // Metrics with fast alternatives use proxy distances + correction.
         // Others use the direct distance function.

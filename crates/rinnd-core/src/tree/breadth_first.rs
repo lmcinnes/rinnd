@@ -19,6 +19,8 @@ struct FrontierNode {
 pub(super) struct Split {
     pub(super) hyperplane: Vec<f32>,
     pub(super) offset: f32,
+    /// Seed for breaking margin ties (the seed that produced this split).
+    pub(super) tie_seed: u64,
 }
 
 struct TreeState {
@@ -60,20 +62,20 @@ impl TreeState {
                 if node.end - node.start <= leaf_size || node.depth >= max_depth {
                     None
                 } else {
-                    make_split(
+                    Some(choose_split(
                         data,
                         dim,
                         &self.permutation[node.start..node.end],
                         node.seed,
                         angular,
-                    )
+                    ))
                 }
             })
             .collect();
         self.splits.iter().any(Option::is_some)
     }
 
-    fn finish_level(&mut self, tree_slot: usize, batch_width: usize, sides: &[u8]) {
+    fn finish_level(&mut self, data: &[f32], dim: usize, angular: bool, tree_slot: usize, batch_width: usize, sides: &[u8]) {
         let mut next_frontier = Vec::with_capacity(self.frontier.len() * 2);
         for (node_index, node) in self.frontier.iter().copied().enumerate() {
             if self.splits[node_index].is_none() {
@@ -98,12 +100,8 @@ impl TreeState {
             }
 
             if left == node.start || left == node.end {
-                self.leaves
-                    .push(self.permutation[node.start..node.end].to_vec());
-                for &point in &self.permutation[node.start..node.end] {
-                    self.assignments[point as usize] = NO_NODE;
-                }
-                continue;
+                let (_, offset) = repair_split(data, dim, &mut self.permutation[node.start..node.end], |_, _| {}, node.seed, angular);
+                left = node.start + offset;
             }
 
             let left_index = next_frontier.len();
@@ -203,7 +201,7 @@ pub(crate) fn build_breadth_first_leaf_forest(
                         if let Some(split) = &tree.splits[node_index] {
                             let margin = margins[tree_slot] + split.offset;
                             point_sides[tree_slot] = if margin.abs() < 1e-8 {
-                                tie_side(tree.frontier[node_index].seed, point_index)
+                                tie_side(split.tie_seed, point_index)
                             } else {
                                 (margin >= 0.0) as u8
                             };
@@ -214,7 +212,7 @@ pub(crate) fn build_breadth_first_leaf_forest(
             trees
                 .par_iter_mut()
                 .enumerate()
-                .for_each(|(tree_slot, tree)| tree.finish_level(tree_slot, batch_width, &sides));
+                .for_each(|(tree_slot, tree)| tree.finish_level(data, dim, angular, tree_slot, batch_width, &sides));
         }
 
         for tree in trees {
@@ -292,6 +290,63 @@ unsafe fn batched_dot_products_avx2(
     sums
 }
 
+const SPLIT_ATTEMPTS: u64 = 8;
+
+#[inline]
+fn attempt_seed(seed: u64, attempt: u64) -> u64 {
+    if attempt == 0 { seed } else { mix64(seed ^ attempt.wrapping_mul(0x9e3779b97f4a7c15)) }
+}
+
+/// First valid split among `SPLIT_ATTEMPTS` seeds; otherwise a zero hyperplane,
+/// which sends every point to a random side by the tie rule.
+pub(super) fn choose_split(data: &[f32], dim: usize, indices: &[i32], seed: u64, angular: bool) -> Split {
+    (0..SPLIT_ATTEMPTS)
+        .find_map(|attempt| make_split(data, dim, indices, attempt_seed(seed, attempt), angular))
+        .unwrap_or(Split { hyperplane: vec![0.0; dim], offset: 0.0, tie_seed: attempt_seed(seed, SPLIT_ATTEMPTS) })
+}
+
+/// Re-split a node whose split put every point on one side, like the depth-first
+/// builder: retry with new seeds, then fall back to a shuffled half split with a
+/// zero hyperplane. Partitions `ids` in place (mirroring each swap through `swap`)
+/// and returns the split and the size of the left part.
+pub(super) fn repair_split(
+    data: &[f32],
+    dim: usize,
+    ids: &mut [i32],
+    mut swap: impl FnMut(usize, usize),
+    seed: u64,
+    angular: bool,
+) -> (Split, usize) {
+    for attempt in SPLIT_ATTEMPTS + 1..2 * SPLIT_ATTEMPTS {
+        let Some(split) = make_split(data, dim, ids, attempt_seed(seed, attempt), angular) else {
+            continue;
+        };
+        let (mut left, mut right) = (0, ids.len());
+        while left < right {
+            let id = ids[left] as usize;
+            let margin = dot_product(&data[id * dim..(id + 1) * dim], &split.hyperplane) + split.offset;
+            let side = if margin.abs() < 1e-8 { tie_side(split.tie_seed, id) } else { (margin >= 0.0) as u8 };
+            if side == 0 {
+                left += 1;
+            } else {
+                right -= 1;
+                ids.swap(left, right);
+                swap(left, right);
+            }
+        }
+        if left > 0 && left < ids.len() {
+            return (split, left);
+        }
+    }
+    let mut rng = FastRng::new(attempt_seed(seed, 2 * SPLIT_ATTEMPTS));
+    for position in (1..ids.len()).rev() {
+        let other = rng.next_index(position + 1);
+        ids.swap(position, other);
+        swap(position, other);
+    }
+    (Split { hyperplane: vec![0.0; dim], offset: 0.0, tie_seed: seed }, ids.len() / 2)
+}
+
 pub(super) fn make_split(
     data: &[f32],
     dim: usize,
@@ -309,11 +364,12 @@ pub(super) fn make_split(
     let second_index = indices[second] as usize;
     let point1 = &data[first_index * dim..(first_index + 1) * dim];
     let point2 = &data[second_index * dim..(second_index + 1) * dim];
-    if angular {
+    let split = if angular {
         make_angular_split(point1, point2)
     } else {
         make_euclidean_split(point1, point2)
-    }
+    };
+    split.map(|split| Split { tie_seed: seed, ..split })
 }
 
 fn make_angular_split(point1: &[f32], point2: &[f32]) -> Option<Split> {
@@ -337,6 +393,7 @@ fn make_angular_split(point1: &[f32], point2: &[f32]) -> Option<Split> {
     Some(Split {
         hyperplane,
         offset: 0.0,
+        tie_seed: 0,
     })
 }
 
@@ -361,6 +418,7 @@ fn make_euclidean_split(point1: &[f32], point2: &[f32]) -> Option<Split> {
     Some(Split {
         hyperplane,
         offset: -midpoint_dot * inverse_norm,
+        tie_seed: 0,
     })
 }
 

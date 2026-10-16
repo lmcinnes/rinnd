@@ -2,7 +2,7 @@
 
 use crate::distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 use crate::graph::{NeighborGraph, SearchGraph};
-use crate::nndescent::{nn_descent, nn_descent_graph, NNDescentParams, NNDescentStats};
+use crate::nndescent::{nn_descent_graph, nn_descent_retained, NNDescentParams, NNDescentStats};
 use crate::rng::FastRng;
 use crate::search::{
     greedy_search_indices_with_workspace_initialized,
@@ -636,7 +636,7 @@ impl<'a> NNDescentBuilder<'a> {
         self
     }
 
-    /// Use the experimental breadth-first forest for graph-only construction.
+    /// Build the forest breadth first (hybrid builder), `width` trees per margin pass.
     pub fn breadth_first_tree_batch_width(mut self, width: usize) -> Self {
         assert!(
             (1..=8).contains(&width),
@@ -646,7 +646,7 @@ impl<'a> NNDescentBuilder<'a> {
         self
     }
 
-    /// Use depth-first forest construction for graph-only construction.
+    /// Use the legacy depth-first forest construction.
     pub fn depth_first_tree_build(mut self) -> Self {
         self.breadth_first_batch_width = None;
         self
@@ -868,13 +868,15 @@ impl<'a> NNDescentBuilder<'a> {
         let mut rng = FastRng::new(self.random_seed);
 
         // Run NN-descent
-        let (mut neighbor_heap, forest, nn_descent_stats) = nn_descent(
+        let (mut neighbor_heap, forest, nn_descent_stats) = nn_descent_retained(
             &self.data,
             self.n_points,
             self.dim,
             &distance,
             &params,
             &mut rng,
+            self.breadth_first_batch_width,
+            self.n_search_trees,
         );
 
         // Sort the heap so neighbors are in ascending distance order

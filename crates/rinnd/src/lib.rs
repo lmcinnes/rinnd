@@ -1059,13 +1059,13 @@ impl PyNNDescent {
             normalize_rows_inplace(&mut query_vec, query_dim);
         }
 
-        let (indices, distances) = py.allow_threads(|| {
+        let (indices, distances) = py.detach(|| {
             self.install(|| self.index_data.query(&query_vec, n_queries, k, epsilon))
         });
 
         // Create 2D arrays directly
-        let indices_arr = PyArray1::from_vec_bound(py, indices);
-        let distances_arr = PyArray1::from_vec_bound(py, distances);
+        let indices_arr = PyArray1::from_vec(py, indices);
+        let distances_arr = PyArray1::from_vec(py, distances);
 
         let indices_2d = indices_arr.reshape([n_queries, k])?;
         let distances_2d = distances_arr.reshape([n_queries, k])?;
@@ -1112,7 +1112,7 @@ impl PyNNDescent {
             normalize_rows_inplace(&mut query_vec, query_dim);
         }
 
-        let (indices, distances) = py.allow_threads(|| {
+        let (indices, distances) = py.detach(|| {
             self.install(|| {
                 self.index_data.query_quantized_widths(
                     &query_vec,
@@ -1124,8 +1124,8 @@ impl PyNNDescent {
                 )
             })
         })?;
-        let indices_arr = PyArray1::from_vec_bound(py, indices).reshape([n_queries, k])?;
-        let distances_arr = PyArray1::from_vec_bound(py, distances).reshape([n_queries, k])?;
+        let indices_arr = PyArray1::from_vec(py, indices).reshape([n_queries, k])?;
+        let distances_arr = PyArray1::from_vec(py, distances).reshape([n_queries, k])?;
         Ok((indices_arr, distances_arr))
     }
 
@@ -1158,15 +1158,15 @@ impl PyNNDescent {
             }
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.install(|| self.index_data.query_one(&scratch[..], k, epsilon))
             })
         } else {
-            py.allow_threads(|| self.install(|| self.index_data.query_one(query_slice, k, epsilon)))
+            py.detach(|| self.install(|| self.index_data.query_one(query_slice, k, epsilon)))
         };
 
-        let idx = PyArray1::from_vec_bound(py, indices);
-        let dist = PyArray1::from_vec_bound(py, distances);
+        let idx = PyArray1::from_vec(py, indices);
+        let dist = PyArray1::from_vec(py, distances);
         Ok((idx, dist))
     }
 
@@ -1202,16 +1202,16 @@ impl PyNNDescent {
             }
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.install(|| self.index_data.query_one_indices(&scratch[..], k, epsilon))
             })
         } else {
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.install(|| self.index_data.query_one_indices(query_slice, k, epsilon))
             })
         };
 
-        Ok(PyArray1::from_vec_bound(py, indices))
+        Ok(PyArray1::from_vec(py, indices))
     }
 
     /// Query a quantized index with independent query-time candidate and FP32
@@ -1251,7 +1251,7 @@ impl PyNNDescent {
             }
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.install(|| {
                     self.index_data.query_one_quantized_widths(
                         &scratch[..],
@@ -1263,7 +1263,7 @@ impl PyNNDescent {
                 })
             })
         } else {
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.install(|| {
                     self.index_data.query_one_quantized_widths(
                         query_slice,
@@ -1275,7 +1275,7 @@ impl PyNNDescent {
                 })
             })
         }?;
-        Ok(PyArray1::from_vec_bound(py, result.0))
+        Ok(PyArray1::from_vec(py, result.0))
     }
 
     /// Export current search graph in CSR format.
@@ -1285,7 +1285,7 @@ impl PyNNDescent {
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<i32>>, f32)> {
         self.ensure_search_enabled()?;
-        let (graph, min_distance) = py.allow_threads(|| {
+        let (graph, min_distance) = py.detach(|| {
             self.install(|| {
                 (
                     self.index_data.search_graph_original_order(),
@@ -1294,8 +1294,8 @@ impl PyNNDescent {
             })
         });
         Ok((
-            PyArray1::from_vec_bound(py, graph.indptr),
-            PyArray1::from_vec_bound(py, graph.indices),
+            PyArray1::from_vec(py, graph.indptr),
+            PyArray1::from_vec(py, graph.indices),
             min_distance,
         ))
     }
@@ -1304,7 +1304,7 @@ impl PyNNDescent {
     fn storage_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let (encoding, code_bytes, metadata_bytes, retained_fp32_bytes, encode_seconds) =
             self.index_data.storage_info();
-        let info = PyDict::new_bound(py);
+        let info = PyDict::new(py);
         info.set_item("encoding", encoding)?;
         info.set_item("graph_only", !self.index_data.search_enabled())?;
         info.set_item("graph_bytes", code_bytes + metadata_bytes)?;
@@ -1357,7 +1357,7 @@ impl PyNNDescent {
     /// Build query search structures. This method is idempotent.
     fn prepare(&self, py: Python<'_>) -> PyResult<()> {
         self.ensure_search_enabled()?;
-        py.allow_threads(|| self.install(|| self.index_data.prepare()));
+        py.detach(|| self.install(|| self.index_data.prepare()));
         Ok(())
     }
 
@@ -1383,8 +1383,8 @@ impl PyNNDescent {
         // Return the stored neighbor graph (no re-query needed)
         let (indices, distances) = self.index_data.neighbor_graph();
 
-        let indices_arr = PyArray1::from_vec_bound(py, indices);
-        let distances_arr = PyArray1::from_vec_bound(py, distances);
+        let indices_arr = PyArray1::from_vec(py, indices);
+        let distances_arr = PyArray1::from_vec(py, distances);
 
         let indices_2d = indices_arr.reshape([self.n_points, self.n_neighbors])?;
         let distances_2d = distances_arr.reshape([self.n_points, self.n_neighbors])?;
@@ -1396,7 +1396,7 @@ impl PyNNDescent {
     #[getter]
     fn build_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let stats = self.index_data.build_stats();
-        let result = PyDict::new_bound(py);
+        let result = PyDict::new(py);
         result.set_item("forest_seconds", stats.nn_descent.forest_seconds)?;
         result.set_item(
             "leaf_initialization_seconds",
@@ -1408,7 +1408,7 @@ impl PyNNDescent {
         )?;
         result.set_item("update_seconds", stats.nn_descent.update_seconds.clone())?;
         let phases = &stats.nn_descent.candidate_phases;
-        let candidate_phases = PyDict::new_bound(py);
+        let candidate_phases = PyDict::new(py);
         for (name, values) in [
             ("initialization", phases.iter().map(|phase| phase.initialization_seconds).collect::<Vec<_>>()),
             ("forward", phases.iter().map(|phase| phase.forward_seconds).collect()),
@@ -1459,14 +1459,14 @@ impl PyNNDescent {
     )> {
         self.ensure_search_enabled()?;
         let tree = py
-            .allow_threads(|| self.install(|| self.index_data.export_search_tree()))
+            .detach(|| self.install(|| self.index_data.export_search_tree()))
             .ok_or_else(|| PyValueError::new_err("no retained search tree is available"))?;
         let children: Vec<i32> = tree.children.into_iter().flatten().collect();
         let hyperplanes =
-            PyArray1::from_vec_bound(py, tree.hyperplanes).reshape([tree.n_nodes, tree.dim])?;
-        let offsets = PyArray1::from_vec_bound(py, tree.offsets);
-        let children = PyArray1::from_vec_bound(py, children).reshape([tree.n_nodes, 2])?;
-        let indices = PyArray1::from_vec_bound(py, tree.indices);
+            PyArray1::from_vec(py, tree.hyperplanes).reshape([tree.n_nodes, tree.dim])?;
+        let offsets = PyArray1::from_vec(py, tree.offsets);
+        let children = PyArray1::from_vec(py, children).reshape([tree.n_nodes, 2])?;
+        let indices = PyArray1::from_vec(py, tree.indices);
         Ok((hyperplanes, offsets, children, indices))
     }
 }
@@ -1985,9 +1985,9 @@ fn benchmark_candidate_building<'py>(
     let candidates = CandidateSets::build_from_graph(&mut heap, max_candidates, &mut rng);
 
     // Convert to numpy arrays
-    let new_indices = PyArray1::from_vec_bound(py, candidates.new_indices)
+    let new_indices = PyArray1::from_vec(py, candidates.new_indices)
         .reshape([n_vertices, max_candidates])?;
-    let old_indices = PyArray1::from_vec_bound(py, candidates.old_indices)
+    let old_indices = PyArray1::from_vec(py, candidates.old_indices)
         .reshape([n_vertices, max_candidates])?;
 
     Ok((new_indices, old_indices))
@@ -2065,7 +2065,7 @@ fn benchmark_distances<'py>(
         results.push(metric.distance(vi, vj));
     }
 
-    Ok(PyArray1::from_vec_bound(py, results))
+    Ok(PyArray1::from_vec(py, results))
 }
 
 /// Benchmark quantized u8 squared-euclidean distances.
@@ -2136,7 +2136,7 @@ fn benchmark_quantized_distances_u8<'py>(
         results.push(quantized_u8_sq_euclidean(q, yq, &codebook));
     }
 
-    Ok(PyArray1::from_vec_bound(py, results))
+    Ok(PyArray1::from_vec(py, results))
 }
 
 /// Benchmark candidate distances on data already symmetrically quantized to
@@ -2191,13 +2191,13 @@ fn benchmark_quantized_angular_i8<'py>(
         results.push(value);
     }
 
-    Ok(PyArray1::from_vec_bound(py, results))
+    Ok(PyArray1::from_vec(py, results))
 }
 
 /// The rinnd Python module.
-#[pymodule]
+#[pymodule(gil_used = true)]
 fn rinnd(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let named_distances = PyDict::new_bound(_py);
+    let named_distances = PyDict::new(_py);
     for &(name, _) in Metric::NAMED_DISTANCES {
         named_distances.set_item(name, true)?;
     }

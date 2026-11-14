@@ -1,0 +1,74 @@
+name: Run tests
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches:
+    - main
+    - master
+  pull_request:
+    branches:
+    - main
+    - master
+    paths-ignore:
+    - docs/**
+    - README.md
+    - README.rst
+permissions:
+  contents: read
+concurrency:
+  # Cancel if a new commit is made and things are still running
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  rust-tests:
+    name: Rust workspace tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89.0
+    - name: Run Cargo tests
+      # The extension crate needs libpython to link a native test executable.
+      # Exercise its Python API in python-tests instead.
+      run: cargo test --release --locked --workspace --exclude rinnd
+
+  python-tests:
+    name: Python ${{ matrix.python-version }} (${{ matrix.image-name }})
+    runs-on: ${{ matrix.image-name }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # Don't stop other jobs if one fails
+      fail-fast: false
+      matrix:
+        image-name: [ubuntu-latest, windows-latest, macos-latest, ubuntu-26.04-arm, windows-11-arm]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+    - name: checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install uv and set python version to "${{ matrix.python-version }}"
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      with:
+        python-version: "${{ matrix.python-version }}"
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89.0
+    - name: Install package and dependencies
+      run: |-
+        uv venv
+        uv pip install pytest -e ./crates/rinnd
+    - name: Run tests
+      run: uv run --no-project python -m pytest tests -v --junitxml=test-results/test-results.xml
+    - name: Upload test results
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: test-results-${{ matrix.image-name }}-py${{ matrix.python-version }}
+        path: test-results/test-results.xml
+        if-no-files-found: warn

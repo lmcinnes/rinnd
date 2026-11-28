@@ -4,19 +4,22 @@
 //! k-nearest neighbor graph construction.
 
 mod candidates;
+pub mod progressive;
 mod update;
 
 pub use candidates::{CandidateBuildStats, CandidateSets};
+pub use progressive::ProgressiveBuild;
 pub use update::{apply_updates, UpdateArray};
 
 use crate::distance::Distance;
 use crate::heap::NeighborHeap;
 use crate::rng::FastRng;
-use crate::tree::{build_rp_forest, build_rp_leaf_forest, rptree_leaf_array, FlatTree};
+use crate::distance::affine::AffineCodes;
+use crate::tree::build_rp_leaf_forest;
 #[cfg(not(feature = "hybrid-forest"))]
 use crate::tree::build_breadth_first_leaf_forest;
 #[cfg(feature = "hybrid-forest")]
-use crate::tree::{build_hybrid_forest, build_hybrid_leaf_forest, local_points_for};
+use crate::tree::{build_hybrid_leaf_forest, build_space_forest, local_points_for, local_points_for_row_bytes, CodeSpace};
 
 use rayon::prelude::*;
 
@@ -30,14 +33,22 @@ pub struct NNDescentStats {
     pub update_generation_seconds: Vec<f64>,
     pub update_application_seconds: Vec<f64>,
     pub updates: Vec<usize>,
+    /// Encoding the progressive build's 8-bit codes (zero without one).
+    pub code_seconds: f64,
+    /// Iterations (the first ones) run on the codes.
+    pub approximate_iterations: usize,
+    /// Re-scoring the approximate graph with exact distances.
+    pub rescore_seconds: f64,
 }
 
 impl NNDescentStats {
     pub fn total_seconds(&self) -> f64 {
         self.forest_seconds
+            + self.code_seconds
             + self.leaf_initialization_seconds
             + self.candidate_seconds.iter().sum::<f64>()
             + self.update_seconds.iter().sum::<f64>()
+            + self.rescore_seconds
     }
 }
 
@@ -62,6 +73,11 @@ pub struct NNDescentParams {
     pub max_depth: usize,
     /// Verbose output
     pub verbose: bool,
+    /// Whether early phases run on 8-bit codes (see [`progressive`]).
+    pub progressive: ProgressiveBuild,
+    /// Whether the (breadth-first) forest splits 8-bit codes (see
+    /// [`CODE_TREE_MIN_DIM`]).
+    pub code_trees: bool,
 }
 
 impl Default for NNDescentParams {
@@ -76,6 +92,8 @@ impl Default for NNDescentParams {
             angular: false,
             max_depth: 200,
             verbose: false,
+            progressive: ProgressiveBuild::Auto,
+            code_trees: true,
         }
     }
 }
@@ -89,7 +107,14 @@ impl NNDescentParams {
     }
 }
 
-/// Run the NN-Descent algorithm to build a k-NN graph.
+/// From this many features up, the breadth-first forest of a distance with a
+/// code form splits 8-bit codes even without a progressive build: encoding
+/// costs less than it saves (at 128-384 features the forest took 37-53% less
+/// time, with unchanged graph recall).
+pub const CODE_TREE_MIN_DIM: usize = 128;
+
+/// Run the NN-Descent algorithm to build a k-NN graph, initialized from the
+/// leaves of a depth-first RP forest.
 ///
 /// # Arguments
 /// * `data` - Flattened data array (n_points × dim)
@@ -108,27 +133,12 @@ pub fn nn_descent<D: Distance<f32> + Sync>(
     distance: &D,
     params: &NNDescentParams,
     rng: &mut FastRng,
-) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
-    nn_descent_impl(data, n_points, dim, distance, params, rng, true, None, params.n_trees)
+) -> (NeighborHeap, NNDescentStats) {
+    nn_descent_impl(data, n_points, dim, distance, params, rng, None)
 }
 
-/// Like [`nn_descent`], but returns only the first `n_retained` trees. With a batch
-/// width, the forest is built by the hybrid builder, so the graph matches
-/// `nn_descent_graph` with the same width.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn nn_descent_retained<D: Distance<f32> + Sync>(
-    data: &[f32],
-    n_points: usize,
-    dim: usize,
-    distance: &D,
-    params: &NNDescentParams,
-    rng: &mut FastRng,
-    breadth_first_batch_width: Option<usize>,
-    n_retained: usize,
-) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
-    nn_descent_impl(data, n_points, dim, distance, params, rng, true, breadth_first_batch_width, n_retained)
-}
-
+/// Like [`nn_descent`]; with a batch width, the forest is built breadth first
+/// (by the hybrid builder), `breadth_first_batch_width` trees per pass.
 pub(crate) fn nn_descent_graph<D: Distance<f32> + Sync>(
     data: &[f32],
     n_points: usize,
@@ -137,42 +147,8 @@ pub(crate) fn nn_descent_graph<D: Distance<f32> + Sync>(
     params: &NNDescentParams,
     rng: &mut FastRng,
     breadth_first_batch_width: Option<usize>,
-) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
-    nn_descent_impl(
-        data,
-        n_points,
-        dim,
-        distance,
-        params,
-        rng,
-        false,
-        breadth_first_batch_width,
-        0,
-    )
-}
-
-/// Depth-first forest; leaves come from every tree, only the first `n_retained` are kept.
-fn build_retained_rp_forest(
-    data: &[f32],
-    n_points: usize,
-    dim: usize,
-    params: &NNDescentParams,
-    rng: &mut FastRng,
-    n_retained: usize,
-) -> (Vec<FlatTree>, Vec<Vec<i32>>) {
-    let mut forest = build_rp_forest(
-        data,
-        n_points,
-        dim,
-        params.n_trees,
-        params.leaf_size,
-        rng,
-        params.angular,
-        params.max_depth,
-    );
-    let leaf_array = rptree_leaf_array(&forest);
-    forest.truncate(n_retained);
-    (forest, leaf_array)
+) -> (NeighborHeap, NNDescentStats) {
+    nn_descent_impl(data, n_points, dim, distance, params, rng, breadth_first_batch_width)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -183,13 +159,17 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
     distance: &D,
     params: &NNDescentParams,
     rng: &mut FastRng,
-    retain_trees: bool,
     breadth_first_batch_width: Option<usize>,
-    n_retained: usize,
-) -> (NeighborHeap, Vec<FlatTree>, NNDescentStats) {
+) -> (NeighborHeap, NNDescentStats) {
     use std::time::Instant;
 
     let effective_max_candidates = params.max_candidates.min(60).min(params.n_neighbors);
+
+    // A progressive build encodes first: its forest can split the codes.
+    let code_started = Instant::now();
+    let codes = progressive::code_kind(params.progressive, distance, n_points, dim, params.n_neighbors)
+        .map(|kind| progressive::CodePairs::encode(data, dim, kind));
+    let code_seconds = if codes.is_some() { code_started.elapsed().as_secs_f64() } else { 0.0 };
 
     let t_forest_start = Instant::now();
 
@@ -197,27 +177,44 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
         println!("Building RP forest with {} trees...", params.n_trees);
     }
 
-    let (forest, leaf_array) = if retain_trees {
-        #[cfg(feature = "hybrid-forest")]
-        if let Some(batch_width) = breadth_first_batch_width {
-            build_hybrid_forest(
-                data,
-                n_points,
-                dim,
-                params.n_trees,
-                params.leaf_size,
-                rng,
-                params.angular,
-                params.max_depth,
-                batch_width,
-                local_points_for(dim),
-                n_retained,
-            )
-        } else {
-            build_retained_rp_forest(data, n_points, dim, params, rng, n_retained)
+    // The forest splits 8-bit codes: the progressive build's, or (from
+    // CODE_TREE_MIN_DIM features) codes encoded for it alone. Only leaves are
+    // kept, so their splits need no data-space form.
+    #[cfg(feature = "hybrid-forest")]
+    let code_forest = match breadth_first_batch_width.filter(|_| params.code_trees) {
+        Some(batch_width) => {
+            let tree_codes;
+            let forest_codes = match &codes {
+                Some(codes) => Some(codes.codes()),
+                None => match distance.build_code_kind().filter(|_| dim >= CODE_TREE_MIN_DIM) {
+                    Some(kind) => {
+                        tree_codes = AffineCodes::encode_for_build(data, dim, kind);
+                        Some(&tree_codes)
+                    }
+                    None => None,
+                },
+            };
+            forest_codes.map(|forest_codes| {
+                let space = CodeSpace { data, dim, angular: params.angular, codes: forest_codes };
+                build_space_forest(
+                    &space,
+                    n_points,
+                    params.n_trees,
+                    params.leaf_size,
+                    rng,
+                    params.max_depth,
+                    batch_width,
+                    local_points_for_row_bytes(forest_codes.stride()),
+                )
+            })
         }
-        #[cfg(not(feature = "hybrid-forest"))]
-        build_retained_rp_forest(data, n_points, dim, params, rng, n_retained)
+        None => None,
+    };
+    #[cfg(not(feature = "hybrid-forest"))]
+    let code_forest: Option<Vec<Vec<i32>>> = None;
+
+    let leaf_array = if let Some(leaves) = code_forest {
+        leaves
     } else if let Some(batch_width) = breadth_first_batch_width {
         #[cfg(feature = "hybrid-forest")]
         let leaves = build_hybrid_leaf_forest(
@@ -244,9 +241,9 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
             params.max_depth,
             batch_width,
         );
-        (Vec::new(), leaves)
+        leaves
     } else {
-        let leaves = build_rp_leaf_forest(
+        build_rp_leaf_forest(
             data,
             n_points,
             dim,
@@ -255,30 +252,10 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
             rng,
             params.angular,
             params.max_depth,
-        );
-        (Vec::new(), leaves)
+        )
     };
 
     let t_forest = t_forest_start.elapsed();
-
-    // Initialize neighbor graph from tree leaves
-    let mut neighbor_graph = NeighborHeap::new(n_points, params.n_neighbors);
-    let t_init_start = Instant::now();
-
-    if params.verbose {
-        println!("Initializing graph from {} leaves...", leaf_array.len());
-    }
-
-    initialize_from_leaves(&mut neighbor_graph, &leaf_array, data, dim, distance, params.leaf_size);
-
-    let t_init = t_init_start.elapsed();
-
-    if params.verbose {
-        println!(
-            "Running NN-descent for up to {} iterations...",
-            params.n_iters
-        );
-    }
 
     let mut candidate_seconds = Vec::with_capacity(params.n_iters);
     let mut candidate_phases = Vec::with_capacity(params.n_iters);
@@ -289,50 +266,114 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
     let mut actual_iters = 0;
     #[cfg(feature = "candidate-workspace")]
     let mut candidate_workspace = candidates::CandidateWorkspace::default();
+    let threshold = (params.delta * params.n_neighbors as f32 * n_points as f32) as usize;
 
-    // NN-descent iterations
-    for iter in 0..params.n_iters {
-        actual_iters = iter + 1;
+    // One NN-descent iteration on `$graph` with the distances of `$source`;
+    // evaluates to the number of graph changes.
+    macro_rules! iterate {
+        ($graph:expr, $source:expr, $label:expr) => {{
+            actual_iters += 1;
+            // Build candidate sets (separating new from old); this also marks
+            // neighbors that appear in new_candidates as old.
+            let t_cand_start = Instant::now();
+            #[cfg(feature = "candidate-workspace")]
+            let (candidates, phases) = CandidateSets::build_from_graph_reusing(
+                $graph, effective_max_candidates, rng, &mut candidate_workspace,
+            );
+            #[cfg(not(feature = "candidate-workspace"))]
+            let (candidates, phases) =
+                CandidateSets::build_from_graph_profiled($graph, effective_max_candidates, rng);
+            candidate_seconds.push(t_cand_start.elapsed().as_secs_f64());
+            candidate_phases.push(phases);
 
-        // Build candidate sets (separating new from old)
-        // This also marks neighbors that appear in new_candidates as old
-        let t_cand_start = Instant::now();
-        #[cfg(feature = "candidate-workspace")]
-        let (candidates, phases) = CandidateSets::build_from_graph_reusing(
-            &mut neighbor_graph, effective_max_candidates, rng, &mut candidate_workspace,
-        );
-        #[cfg(not(feature = "candidate-workspace"))]
-        let (candidates, phases) =
-            CandidateSets::build_from_graph_profiled(&mut neighbor_graph, effective_max_candidates, rng);
-        candidate_seconds.push(t_cand_start.elapsed().as_secs_f64());
-        candidate_phases.push(phases);
+            let t_upd_start = Instant::now();
+            let (n_changes, generation_seconds, application_seconds) =
+                update_iteration_source($graph, &candidates, $source);
+            update_seconds.push(t_upd_start.elapsed().as_secs_f64());
+            update_generation_seconds.push(generation_seconds);
+            update_application_seconds.push(application_seconds);
+            updates.push(n_changes);
+            #[cfg(feature = "candidate-workspace")]
+            candidate_workspace.recycle(candidates);
 
-        // Generate and apply updates
-        let t_upd_start = Instant::now();
-        let update_result = update_iteration(&mut neighbor_graph, &candidates, data, dim, distance);
-        let (n_changes, generation_seconds, application_seconds) = update_result;
-        update_seconds.push(t_upd_start.elapsed().as_secs_f64());
-        update_generation_seconds.push(generation_seconds);
-        update_application_seconds.push(application_seconds);
-        updates.push(n_changes);
-        #[cfg(feature = "candidate-workspace")]
-        candidate_workspace.recycle(candidates);
-
-        if params.verbose {
-            println!("Iteration {}: {} updates", iter + 1, n_changes);
-        }
-
-        // Check convergence
-        let threshold = (params.delta * params.n_neighbors as f32 * n_points as f32) as usize;
-        if n_changes <= threshold {
             if params.verbose {
-                println!("Converged after {} iterations", iter + 1);
+                println!("Iteration {}{}: {} updates", actual_iters, $label, n_changes);
+            }
+            n_changes
+        }};
+    }
+
+    let exact = FloatPairs { data, dim, distance };
+    let mut approximate_iterations = 0;
+    let mut rescore_seconds = 0.0;
+    let t_init;
+    let mut neighbor_graph = if let Some(codes) = codes {
+        // Leaf join and early iterations on 8-bit codes, with wider heaps.
+        let width = progressive::approximate_width(params.n_neighbors, n_points);
+        if params.verbose {
+            println!(
+                "Progressive build: {:.1} MB of 8-bit codes in {:.2}s; heaps {} wide",
+                codes.storage_bytes() as f64 / 1e6,
+                code_seconds,
+                width,
+            );
+            println!("Initializing graph from {} leaves (sq8)...", leaf_array.len());
+        }
+        let mut approximate = NeighborHeap::new(n_points, width);
+        let t_init_start = Instant::now();
+        initialize_from_leaves_source(&mut approximate, &leaf_array, params.leaf_size, &codes);
+        t_init = t_init_start.elapsed();
+        // Updates on the codes do not measure exact convergence: converging
+        // on them only switches to exact distances.
+        while actual_iters < params.n_iters {
+            approximate_iterations += 1;
+            if iterate!(&mut approximate, &codes, " (sq8)") <= threshold {
+                break;
+            }
+        }
+        drop(codes);
+        let started = Instant::now();
+        let graph = progressive::rescore(
+            &approximate,
+            &exact,
+            params.n_neighbors,
+            &progressive::leaf_order(&leaf_array, n_points),
+        );
+        rescore_seconds = started.elapsed().as_secs_f64();
+        if params.verbose {
+            println!("Re-scored with exact distances in {:.2}s", rescore_seconds);
+        }
+        // The exact graph is new: start the candidate workspace afresh.
+        #[cfg(feature = "candidate-workspace")]
+        {
+            candidate_workspace = candidates::CandidateWorkspace::default();
+        }
+        graph
+    } else {
+        let mut graph = NeighborHeap::new(n_points, params.n_neighbors);
+        let t_init_start = Instant::now();
+        if params.verbose {
+            println!("Initializing graph from {} leaves...", leaf_array.len());
+        }
+        initialize_from_leaves(&mut graph, &leaf_array, data, dim, distance, params.leaf_size);
+        t_init = t_init_start.elapsed();
+        graph
+    };
+
+    if params.verbose {
+        println!(
+            "Running NN-descent for up to {} iterations...",
+            params.n_iters - actual_iters
+        );
+    }
+
+    while actual_iters < params.n_iters {
+        if iterate!(&mut neighbor_graph, &exact, "") <= threshold {
+            if params.verbose {
+                println!("Converged after {} iterations", actual_iters);
             }
             break;
         }
-
-        // Note: Neighbors are marked as old inside CandidateSets::build_from_graph
-        // (only those that appear in new_candidates, matching PyNNDescent behavior)
     }
 
     #[cfg(feature = "candidate-workspace")]
@@ -382,9 +423,12 @@ fn nn_descent_impl<D: Distance<f32> + Sync>(
         update_generation_seconds,
         update_application_seconds,
         updates,
+        code_seconds,
+        approximate_iterations,
+        rescore_seconds,
     };
 
-    (neighbor_graph, forest, stats)
+    (neighbor_graph, stats)
 }
 
 fn leaf_update_capacity(block_size: usize, max_leaf_size: usize, n_threads: usize) -> usize {
@@ -408,10 +452,7 @@ fn initialize_from_leaves<D: Distance<f32> + Sync>(
     distance: &D,
     leaf_size: usize,
 ) {
-    let leaves: Vec<&[i32]> = leaves.iter().flat_map(|leaf| {
-        let valid_len = leaf.iter().position(|&point| point < 0).unwrap_or(leaf.len());
-        leaf[..valid_len].chunks(leaf_size.max(1))
-    }).collect();
+    let leaves = leaf_chunks(leaves, leaf_size);
     let n_points = graph.n_points;
     let n_leaves = leaves.len();
 
@@ -521,31 +562,94 @@ fn initialize_from_leaves<D: Distance<f32> + Sync>(
             })
             .collect();
 
-        // Apply updates in parallel by vertex block (avoid write conflicts)
-        let updates_ref = &updates;
-        (0..n_threads).into_par_iter().for_each(|t| {
-            let v_block_start = t * vertex_block_size;
-            let v_block_end = (v_block_start + vertex_block_size).min(n_points);
+        apply_leaf_updates(graph, &updates, vertex_block_size);
+    }
+}
 
-            // Get mutable access to this thread's vertex block
-            // SAFETY: Each thread writes to disjoint vertex blocks
-            let graph_ptr = graph as *const NeighborHeap as *mut NeighborHeap;
-            let graph_mut = unsafe { &mut *graph_ptr };
+/// The valid points of each leaf, in chunks of at most `leaf_size`.
+fn leaf_chunks(leaves: &[Vec<i32>], leaf_size: usize) -> Vec<&[i32]> {
+    leaves
+        .iter()
+        .flat_map(|leaf| {
+            let valid_len = leaf.iter().position(|&point| point < 0).unwrap_or(leaf.len());
+            leaf[..valid_len].chunks(leaf_size.max(1))
+        })
+        .collect()
+}
 
-            for thread_updates in updates_ref.iter() {
-                for &(p, q, d) in thread_updates {
-                    let p_usize = p as usize;
-                    let q_usize = q as usize;
+/// Push leaf-join updates into both endpoints' rows, in parallel by vertex block.
+fn apply_leaf_updates(graph: &mut NeighborHeap, updates: &[Vec<(i32, i32, f32)>], vertex_block_size: usize) {
+    let n_points = graph.n_points;
+    let n_threads = updates.len();
+    (0..n_threads).into_par_iter().for_each(|t| {
+        let v_block_start = t * vertex_block_size;
+        let v_block_end = (v_block_start + vertex_block_size).min(n_points);
 
-                    if p_usize >= v_block_start && p_usize < v_block_end {
-                        graph_mut.checked_flagged_push(p_usize, q, d, true);
-                    }
-                    if q_usize >= v_block_start && q_usize < v_block_end {
-                        graph_mut.checked_flagged_push(q_usize, p, d, true);
-                    }
+        // SAFETY: Each thread writes to disjoint vertex blocks
+        let graph_ptr = graph as *const NeighborHeap as *mut NeighborHeap;
+        let graph_mut = unsafe { &mut *graph_ptr };
+
+        for thread_updates in updates {
+            for &(p, q, d) in thread_updates {
+                let p_usize = p as usize;
+                let q_usize = q as usize;
+
+                if p_usize >= v_block_start && p_usize < v_block_end {
+                    graph_mut.checked_flagged_push(p_usize, q, d, true);
+                }
+                if q_usize >= v_block_start && q_usize < v_block_end {
+                    graph_mut.checked_flagged_push(q_usize, p, d, true);
                 }
             }
-        });
+        }
+    });
+}
+
+/// Initialize the neighbor graph from RP tree leaves with the distances of
+/// `source` (all pairs of each leaf, as [`initialize_from_leaves`] does).
+pub(crate) fn initialize_from_leaves_source<S: PairSource>(
+    graph: &mut NeighborHeap,
+    leaves: &[Vec<i32>],
+    leaf_size: usize,
+    source: &S,
+) {
+    let leaves = leaf_chunks(leaves, leaf_size);
+    let n_points = graph.n_points;
+    let n_threads = rayon::current_num_threads();
+    let block_size = (n_threads * 64).max(128);
+    let max_leaf_size = leaves.iter().map(|leaf| leaf.len()).max().unwrap_or(0);
+    let updates_per_thread = leaf_update_capacity(block_size, max_leaf_size, n_threads);
+    let vertex_block_size = n_points.div_ceil(n_threads).max(1);
+    for leaf_block in leaves.chunks(block_size) {
+        let graph_ref = &*graph;
+        let leaves_per_thread = leaf_block.len().div_ceil(n_threads);
+        let updates: Vec<Vec<(i32, i32, f32)>> = (0..n_threads)
+            .into_par_iter()
+            .map(|t| {
+                let mut thread_updates = Vec::with_capacity(updates_per_thread);
+                let start = (t * leaves_per_thread).min(leaf_block.len());
+                let end = (start + leaves_per_thread).min(leaf_block.len());
+                let mine = &leaf_block[start..end];
+                if let Some(first) = mine.first() {
+                    source.prefetch_points(first);
+                }
+                for (position, leaf) in mine.iter().enumerate() {
+                    if let Some(next) = mine.get(position + 1) {
+                        source.prefetch_points(next);
+                    }
+                    for (offset, &point) in leaf.iter().enumerate() {
+                        let point_threshold = graph_ref.max_distance(point as usize);
+                        source.distances(point, &leaf[offset + 1..], false, |_, neighbor, value| {
+                            if value < point_threshold.max(graph_ref.max_distance(neighbor as usize)) {
+                                thread_updates.push((point, neighbor, value));
+                            }
+                        });
+                    }
+                }
+                thread_updates
+            })
+            .collect();
+        apply_leaf_updates(graph, &updates, vertex_block_size);
     }
 }
 
@@ -701,6 +805,45 @@ impl UpdateRecord for CandidateRefUpdate {
     }
 }
 
+/// Distances between points for NN-descent's local joins: exact float
+/// distances ([`FloatPairs`]) or approximate ones from codes (see
+/// [`progressive`]).
+pub(crate) trait PairSource: Sync {
+    /// Call `apply(slot, neighbor, distance)` for each of `candidates`, skipping
+    /// negative entries (and `point` itself with `skip_self`); `slot` is the
+    /// candidate's position.
+    fn distances(&self, point: i32, candidates: &[i32], skip_self: bool, apply: impl FnMut(usize, i32, f32));
+
+    /// Hint that `hub`'s candidates are joined next.
+    #[inline(always)]
+    fn prefetch_hub(&self, _candidates: &CandidateSets, _hub: usize, _graph: &NeighborHeap) {}
+
+    /// Hint that `points` are joined (all pairs) next.
+    #[inline(always)]
+    fn prefetch_points(&self, _points: &[i32]) {}
+}
+
+/// Exact distances between rows of the data.
+pub(crate) struct FloatPairs<'a, D> {
+    pub data: &'a [f32],
+    pub dim: usize,
+    pub distance: &'a D,
+}
+
+impl<D: Distance<f32> + Sync> PairSource for FloatPairs<'_, D> {
+    #[inline(always)]
+    fn distances(&self, point: i32, candidates: &[i32], skip_self: bool, apply: impl FnMut(usize, i32, f32)) {
+        candidate_distances(point, candidates, skip_self, self.data, self.dim, self.distance, apply);
+    }
+
+    #[inline(always)]
+    fn prefetch_hub(&self, candidates: &CandidateSets, hub: usize, graph: &NeighborHeap) {
+        if cfg!(feature = "generation-prefetch") && self.dim <= GENERATION_PREFETCH_MAX_DIM {
+            prefetch_hub(candidates, hub, self.data, self.dim, graph);
+        }
+    }
+}
+
 #[inline(always)]
 fn candidate_distances<D: Distance<f32>>(
     point: i32,
@@ -754,6 +897,7 @@ fn candidate_distances<D: Distance<f32>>(
 ///
 /// This avoids the per-point Vec allocation of the previous approach, which
 /// created n_points separate allocations per iteration.
+#[allow(dead_code)]
 fn update_iteration<D: Distance<f32> + Sync>(
     graph: &mut NeighborHeap,
     candidates: &CandidateSets,
@@ -761,13 +905,23 @@ fn update_iteration<D: Distance<f32> + Sync>(
     dim: usize,
     distance: &D,
 ) -> (usize, f64, f64) {
-    #[cfg(feature = "packed-updates")]
-    if CandidateRefUpdate::supports(UPDATE_BLOCK_SIZE, candidates.max_candidates) {
-        return update_iteration_with::<D, CandidateRefUpdate>(graph, candidates, data, dim, distance);
-    }
-    update_iteration_with::<D, PotentialUpdate>(graph, candidates, data, dim, distance)
+    update_iteration_source(graph, candidates, &FloatPairs { data, dim, distance })
 }
 
+/// [`update_iteration`] with the distances of `source`.
+pub(crate) fn update_iteration_source<S: PairSource>(
+    graph: &mut NeighborHeap,
+    candidates: &CandidateSets,
+    source: &S,
+) -> (usize, f64, f64) {
+    #[cfg(feature = "packed-updates")]
+    if CandidateRefUpdate::supports(UPDATE_BLOCK_SIZE, candidates.max_candidates) {
+        return update_iteration_observed_source::<S, CandidateRefUpdate>(graph, candidates, source, |_, _| {});
+    }
+    update_iteration_observed_source::<S, PotentialUpdate>(graph, candidates, source, |_, _| {})
+}
+
+#[allow(dead_code)]
 fn update_iteration_with<D: Distance<f32> + Sync, Record: UpdateRecord>(
     graph: &mut NeighborHeap,
     candidates: &CandidateSets,
@@ -778,12 +932,22 @@ fn update_iteration_with<D: Distance<f32> + Sync, Record: UpdateRecord>(
     update_iteration_observed::<D, Record>(graph, candidates, data, dim, distance, |_, _| {})
 }
 
+#[allow(dead_code)]
 fn update_iteration_observed<D: Distance<f32> + Sync, Record: UpdateRecord>(
     graph: &mut NeighborHeap,
     candidates: &CandidateSets,
     data: &[f32],
     dim: usize,
     distance: &D,
+    observe: impl FnMut(&[Vec<Vec<Record>>], usize),
+) -> (usize, f64, f64) {
+    update_iteration_observed_source::<_, Record>(graph, candidates, &FloatPairs { data, dim, distance }, observe)
+}
+
+fn update_iteration_observed_source<S: PairSource, Record: UpdateRecord>(
+    graph: &mut NeighborHeap,
+    candidates: &CandidateSets,
+    source: &S,
     mut observe: impl FnMut(&[Vec<Vec<Record>>], usize),
 ) -> (usize, f64, f64) {
     use std::time::Instant;
@@ -847,14 +1011,13 @@ fn update_iteration_observed<D: Distance<f32> + Sync, Record: UpdateRecord>(
 
         // Generate updates and bucket by destination vertex block
         let generation_started = Instant::now();
-        let prefetch_hubs = cfg!(feature = "generation-prefetch") && dim <= GENERATION_PREFETCH_MAX_DIM;
         thread_buckets.par_iter_mut().enumerate().for_each(|(t, local_buckets)| {
             let row_start = block_start + t * rows_per_thread;
             let row_end = (row_start + rows_per_thread).min(block_end);
 
             for i in row_start..row_end {
-                if prefetch_hubs && i + 1 < row_end {
-                    prefetch_hub(candidates, i + 1, data, dim, graph);
+                if i + 1 < row_end {
+                    source.prefetch_hub(candidates, i + 1, graph);
                 }
                 let new_cands = candidates.get_new(i);
                 let old_cands = candidates.get_old(i);
@@ -864,67 +1027,20 @@ fn update_iteration_observed<D: Distance<f32> + Sync, Record: UpdateRecord>(
                     if p < 0 {
                         continue;
                     }
-                    let p_usize = p as usize;
-                    let data_p = &data[p_usize * dim..(p_usize + 1) * dim];
-                    let thresh_p = graph.max_distance(p_usize);
-
-                    if D::USE_DISTANCE_FOUR && dim >= 32 {
-                        for (neighbors, slot_base, skip_self) in
-                            [(&new_cands[j + 1..], j + 1, false), (old_cands, 0, true)]
-                        {
-                            candidate_distances(
-                                p, neighbors, skip_self, data, dim, distance,
-                                |slot, neighbor, value| {
-                                    let neighbor_index = neighbor as usize;
-                                    if value <= thresh_p.max(graph.max_distance(neighbor_index)) {
-                                        bucket_update(local_buckets, PotentialUpdate {
-                                            point: p,
-                                            neighbor,
-                                            distance: value,
-                                        }, i - block_start, j, slot_base + slot, skip_self, vertex_block_size);
-                                    }
-                                },
-                            );
-                        }
-                        continue;
-                    }
-
-                    for k in (j + 1)..max_candidates {
-                        let q = new_cands[k];
-                        if q < 0 {
-                            continue;
-                        }
-                        let q_usize = q as usize;
-                        let max_thresh = thresh_p.max(graph.max_distance(q_usize));
-                        let d =
-                            distance.distance(data_p, &data[q_usize * dim..(q_usize + 1) * dim]);
-
-                        if d <= max_thresh {
-                            bucket_update(local_buckets, PotentialUpdate {
-                                point: p,
-                                neighbor: q,
-                                distance: d,
-                            }, i - block_start, j, k, false, vertex_block_size);
-                        }
-                    }
-
-                    for k in 0..max_candidates {
-                        let q = old_cands[k];
-                        if q < 0 || p == q {
-                            continue;
-                        }
-                        let q_usize = q as usize;
-                        let max_thresh = thresh_p.max(graph.max_distance(q_usize));
-                        let d =
-                            distance.distance(data_p, &data[q_usize * dim..(q_usize + 1) * dim]);
-
-                        if d <= max_thresh {
-                            bucket_update(local_buckets, PotentialUpdate {
-                                point: p,
-                                neighbor: q,
-                                distance: d,
-                            }, i - block_start, j, k, true, vertex_block_size);
-                        }
+                    let thresh_p = graph.max_distance(p as usize);
+                    for (neighbors, slot_base, skip_self) in
+                        [(&new_cands[j + 1..], j + 1, false), (old_cands, 0, true)]
+                    {
+                        source.distances(p, neighbors, skip_self, |slot, neighbor, value| {
+                            let neighbor_index = neighbor as usize;
+                            if value <= thresh_p.max(graph.max_distance(neighbor_index)) {
+                                bucket_update(local_buckets, PotentialUpdate {
+                                    point: p,
+                                    neighbor,
+                                    distance: value,
+                                }, i - block_start, j, slot_base + slot, skip_self, vertex_block_size);
+                            }
+                        });
                     }
                 }
             }
@@ -1460,13 +1576,15 @@ mod tests {
                 let params = NNDescentParams {
                     n_neighbors: degree, n_trees: 2, leaf_size: 20, max_candidates: degree,
                     n_iters: 5, delta: 0.001, angular, max_depth: 100, verbose: false,
+                    progressive: ProgressiveBuild::Never,
+                    code_trees: true,
                 };
                 for threads in [1, 4] {
                     rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| {
-                        let (expected, _, expected_stats) = nn_descent(
+                        let (expected, expected_stats) = nn_descent(
                             &data, 128, dimension, &Individual(distance.clone()), &params, &mut FastRng::new(42),
                         );
-                        let (actual, _, actual_stats) = nn_descent(
+                        let (actual, actual_stats) = nn_descent(
                             &data, 128, dimension, &distance, &params, &mut FastRng::new(42),
                         );
                         assert_eq!(actual.indices, expected.indices);
@@ -1508,10 +1626,11 @@ mod tests {
             angular: false,
             max_depth: 100,
             verbose: false,
+            progressive: ProgressiveBuild::Never,
+            code_trees: true,
         };
 
-        let (graph, _forest, _stats) =
-            nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
+        let (graph, _stats) = nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
 
         // Check that each point has neighbors
         for point in 0..n_points {
@@ -1540,7 +1659,7 @@ mod tests {
 
         let params = NNDescentParams::new(5);
 
-        let (graph, _, _) = nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
+        let (graph, _) = nn_descent(&data, n_points, dim, &distance, &params, &mut rng);
 
         // No point should have itself as a neighbor
         for point in 0..n_points {

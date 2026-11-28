@@ -16,11 +16,11 @@ struct FrontierNode {
 }
 
 #[derive(Debug)]
-pub(super) struct Split {
-    pub(super) hyperplane: Vec<f32>,
-    pub(super) offset: f32,
+pub(crate) struct Split {
+    pub(crate) hyperplane: Vec<f32>,
+    pub(crate) offset: f32,
     /// Seed for breaking margin ties (the seed that produced this split).
-    pub(super) tie_seed: u64,
+    pub(crate) tie_seed: u64,
 }
 
 struct TreeState {
@@ -290,10 +290,10 @@ unsafe fn batched_dot_products_avx2(
     sums
 }
 
-const SPLIT_ATTEMPTS: u64 = 8;
+pub(super) const SPLIT_ATTEMPTS: u64 = 8;
 
 #[inline]
-fn attempt_seed(seed: u64, attempt: u64) -> u64 {
+pub(super) fn attempt_seed(seed: u64, attempt: u64) -> u64 {
     if attempt == 0 { seed } else { mix64(seed ^ attempt.wrapping_mul(0x9e3779b97f4a7c15)) }
 }
 

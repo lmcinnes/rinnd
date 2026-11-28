@@ -4,9 +4,13 @@
 //!   forest = depth | bfs<W> (breadth-first, batch width W in 1..=8)
 //! Candidate construction follows the build's features; with `blocked-candidates`,
 //! RINND_BLOCKED_CANDIDATES=0 selects the original algorithm at runtime.
+//! RINND_PROGRESSIVE=auto|1|0 sets whether early phases run on 8-bit codes
+//! (default auto); RINND_CODE_TREES=1|0 whether the forest splits 8-bit codes
+//! (default 1); RINND_N_TREES the forest size (default the builder's).
 
 use rinnd_core::distance::SquaredEuclidean;
 use rinnd_core::index::NNDescentBuilder;
+use rinnd_core::ProgressiveBuild;
 use std::time::Instant;
 
 fn main() {
@@ -24,7 +28,21 @@ fn main() {
     let data: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     assert_eq!(data.len(), n * dim);
 
-    let mut builder = NNDescentBuilder::new(&data, n, dim).n_neighbors(k).random_seed(seed);
+    let progressive = match std::env::var("RINND_PROGRESSIVE").as_deref() {
+        Ok("1") => ProgressiveBuild::Always,
+        Ok("0") => ProgressiveBuild::Never,
+        Ok("auto") | Err(_) => ProgressiveBuild::Auto,
+        Ok(other) => panic!("RINND_PROGRESSIVE must be auto, 1 or 0, not {other}"),
+    };
+    let code_trees = std::env::var("RINND_CODE_TREES").map_or(true, |value| value != "0");
+    let mut builder = NNDescentBuilder::new(&data, n, dim)
+        .n_neighbors(k)
+        .random_seed(seed)
+        .progressive_build(progressive)
+        .code_trees(code_trees);
+    if let Ok(trees) = std::env::var("RINND_N_TREES") {
+        builder = builder.n_trees(trees.parse().expect("RINND_N_TREES must be an integer"));
+    }
     builder = match forest {
         "depth" => builder.depth_first_tree_build(),
         f if f.starts_with("bfs") => builder.breadth_first_tree_batch_width(f[3..].parse().unwrap()),
@@ -42,11 +60,13 @@ fn main() {
     println!(
         "{{\"forest_mode\":\"{}\",\"cand_mode\":\"{}\",\"n\":{},\"dim\":{},\"k\":{},\"seed\":{},\"wall\":{:.4},\
 \"forest\":{:.4},\"leaf_init\":{:.4},\"candidates\":{:.4},\"cand_init\":{:.4},\"cand_forward\":{:.4},\"cand_reverse\":{:.4},\
-\"cand_mark\":{:.4},\"generation\":{:.4},\"application\":{:.4},\"iters\":{},\"updates\":{:?}}}",
+\"cand_mark\":{:.4},\"generation\":{:.4},\"application\":{:.4},\"iters\":{},\"updates\":{:?},\
+\"progressive\":\"{:?}\",\"code_trees\":{},\"code\":{:.4},\"approx_iters\":{},\"rescore\":{:.4},\"generation_per_iter\":{:?}}}",
         forest, std::env::var("RINND_BLOCKED_CANDIDATES").unwrap_or_else(|_| "default".into()),
         n, dim, k, seed, wall, s.forest_seconds, s.leaf_initialization_seconds, sum(&s.candidate_seconds),
         phase(|p| p.initialization_seconds), phase(|p| p.forward_seconds), phase(|p| p.reverse_seconds),
         phase(|p| p.mark_seconds), sum(&s.update_generation_seconds), sum(&s.update_application_seconds),
-        s.updates.len(), s.updates,
+        s.updates.len(), s.updates, progressive, code_trees, s.code_seconds, s.approximate_iterations, s.rescore_seconds,
+        s.update_generation_seconds.iter().map(|t| (t * 100.0).round() / 100.0).collect::<Vec<_>>(),
     );
 }

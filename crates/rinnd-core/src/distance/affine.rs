@@ -351,16 +351,41 @@ impl AffineCodes {
         clip_quantile: Option<f32>,
     ) -> Self {
         assert!(dim > 0 && dim <= row_stride && data.len() % row_stride == 0);
-        assert!(bits == 8 || bits == 4, "codes have 8 or 4 bits");
-        let n_rows = data.len() / row_stride;
-        let levels = ((1u32 << bits) - 1) as f32;
         let (low, high) = match clip_quantile {
             Some(q) if q > 0.0 => clipped_ranges(data, row_stride, dim, q),
             _ => full_ranges(data, row_stride, dim),
         };
+        Self::encode_ranges(data, row_stride, dim, kind, bits, &low, &high)
+    }
+
+    /// 8-bit codes of `data` (`dim` values per row) for building a k-NN graph:
+    /// each feature's codes span its full range, except for features with
+    /// outliers (a full range over [`BUILD_CLIP_RATIO`] times the range between
+    /// the [`BUILD_CLIP_QUANTILE`] quantiles), which span those quantiles. A few
+    /// extreme values would otherwise squeeze nearly every row into a handful of
+    /// codes; genuine tails are kept, as clamping them costs recall.
+    pub(crate) fn encode_for_build(data: &[f32], dim: usize, kind: AffineKind) -> Self {
+        assert!(dim > 0 && data.len() % dim == 0);
+        let (low, high) = outlier_clipped_ranges(data, dim, dim);
+        Self::encode_ranges(data, dim, dim, kind, 8, &low, &high)
+    }
+
+    fn encode_ranges(
+        data: &[f32],
+        row_stride: usize,
+        dim: usize,
+        kind: AffineKind,
+        bits: u32,
+        low: &[f32],
+        high: &[f32],
+    ) -> Self {
+        use rayon::prelude::*;
+        assert!(bits == 8 || bits == 4, "codes have 8 or 4 bits");
+        let n_rows = data.len() / row_stride;
+        let levels = ((1u32 << bits) - 1) as f32;
         let scales: Vec<f32> = low
             .iter()
-            .zip(&high)
+            .zip(high)
             .map(|(&lo, &hi)| {
                 let scale = (hi - lo) / levels;
                 if scale > 0.0 && scale.is_finite() {
@@ -377,36 +402,55 @@ impl AffineCodes {
         let stride = code_bytes.div_ceil(LINE) * LINE;
         let halves = if bits == 8 { 1 } else { 2 };
         let mut codes = AlignedBytes::zeroed(n_rows * stride);
-        let mut sums = vec![0.0f64; halves * stride];
-        let mut norms = Vec::new();
-        if kind == AffineKind::SquaredEuclidean {
-            norms.resize(n_rows, 0.0);
-        }
         let squares: Vec<f32> = scales.iter().map(|&s| s * s).collect();
-        {
-            let buffer = codes.as_mut_slice();
-            for (row_index, row) in data.chunks_exact(row_stride).enumerate() {
-                let out = &mut buffer[row_index * stride..(row_index + 1) * stride];
+        let row_norms: Vec<f32> = codes
+            .as_mut_slice()
+            .par_chunks_mut(stride)
+            .zip(data.par_chunks_exact(row_stride))
+            .with_min_len(256)
+            .map(|(out, row)| {
+                if bits == 8 {
+                    return encode_row_u8(&row[..dim], &offsets, &inverse, &squares, &mut out[..dim]);
+                }
                 let mut norm = 0.0f32;
                 for (j, &value) in row[..dim].iter().enumerate() {
-                    let code = ((value - offsets[j]) * inverse[j]).round().clamp(0.0, levels);
+                    let code = ((value - offsets[j]) * inverse[j]).clamp(0.0, levels);
+                    let code = (code + 0.5) as i32 as f32;
                     norm += squares[j] * code * code;
-                    let code = code as u8;
+                    out[j >> 1] |= (code as u8) << (4 * (j & 1));
+                }
+                norm
+            })
+            .collect();
+        let norms = if kind == AffineKind::SquaredEuclidean { row_norms } else { Vec::new() };
+        // Mean code at each (nibble, byte) position, from exact integer sums.
+        let width = halves * stride;
+        let sums = codes
+            .as_slice()
+            .par_chunks(stride)
+            .with_min_len(256)
+            .fold(
+                || vec![0u64; width],
+                |mut sums, row| {
                     if bits == 8 {
-                        out[j] = code;
-                        sums[j] += f64::from(code);
+                        add_codes(&mut sums, row);
                     } else {
-                        let (half, byte) = (j & 1, j >> 1);
-                        out[byte] |= code << (4 * half);
-                        sums[half * stride + byte] += f64::from(code);
+                        for (byte, &code) in row.iter().enumerate() {
+                            sums[byte] += u64::from(code & 15);
+                            sums[stride + byte] += u64::from(code >> 4);
+                        }
                     }
-                }
-                if !norms.is_empty() {
-                    norms[row_index] = norm;
-                }
-            }
-        }
-        let means = sums.iter().map(|&sum| (sum / n_rows.max(1) as f64) as f32).collect();
+                    sums
+                },
+            )
+            .reduce(
+                || vec![0u64; width],
+                |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                    a
+                },
+            );
+        let means = sums.iter().map(|&sum| (sum as f64 / n_rows.max(1) as f64) as f32).collect();
         Self {
             codes,
             stride,
@@ -420,6 +464,74 @@ impl AffineCodes {
             kind,
             kernel: Kernel::detect(),
         }
+    }
+
+    /// Each coded row of `data` (`dim` values per row) prepared as a query
+    /// against these 8-bit codes, as [`Self::prepare_query`] prepares one, after
+    /// clamping it to the code range (an out-of-range value would otherwise set
+    /// the int8 step and round every other weight of the row to zero). Returns
+    /// the int8 weights, in rows of [`Self::stride`] bytes, and a record per row
+    /// that also holds the row's code norm, so that the distance between rows
+    /// `p` and `q` is `offset_p + scale_p <w_p, c_q> + norm_q`.
+    pub(crate) fn row_queries(&self, data: &[f32]) -> (AlignedBytes, Vec<RowQuery>) {
+        use rayon::prelude::*;
+        assert_eq!(self.bits, 8, "row queries need 8-bit codes");
+        assert_eq!(data.len(), self.n_rows * self.dim);
+        let (dim, stride) = (self.dim, self.stride);
+        let high: Vec<f32> = self
+            .offsets
+            .iter()
+            .zip(&self.scales)
+            .map(|(&offset, &scale)| offset + 255.0 * scale)
+            .collect();
+        let mut weights = AlignedBytes::zeroed(self.n_rows * stride);
+        let mut records = vec![RowQuery::default(); self.n_rows];
+        weights
+            .as_mut_i8_slice()
+            .par_chunks_mut(stride)
+            .zip(data.par_chunks_exact(dim))
+            .zip(records.par_iter_mut())
+            .enumerate()
+            .with_min_len(256)
+            .for_each_init(
+                || vec![0.0f32; dim],
+                |u, (index, ((weights, row), record))| {
+                    let squared_euclidean = self.kind == AffineKind::SquaredEuclidean;
+                    let (total, correction, step) = row_query_weights_i8(
+                        row,
+                        &self.offsets,
+                        &self.scales,
+                        &high,
+                        &self.means[..dim],
+                        squared_euclidean,
+                        u,
+                        &mut weights[..dim],
+                    );
+                    let (offset, scale) = if self.kind == AffineKind::SquaredEuclidean {
+                        (total + 2.0 * correction, -2.0 * step)
+                    } else {
+                        (1.0 - total + correction, -step)
+                    };
+                    let norm = self.norms.get(index).copied().unwrap_or(0.0);
+                    *record = RowQuery { norm, offset, scale, _pad: 0.0 };
+                },
+            );
+        (weights, records)
+    }
+
+    /// The code dot product kernel.
+    pub(crate) fn kernel(&self) -> Kernel {
+        self.kernel
+    }
+
+    /// Each feature's value at code 0.
+    pub(crate) fn offsets(&self) -> &[f32] {
+        &self.offsets
+    }
+
+    /// Each feature's value per code step.
+    pub(crate) fn scales(&self) -> &[f32] {
+        &self.scales
     }
 
     /// The approximated distance.
@@ -563,41 +675,336 @@ impl AffineCodes {
     }
 }
 
+/// Lanes of the row kernels below: elementwise work over 16-value chunks and
+/// sums in 16 independent accumulators vectorize (a single running sum, a
+/// serial chain, would not). So that they vectorize, the kernels also clamp by
+/// comparison (`f32::max` and `f32::min` handle NaN by branching) and round with
+/// [`ROUND_MAGIC`] (`f32::round` is a libm call on baseline x86-64, and an `as`
+/// cast to an integer saturates element by element).
+const ROW_LANES: usize = 16;
+
+/// `1.5 * 2^23`: for `|v| < 2^22`, `v + ROUND_MAGIC` is rounded (half to even)
+/// to an integer whose low bits are those of the float's bits, and subtracting
+/// `ROUND_MAGIC` again gives the rounded value.
+const ROUND_MAGIC: f32 = 12_582_912.0;
+
+/// `v` clamped to `low..=high`; NaN becomes `low`.
+#[inline(always)]
+fn clamp_select(v: f32, low: f32, high: f32) -> f32 {
+    let v = if v > low { v } else { low };
+    if v < high {
+        v
+    } else {
+        high
+    }
+}
+
+/// 8-bit codes of `row` into `out` (rounded half up); returns `|scale * c|^2`.
+fn encode_row_u8(row: &[f32], offsets: &[f32], inverse: &[f32], squares: &[f32], out: &mut [u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: AVX2 and FMA are available.
+        return unsafe { encode_row_u8_avx2(row, offsets, inverse, squares, out) };
+    }
+    encode_row_u8_body(row, offsets, inverse, squares, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn encode_row_u8_avx2(row: &[f32], offsets: &[f32], inverse: &[f32], squares: &[f32], out: &mut [u8]) -> f32 {
+    encode_row_u8_body(row, offsets, inverse, squares, out)
+}
+
+#[inline(always)]
+fn encode_row_u8_body(row: &[f32], offsets: &[f32], inverse: &[f32], squares: &[f32], out: &mut [u8]) -> f32 {
+    let mut lanes = [0.0f32; ROW_LANES];
+    let whole = row.len() / ROW_LANES * ROW_LANES;
+    for start in (0..whole).step_by(ROW_LANES) {
+        let end = start + ROW_LANES;
+        let (row, offsets, inverse) = (&row[start..end], &offsets[start..end], &inverse[start..end]);
+        let (squares, out) = (&squares[start..end], &mut out[start..end]);
+        for t in 0..ROW_LANES {
+            let (code, rounded) = code_u8(row[t], offsets[t], inverse[t]);
+            out[t] = code;
+            lanes[t] += squares[t] * rounded * rounded;
+        }
+    }
+    let mut norm: f32 = lanes.iter().sum();
+    for j in whole..row.len() {
+        let (code, rounded) = code_u8(row[j], offsets[j], inverse[j]);
+        out[j] = code;
+        norm += squares[j] * rounded * rounded;
+    }
+    norm
+}
+
+/// The 8-bit code of `x`, as a byte and a float.
+#[inline(always)]
+fn code_u8(x: f32, offset: f32, inverse: f32) -> (u8, f32) {
+    let shifted = clamp_select((x - offset) * inverse, 0.0, 255.0) + ROUND_MAGIC;
+    (shifted.to_bits() as u8, shifted - ROUND_MAGIC)
+}
+
+/// `row` as int8 query `weights` for 8-bit codes, via [`row_query_u8`] and
+/// [`round_weights_i8`] (`u` is scratch); returns the data term, the rounding
+/// correction and the weight step.
+#[allow(clippy::too_many_arguments)]
+fn row_query_weights_i8(
+    row: &[f32],
+    offsets: &[f32],
+    scales: &[f32],
+    high: &[f32],
+    means: &[f32],
+    squared_euclidean: bool,
+    u: &mut [f32],
+    weights: &mut [i8],
+) -> (f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: AVX2 and FMA are available.
+        return unsafe { row_query_weights_i8_avx2(row, offsets, scales, high, means, squared_euclidean, u, weights) };
+    }
+    row_query_weights_i8_body(row, offsets, scales, high, means, squared_euclidean, u, weights)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_query_weights_i8_avx2(
+    row: &[f32],
+    offsets: &[f32],
+    scales: &[f32],
+    high: &[f32],
+    means: &[f32],
+    squared_euclidean: bool,
+    u: &mut [f32],
+    weights: &mut [i8],
+) -> (f32, f32, f32) {
+    row_query_weights_i8_body(row, offsets, scales, high, means, squared_euclidean, u, weights)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn row_query_weights_i8_body(
+    row: &[f32],
+    offsets: &[f32],
+    scales: &[f32],
+    high: &[f32],
+    means: &[f32],
+    squared_euclidean: bool,
+    u: &mut [f32],
+    weights: &mut [i8],
+) -> (f32, f32, f32) {
+    let (total, max_abs) = row_query_u8(row, offsets, scales, high, squared_euclidean, u);
+    let step = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+    (total, round_weights_i8(u, step, means, weights), step)
+}
+
+/// `row` (clamped to `offsets..=high`) as unrounded query weights `u` for
+/// 8-bit codes; returns the query constant's data term (`|x - offset|^2`, or
+/// `<x, offset>` for dot codes) and `max |u|`.
+#[inline(always)]
+fn row_query_u8(
+    row: &[f32],
+    offsets: &[f32],
+    scales: &[f32],
+    high: &[f32],
+    squared_euclidean: bool,
+    u: &mut [f32],
+) -> (f32, f32) {
+    let mut totals = [0.0f32; ROW_LANES];
+    let mut maxima = [0.0f32; ROW_LANES];
+    let whole = row.len() / ROW_LANES * ROW_LANES;
+    let one = |x: f32, offset: f32, scale: f32, high: f32, u: &mut f32, total: &mut f32, max: &mut f32| {
+        let x = clamp_select(x, offset, high);
+        let (term, weight) = if squared_euclidean {
+            let e = x - offset;
+            (e * e, e * scale)
+        } else {
+            (x * offset, x * scale)
+        };
+        *total += term;
+        *u = weight;
+        let magnitude = weight.abs();
+        *max = if magnitude > *max { magnitude } else { *max };
+    };
+    for start in (0..whole).step_by(ROW_LANES) {
+        let end = start + ROW_LANES;
+        let (row, offsets, scales) = (&row[start..end], &offsets[start..end], &scales[start..end]);
+        let (high, u) = (&high[start..end], &mut u[start..end]);
+        for t in 0..ROW_LANES {
+            one(row[t], offsets[t], scales[t], high[t], &mut u[t], &mut totals[t], &mut maxima[t]);
+        }
+    }
+    let (mut total, mut max) = (0.0f32, 0.0f32);
+    for j in whole..row.len() {
+        one(row[j], offsets[j], scales[j], high[j], &mut u[j], &mut total, &mut max);
+    }
+    (total + totals.iter().sum::<f32>(), maxima.iter().fold(max, |m, &v| m.max(v)))
+}
+
+/// Round `u / step` to int8 `weights` (half to even, clamped to +-127);
+/// returns the rounding's expected effect `sum_j (step w_j - u_j) mean_j`.
+#[inline(always)]
+fn round_weights_i8(u: &[f32], step: f32, means: &[f32], weights: &mut [i8]) -> f32 {
+    let inverse = step.recip();
+    let round = |u: f32| {
+        let shifted = clamp_select(u * inverse, -127.0, 127.0) + ROUND_MAGIC;
+        (shifted.to_bits() as i8, shifted - ROUND_MAGIC)
+    };
+    let mut lanes = [0.0f32; ROW_LANES];
+    let whole = u.len() / ROW_LANES * ROW_LANES;
+    for start in (0..whole).step_by(ROW_LANES) {
+        let end = start + ROW_LANES;
+        let (u, means, weights) = (&u[start..end], &means[start..end], &mut weights[start..end]);
+        for t in 0..ROW_LANES {
+            let (weight, rounded) = round(u[t]);
+            weights[t] = weight;
+            lanes[t] += (step * rounded - u[t]) * means[t];
+        }
+    }
+    let mut correction: f32 = lanes.iter().sum();
+    for j in whole..u.len() {
+        let (weight, rounded) = round(u[j]);
+        weights[j] = weight;
+        correction += (step * rounded - u[j]) * means[j];
+    }
+    correction
+}
+
+/// `u * inverse` rounded (half to even, clamped to +-127) to int8 `weights`.
+pub(crate) fn quantize_i8(u: &[f32], inverse: f32, weights: &mut [i8]) {
+    for (weight, &value) in weights.iter_mut().zip(u) {
+        *weight = (clamp_select(value * inverse, -127.0, 127.0) + ROUND_MAGIC).to_bits() as i8;
+    }
+}
+
+/// Add each code byte of `row` to its running sum.
+fn add_codes(sums: &mut [u64], row: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: AVX2 is available.
+        return unsafe { add_codes_avx2(sums, row) };
+    }
+    add_codes_body(sums, row)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn add_codes_avx2(sums: &mut [u64], row: &[u8]) {
+    add_codes_body(sums, row)
+}
+
+#[inline(always)]
+fn add_codes_body(sums: &mut [u64], row: &[u8]) {
+    sums.iter_mut().zip(row).for_each(|(sum, &code)| *sum += u64::from(code));
+}
+
 fn full_ranges(data: &[f32], row_stride: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut low = vec![f32::INFINITY; dim];
-    let mut high = vec![f32::NEG_INFINITY; dim];
-    for row in data.chunks_exact(row_stride) {
-        for ((lo, hi), &value) in low.iter_mut().zip(high.iter_mut()).zip(&row[..dim]) {
-            *lo = lo.min(value);
-            *hi = hi.max(value);
+    use rayon::prelude::*;
+    let empty = || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]);
+    data.par_chunks_exact(row_stride)
+        .with_min_len(1024)
+        .fold(empty, |(mut low, mut high), row| {
+            for ((lo, hi), &value) in low.iter_mut().zip(high.iter_mut()).zip(&row[..dim]) {
+                *lo = lo.min(value);
+                *hi = hi.max(value);
+            }
+            (low, high)
+        })
+        .reduce(empty, |(mut low, mut high), (other_low, other_high)| {
+            low.iter_mut().zip(other_low).for_each(|(lo, other)| *lo = lo.min(other));
+            high.iter_mut().zip(other_high).for_each(|(hi, other)| *hi = hi.max(other));
+            (low, high)
+        })
+}
+
+/// Per-feature `q` and `1 - q` quantiles of (an evenly spaced sample of) the rows.
+fn clipped_ranges(data: &[f32], row_stride: usize, dim: usize, q: f32) -> (Vec<f32>, Vec<f32>) {
+    quantile_ranges(data, row_stride, dim, q, CLIP_SAMPLE_ROWS)
+}
+
+/// Per-feature `q` and `1 - q` quantiles of at most `max_rows` evenly spaced
+/// rows. Columns are gathered a cache line (16 features) at a time.
+fn quantile_ranges(
+    data: &[f32],
+    row_stride: usize,
+    dim: usize,
+    q: f32,
+    max_rows: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    use rayon::prelude::*;
+    const BLOCK: usize = LINE / 4;
+    let n_rows = data.len() / row_stride;
+    let step = n_rows.div_ceil(max_rows).max(1);
+    let sample: Vec<usize> = (0..n_rows).step_by(step).collect();
+    let n = sample.len();
+    if n == 0 {
+        return (vec![0.0; dim], vec![0.0; dim]);
+    }
+    let low_rank = ((q as f64) * (n - 1) as f64).round() as usize;
+    let high_rank = (((1.0 - q as f64) * (n - 1) as f64).round() as usize).max(low_rank);
+    let ranges: Vec<(f32, f32)> = (0..dim.div_ceil(BLOCK))
+        .into_par_iter()
+        .flat_map_iter(|block| {
+            let first = block * BLOCK;
+            let width = BLOCK.min(dim - first);
+            let mut columns = vec![0.0f32; width * n];
+            for (position, &row) in sample.iter().enumerate() {
+                let values = &data[row * row_stride + first..row * row_stride + first + width];
+                for (offset, &value) in values.iter().enumerate() {
+                    columns[offset * n + position] = value;
+                }
+            }
+            columns
+                .chunks_exact_mut(n)
+                .map(|column| {
+                    let (_, &mut hi, _) = column.select_nth_unstable_by(high_rank, f32::total_cmp);
+                    let (_, &mut lo, _) = column.select_nth_unstable_by(low_rank, f32::total_cmp);
+                    (lo, hi)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ranges.into_iter().unzip()
+}
+
+/// Quantile clipped by the build codes (see [`AffineCodes::encode_for_build`]).
+pub const BUILD_CLIP_QUANTILE: f32 = 1e-3;
+/// A feature is clipped only when its full range is this many times its
+/// quantile range: an outlier, not a tail (a Gaussian feature's full range is
+/// about 1.5 times its 0.1%-99.9% range).
+pub const BUILD_CLIP_RATIO: f32 = 4.0;
+const BUILD_CLIP_SAMPLE_ROWS: usize = 50_000;
+
+fn outlier_clipped_ranges(data: &[f32], row_stride: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let (mut low, mut high) = full_ranges(data, row_stride, dim);
+    if data.len() / row_stride <= 1000 {
+        return (low, high);
+    }
+    let (quantile_low, quantile_high) =
+        quantile_ranges(data, row_stride, dim, BUILD_CLIP_QUANTILE, BUILD_CLIP_SAMPLE_ROWS);
+    for j in 0..dim {
+        let quantile_range = quantile_high[j] - quantile_low[j];
+        if quantile_range > 0.0 && high[j] - low[j] > BUILD_CLIP_RATIO * quantile_range {
+            low[j] = quantile_low[j];
+            high[j] = quantile_high[j];
         }
     }
     (low, high)
 }
 
-/// Per-feature `q` and `1 - q` quantiles of (an evenly spaced sample of) the rows.
-fn clipped_ranges(data: &[f32], row_stride: usize, dim: usize, q: f32) -> (Vec<f32>, Vec<f32>) {
-    let n_rows = data.len() / row_stride;
-    let step = n_rows.div_ceil(CLIP_SAMPLE_ROWS).max(1);
-    let sample: Vec<usize> = (0..n_rows).step_by(step).collect();
-    let n = sample.len();
-    let mut low = vec![0.0f32; dim];
-    let mut high = vec![0.0f32; dim];
-    if n == 0 {
-        return (low, high);
-    }
-    let low_rank = ((q as f64) * (n - 1) as f64).round() as usize;
-    let high_rank = (((1.0 - q as f64) * (n - 1) as f64).round() as usize).max(low_rank);
-    let mut column = Vec::with_capacity(n);
-    for j in 0..dim {
-        column.clear();
-        column.extend(sample.iter().map(|&row| data[row * row_stride + j]));
-        let (_, &mut hi, _) = column.select_nth_unstable_by(high_rank, f32::total_cmp);
-        let (_, &mut lo, _) = column.select_nth_unstable_by(low_rank, f32::total_cmp);
-        low[j] = lo;
-        high[j] = hi;
-    }
-    (low, high)
+/// A row prepared as a query against 8-bit codes (see
+/// [`AffineCodes::row_queries`]): one aligned 16-byte record, so a distance
+/// reads a single cache line of scalars per row.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, align(16))]
+pub(crate) struct RowQuery {
+    /// `|scale * c|^2` of the row's codes (squared euclidean codes only).
+    pub norm: f32,
+    pub offset: f32,
+    pub scale: f32,
+    _pad: f32,
 }
 
 /// A float16 copy of the data for reranking: `data / scale`, with `scale` the

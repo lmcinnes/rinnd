@@ -6,7 +6,37 @@ Graph delivery and single-query throughput are separate workloads. The current
 priority is full-corpus graph delivery, especially for large datasets; query timing
 is not an adoption gate for lossless construction changes with identical graphs.
 
-## Current default decision (2026-10-16, hybrid forest for search indexes)
+## Current default decision (2026-11-28, progressive builds, SQ8 forests, hub search trees)
+
+Three changes, each screened with interleaved A/Bs (graph builds with `graph_bench`
+at 8 threads on 4 cores; searches with VIBE's `dev/explore_rinnd.py`, single-thread
+QPS at 0.95 recall@100, 5000 queries, two replicates):
+
+- **Progressive builds.** From 512 features (euclidean metrics, normalized cosine)
+  the leaf join and first NN-descent iterations run on 8-bit codes with 1.25x wider
+  heaps, then every entry is re-scored exactly. Builds of VIBE datasets took 18-39%
+  less time than the previous release (arxiv 87 -> 57 s, gooaq 143 -> 91 s, agnews
+  138 -> 85 s, landmark 52 -> 32 s) at unchanged search QPS (-1.7% to +3.3%).
+  On 500K x 4096 (8 trees) the build took 83 -> 31 s, graph recall@30 0.9971 -> 0.9977.
+- **SQ8 forests.** The breadth-first forest splits 8-bit codes (one code row
+  against four trees' int8 weights) in progressive builds and from 128 features in
+  any build. Forest time fell 37-53% at 128-384 features and 66-76% at 768-4096,
+  with graph recall within +-0.002.
+- **Hub search trees.** Searches start from a single tree that `prepare()` builds
+  from the k-NN graph (pynndescent's hub tree, 48-point leaves); the build keeps
+  only forest leaves, and `search_tree`/`n_search_trees` are gone (API break).
+  Against the first construction tree, on the same graph: yahoo +6.6%, imagenet-clip
+  +4.2%, landmark +1.9%, arxiv +5.7%, gooaq +10.0%, agnews +9.4%; with query samples
+  (the tree only sets the layout): yandex -0.1%, imagenet-align +0.8%, yi +0.4%.
+  Building the tree adds 0.5-1.7 s at 0.7-1.3M points. A random projection tree
+  with the same leaves searched as fast (within +-1%), so the gain comes from
+  choosing the leaf size apart from construction; leaves of 32 and 48 points
+  beat 64 by 1.2% and 2.1% on average, and 96 was slower on 3 of 4 datasets.
+
+Run-to-run drift of single explore runs was +-3-5%, so only interleaved,
+replicated comparisons were used. 192 core and 57 Python tests pass.
+
+## Default decision (2026-10-16, hybrid forest for search indexes)
 
 Search-capable indexes now build their forest with the hybrid builder (Python
 `tree_build_strategy="auto"`), keeping the first `n_search_trees` trees as query

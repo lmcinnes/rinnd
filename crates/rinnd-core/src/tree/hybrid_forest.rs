@@ -18,10 +18,8 @@
 //! sorting on (depth, root-to-node path).
 
 use super::breadth_first::{batched_dot_products, child_seed, choose_split, repair_split, tie_side, Split, MAX_TREE_BATCH_WIDTH};
-use super::flat_tree::FlatTree;
 use crate::rng::FastRng;
 use rayon::prelude::*;
-use std::collections::HashMap;
 
 const NO_NODE: u32 = u32::MAX;
 const LOCAL_SUBTREE_BYTES: usize = 1 << 20;
@@ -59,7 +57,12 @@ fn assign_ranges(permutation: &[i32], assignments: &mut [u32], ranges: &[(usize,
 
 /// Points per cache-local subtree.
 pub(crate) fn local_points_for(dim: usize) -> usize {
-    LOCAL_SUBTREE_BYTES / (4 * dim.max(1))
+    local_points_for_row_bytes(4 * dim)
+}
+
+/// Points per cache-local subtree of rows `row_bytes` long.
+pub(crate) fn local_points_for_row_bytes(row_bytes: usize) -> usize {
+    LOCAL_SUBTREE_BYTES / row_bytes.max(1)
 }
 
 /// Root-to-node path, one bit per level (right = 1), most significant first.
@@ -90,39 +93,113 @@ struct Node {
 }
 
 type Leaf = (usize, Path, Vec<i32>);
-/// A split node of a retained tree, keyed like leaves by (depth, path).
-type Internal = (usize, Path, Split);
 
-/// Split nodes of a retained tree, for its query tree.
-#[derive(Default)]
-struct Retained {
-    splits: Vec<Internal>,
+/// How a forest splits its nodes. [`FloatSpace`] splits the data rows; other
+/// spaces split another form of them. Every decision depends only on a node's
+/// points and seed.
+pub(crate) trait SplitSpace: Sync {
+    /// A node's split.
+    type Split: Send + Sync;
+    /// A deferred node's rows, as [`Self::node_sides`] reads them, and scratch.
+    type Local: Send;
+
+    /// Split the points `ids` (see [`choose_split`]).
+    fn choose_split(&self, ids: &[i32], seed: u64) -> Self::Split;
+
+    /// Re-split points left on one side (see [`repair_split`]): partitions
+    /// `ids`, mirroring each swap through `swap`, and returns the split and
+    /// the size of the left part.
+    fn repair_split(&self, ids: &mut [i32], swap: impl FnMut(usize, usize), seed: u64) -> (Self::Split, usize);
+
+    /// The side of `point` for each present split of a batch of `width` trees.
+    fn batch_sides(&self, point: usize, splits: &[Option<&Self::Split>; MAX_TREE_BATCH_WIDTH], width: usize, sides: &mut [u8]);
+
+    /// The rows of a deferred node's points `ids`, and each point's row in them.
+    fn gather(&self, ids: &[i32]) -> (Self::Local, Vec<u32>);
+
+    /// The side of each of the points `ids` (rows `rows` of `local`).
+    fn node_sides(&self, local: &mut Self::Local, rows: &[u32], ids: &[i32], split: &Self::Split, sides: &mut Vec<u8>);
 }
 
-impl Retained {
-    fn extend(&mut self, other: Retained) {
-        self.splits.extend(other.splits);
+/// Splits of the data rows themselves.
+pub(crate) struct FloatSpace<'a> {
+    pub data: &'a [f32],
+    pub dim: usize,
+    pub angular: bool,
+}
+
+/// A deferred node's rows (copied when short) and margins.
+pub(crate) struct FloatLocal {
+    buffer: Option<Vec<f32>>,
+    margins: Vec<f32>,
+}
+
+impl SplitSpace for FloatSpace<'_> {
+    type Split = Split;
+    type Local = FloatLocal;
+
+    fn choose_split(&self, ids: &[i32], seed: u64) -> Split {
+        choose_split(self.data, self.dim, ids, seed, self.angular)
+    }
+
+    fn repair_split(&self, ids: &mut [i32], swap: impl FnMut(usize, usize), seed: u64) -> (Split, usize) {
+        repair_split(self.data, self.dim, ids, swap, seed, self.angular)
+    }
+
+    fn batch_sides(&self, point: usize, splits: &[Option<&Split>; MAX_TREE_BATCH_WIDTH], width: usize, sides: &mut [u8]) {
+        let row = &self.data[point * self.dim..(point + 1) * self.dim];
+        let hyperplanes = splits.map(|split| split.map(|split| split.hyperplane.as_slice()));
+        let margins = batched_dot_products(row, &hyperplanes, width);
+        for slot in 0..width {
+            if let Some(split) = splits[slot] {
+                sides[slot] = float_side(margins[slot] + split.offset, split.tie_seed, point);
+            }
+        }
+    }
+
+    fn gather(&self, ids: &[i32]) -> (FloatLocal, Vec<u32>) {
+        // Only short rows are copied: longer rows are already contiguous enough.
+        if self.dim > GATHER_MAX_DIM {
+            return (FloatLocal { buffer: None, margins: Vec::new() }, ids.iter().map(|&id| id as u32).collect());
+        }
+        let mut buffer = Vec::with_capacity(ids.len() * self.dim);
+        for &id in ids {
+            buffer.extend_from_slice(&self.data[id as usize * self.dim..(id as usize + 1) * self.dim]);
+        }
+        (FloatLocal { buffer: Some(buffer), margins: Vec::new() }, (0..ids.len() as u32).collect())
+    }
+
+    fn node_sides(&self, local: &mut FloatLocal, rows: &[u32], ids: &[i32], split: &Split, sides: &mut Vec<u8>) {
+        let buffer = local.buffer.as_deref().unwrap_or(self.data);
+        local_margins(buffer, self.dim, rows, &split.hyperplane, &mut local.margins);
+        sides.clear();
+        sides.extend(
+            local.margins.iter().zip(ids).map(|(&dot, &id)| float_side(dot + split.offset, split.tie_seed, id as usize)),
+        );
     }
 }
 
-/// Leaves of one subtree, plus its query-tree record when the tree is retained.
-struct Output {
-    leaves: Vec<Leaf>,
-    retained: Option<Retained>,
+/// The side of a point with this margin (ties broken per point).
+#[inline(always)]
+fn float_side(margin: f32, tie_seed: u64, point: usize) -> u8 {
+    if margin.abs() < 1e-8 {
+        tie_side(tie_seed, point)
+    } else {
+        (margin >= 0.0) as u8
+    }
 }
 
-struct Tree {
+struct Tree<P> {
     permutation: Vec<i32>,
     assignments: Vec<u32>,
     frontier: Vec<Node>,
-    splits: Vec<Split>,
+    splits: Vec<P>,
     leaves: Vec<Leaf>,
     deferred: Vec<(Node, Vec<i32>)>,
-    retained: Option<Retained>,
 }
 
-impl Tree {
-    fn new(n_points: usize, seed: u64, retain: bool) -> Self {
+impl<P: Send + Sync> Tree<P> {
+    fn new(n_points: usize, seed: u64) -> Self {
         Self {
             permutation: (0..n_points as i32).collect(),
             assignments: vec![0; n_points],
@@ -130,13 +207,12 @@ impl Tree {
             splits: Vec::new(),
             leaves: Vec::new(),
             deferred: Vec::new(),
-            retained: retain.then(Retained::default),
         }
     }
 
     /// Decide every frontier node: leaf now, defer to the cache-local phase,
     /// or split at this level. Returns whether any node splits.
-    fn classify(&mut self, data: &[f32], dim: usize, leaf_size: usize, local_points: usize, angular: bool, max_depth: usize) -> bool {
+    fn classify<S: SplitSpace<Split = P>>(&mut self, space: &S, leaf_size: usize, local_points: usize, max_depth: usize) -> bool {
         let frontier = std::mem::take(&mut self.frontier);
         self.splits.clear();
         let mut ranges = Vec::with_capacity(frontier.len());
@@ -151,7 +227,7 @@ impl Tree {
                 self.deferred.push((node, ids));
             } else {
                 ranges.push((node.start, node.end, self.frontier.len() as u32));
-                self.splits.push(choose_split(data, dim, &self.permutation[node.start..node.end], node.seed, angular));
+                self.splits.push(space.choose_split(&self.permutation[node.start..node.end], node.seed));
                 self.frontier.push(node);
             }
         }
@@ -162,7 +238,7 @@ impl Tree {
     /// Partition each split node exactly as the breadth-first builder does,
     /// re-splitting nodes whose split left one side empty.
     /// Children's assignments are written by the next `classify`.
-    fn partition(&mut self, data: &[f32], dim: usize, angular: bool, tree_slot: usize, batch_width: usize, sides: &[u8]) {
+    fn partition<S: SplitSpace<Split = P>>(&mut self, space: &S, tree_slot: usize, batch_width: usize, sides: &[u8]) {
         let frontier = std::mem::take(&mut self.frontier);
         // Frontier nodes are disjoint ranges in increasing order of `start`.
         let mut slices = Vec::with_capacity(frontier.len());
@@ -175,7 +251,7 @@ impl Tree {
             rest = tail;
             offset = node.end;
         }
-        let lefts: Vec<(usize, Option<Split>)> = slices
+        let lefts: Vec<usize> = slices
             .into_par_iter()
             .map(|(slice, seed)| {
                 let (mut left, mut right) = (0, slice.len());
@@ -188,21 +264,17 @@ impl Tree {
                     }
                 }
                 if left == 0 || left == slice.len() {
-                    let (split, left) = repair_split(data, dim, slice, |_, _| {}, seed, angular);
-                    return (left, Some(split));
+                    return space.repair_split(slice, |_, _| {}, seed).1;
                 }
-                (left, None)
+                left
             })
             .collect();
         let mut next = Vec::with_capacity(frontier.len() * 2);
-        let splits = std::mem::take(&mut self.splits);
-        for ((node, (offset, repaired)), split) in frontier.into_iter().zip(lefts).zip(splits) {
+        self.splits.clear();
+        for (node, offset) in frontier.into_iter().zip(lefts) {
             let left = node.start + offset;
             next.push(Node { start: node.start, end: left, depth: node.depth + 1, seed: child_seed(node.seed, false), path: node.path.child(node.depth, false) });
             next.push(Node { start: left, end: node.end, depth: node.depth + 1, seed: child_seed(node.seed, true), path: node.path.child(node.depth, true) });
-            if let Some(retained) = &mut self.retained {
-                retained.splits.push((node.depth, node.path, repaired.unwrap_or(split)));
-            }
         }
         self.frontier = next;
     }
@@ -268,38 +340,30 @@ fn local_margins(buffer: &[f32], dim: usize, rows: &[u32], plane: &[f32], out: &
     }
 }
 
-/// Finish one deferred subtree from a contiguous copy of its rows.
+/// Finish one deferred subtree from its gathered rows.
 #[allow(clippy::too_many_arguments)]
-fn local_subtree(
-    data: &[f32],
-    dim: usize,
-    buffer: &[f32],
+fn local_subtree<S: SplitSpace>(
+    space: &S,
+    local: &mut S::Local,
     ids: &mut [i32],
     rows: &mut [u32],
     depth: usize,
     seed: u64,
     path: Path,
     leaf_size: usize,
-    angular: bool,
     max_depth: usize,
-    out: &mut Output,
-    scratch: &mut (Vec<f32>, Vec<u8>),
+    leaves: &mut Vec<Leaf>,
+    sides: &mut Vec<u8>,
 ) {
     let m = ids.len();
     if m <= leaf_size || depth >= max_depth {
-        out.leaves.push((depth, path, ids.to_vec()));
+        leaves.push((depth, path, ids.to_vec()));
         return;
     }
-    let mut split = choose_split(data, dim, ids, seed, angular);
+    let split = space.choose_split(ids, seed);
     // Sides for every point (a function of the point alone), then the same
     // two-pointer partition as the breadth-first builder.
-    let (margins, sides) = scratch;
-    local_margins(buffer, dim, rows, &split.hyperplane, margins);
-    sides.clear();
-    sides.extend(margins.iter().zip(ids.iter()).map(|(&dot, &id)| {
-        let margin = dot + split.offset;
-        if margin.abs() < 1e-8 { tie_side(split.tie_seed, id as usize) } else { (margin >= 0.0) as u8 }
-    }));
+    space.node_sides(local, rows, ids, &split, sides);
     let (mut left, mut right) = (0, m);
     while left < right {
         if sides[left] == 0 {
@@ -311,18 +375,16 @@ fn local_subtree(
             sides.swap(left, right);
         }
     }
+    drop(split);
     if left == 0 || left == m {
-        (split, left) = repair_split(data, dim, ids, |a, b| rows.swap(a, b), seed, angular);
+        left = space.repair_split(ids, |a, b| rows.swap(a, b), seed).1;
     }
     let (left_ids, right_ids) = ids.split_at_mut(left);
     let (left_rows, right_rows) = rows.split_at_mut(left);
     let left_path = path.child(depth, false);
     let right_path = path.child(depth, true);
-    if let Some(retained) = &mut out.retained {
-        retained.splits.push((depth, path, split));
-    }
-    local_subtree(data, dim, buffer, left_ids, left_rows, depth + 1, child_seed(seed, false), left_path, leaf_size, angular, max_depth, out, scratch);
-    local_subtree(data, dim, buffer, right_ids, right_rows, depth + 1, child_seed(seed, true), right_path, leaf_size, angular, max_depth, out, scratch);
+    local_subtree(space, local, left_ids, left_rows, depth + 1, child_seed(seed, false), left_path, leaf_size, max_depth, leaves, sides);
+    local_subtree(space, local, right_ids, right_rows, depth + 1, child_seed(seed, true), right_path, leaf_size, max_depth, leaves, sides);
 }
 
 /// Drop-in replacement for `build_breadth_first_leaf_forest` with identical output.
@@ -340,94 +402,43 @@ pub(crate) fn build_hybrid_leaf_forest(
     local_points: usize,
 ) -> Vec<Vec<i32>> {
     assert_eq!(data.len(), n_points * dim);
-    assert!(n_points <= i32::MAX as usize);
-    assert!((1..=MAX_TREE_BATCH_WIDTH).contains(&tree_batch_width));
-
-    let seeds: Vec<u64> = (0..n_trees).map(|_| rng.next_u64()).collect();
-    build_trees(data, n_points, dim, &seeds, tree_batch_width, leaf_size, angular, max_depth, local_points, 0).1
+    let space = FloatSpace { data, dim, angular };
+    build_space_forest(&space, n_points, n_trees, leaf_size, rng, max_depth, tree_batch_width, local_points)
 }
 
-/// Hybrid forest that also returns the first `n_retained` trees as query trees.
-/// Leaves are identical to `build_hybrid_leaf_forest` for the same RNG state.
+/// The leaves of every tree of the hybrid forest of `space`'s `n_points` points.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_hybrid_forest(
-    data: &[f32],
+pub(crate) fn build_space_forest<S: SplitSpace>(
+    space: &S,
     n_points: usize,
-    dim: usize,
     n_trees: usize,
     leaf_size: usize,
     rng: &mut FastRng,
-    angular: bool,
     max_depth: usize,
     tree_batch_width: usize,
     local_points: usize,
-    n_retained: usize,
-) -> (Vec<FlatTree>, Vec<Vec<i32>>) {
-    assert_eq!(data.len(), n_points * dim);
+) -> Vec<Vec<i32>> {
     assert!(n_points <= i32::MAX as usize);
     assert!((1..=MAX_TREE_BATCH_WIDTH).contains(&tree_batch_width));
 
     let seeds: Vec<u64> = (0..n_trees).map(|_| rng.next_u64()).collect();
-    build_trees(data, n_points, dim, &seeds, tree_batch_width, leaf_size, angular, max_depth, local_points, n_retained)
-}
-
-/// Assemble a query tree with nodes numbered in breadth-first order (root 0).
-fn flat_tree(dim: usize, leaves: &[Leaf], splits: Vec<Internal>) -> FlatTree {
-    enum Kind {
-        Leaf(usize),
-        Split(Split),
-    }
-    let mut nodes: Vec<(usize, Path, Kind)> = leaves
-        .iter()
-        .enumerate()
-        .map(|(i, leaf)| (leaf.0, leaf.1.clone(), Kind::Leaf(i)))
-        .chain(splits.into_iter().map(|(depth, path, split)| (depth, path, Kind::Split(split))))
-        .collect();
-    nodes.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    let ids: HashMap<(usize, Path), i32> =
-        nodes.iter().enumerate().map(|(id, node)| ((node.0, node.1.clone()), id as i32)).collect();
-
-    let n_nodes = nodes.len();
-    let mut hyperplanes = vec![0.0; n_nodes * dim];
-    let mut offsets = vec![0.0; n_nodes];
-    let mut children = Vec::with_capacity(n_nodes);
-    let mut indices = Vec::with_capacity(leaves.iter().map(|leaf| leaf.2.len()).sum());
-    for (id, (depth, path, kind)) in nodes.into_iter().enumerate() {
-        match kind {
-            Kind::Leaf(i) => {
-                let start = indices.len() as i32;
-                indices.extend_from_slice(&leaves[i].2);
-                children.push([-start, -(indices.len() as i32)]);
-            }
-            Kind::Split(split) => {
-                hyperplanes[id * dim..(id + 1) * dim].copy_from_slice(&split.hyperplane);
-                offsets[id] = split.offset;
-                let child = |right| ids[&(depth + 1, path.child(depth, right))];
-                children.push([child(false), child(true)]);
-            }
-        }
-    }
-    FlatTree { hyperplanes, offsets, children, indices, dim, n_nodes }
+    build_trees(space, n_points, &seeds, tree_batch_width, leaf_size, max_depth, local_points)
 }
 
 /// Build all trees with shared breadth-first levels and return their leaves in tree order,
 /// each in breadth-first order. Margins are computed for `tree_batch_width` trees per pass.
 #[allow(clippy::too_many_arguments)]
-fn build_trees(
-    data: &[f32],
+fn build_trees<S: SplitSpace>(
+    space: &S,
     n_points: usize,
-    dim: usize,
     seeds: &[u64],
     tree_batch_width: usize,
     leaf_size: usize,
-    angular: bool,
     max_depth: usize,
     local_points: usize,
-    n_retained: usize,
-) -> (Vec<FlatTree>, Vec<Vec<i32>>) {
+) -> Vec<Vec<i32>> {
     let n_trees = seeds.len();
-    let mut trees: Vec<Tree> =
-        seeds.par_iter().enumerate().map(|(i, &seed)| Tree::new(n_points, seed, i < n_retained)).collect();
+    let mut trees: Vec<Tree<S::Split>> = seeds.par_iter().map(|&seed| Tree::new(n_points, seed)).collect();
     // Points outside every frontier keep stale sides, which partition never reads.
     let mut sides = vec![0u8; n_points * n_trees];
 
@@ -435,90 +446,53 @@ fn build_trees(
     loop {
         let any_splits = trees
             .par_iter_mut()
-            .map(|tree| tree.classify(data, dim, leaf_size, local_points, angular, max_depth))
+            .map(|tree| tree.classify(space, leaf_size, local_points, max_depth))
             .reduce(|| false, |a, b| a | b);
         if !any_splits {
             break;
         }
         sides.par_chunks_mut(n_trees).enumerate().for_each(|(point_index, point_sides)| {
-            let point = &data[point_index * dim..(point_index + 1) * dim];
             for (group, group_sides) in trees.chunks(tree_batch_width).zip(point_sides.chunks_mut(tree_batch_width)) {
-                let mut hyperplanes: [Option<&[f32]>; MAX_TREE_BATCH_WIDTH] = [None; MAX_TREE_BATCH_WIDTH];
+                let mut splits: [Option<&S::Split>; MAX_TREE_BATCH_WIDTH] = [None; MAX_TREE_BATCH_WIDTH];
                 let mut any = false;
                 for (slot, tree) in group.iter().enumerate() {
                     let node = tree.assignments[point_index];
                     if node != NO_NODE {
-                        hyperplanes[slot] = Some(tree.splits[node as usize].hyperplane.as_slice());
+                        splits[slot] = Some(&tree.splits[node as usize]);
                         any = true;
                     }
                 }
-                if !any {
-                    continue;
-                }
-                let margins = batched_dot_products(point, &hyperplanes, group.len());
-                for (slot, tree) in group.iter().enumerate() {
-                    let node = tree.assignments[point_index];
-                    if node != NO_NODE {
-                        let node = node as usize;
-                        let margin = margins[slot] + tree.splits[node].offset;
-                        group_sides[slot] = if margin.abs() < 1e-8 {
-                            tie_side(tree.splits[node].tie_seed, point_index)
-                        } else {
-                            (margin >= 0.0) as u8
-                        };
-                    }
+                if any {
+                    space.batch_sides(point_index, &splits, group.len(), group_sides);
                 }
             }
         });
-        trees.par_iter_mut().enumerate().for_each(|(slot, tree)| tree.partition(data, dim, angular, slot, n_trees, &sides));
+        trees.par_iter_mut().enumerate().for_each(|(slot, tree)| tree.partition(space, slot, n_trees, &sides));
     }
     drop(sides);
 
     // Cache-local subtrees for all trees at once, then breadth-first output order per tree.
-    let built: Vec<(Option<FlatTree>, Vec<Vec<i32>>)> = trees
+    let built: Vec<Vec<Vec<i32>>> = trees
         .into_par_iter()
         .map(|tree| {
             let mut leaves = tree.leaves;
-            let mut retained = tree.retained;
-            let retain = retained.is_some();
-            let local: Vec<Output> = tree
+            let local: Vec<Vec<Leaf>> = tree
                 .deferred
                 .into_par_iter()
                 .map(|(node, mut ids)| {
-                    let mut out = Output { leaves: Vec::new(), retained: retain.then(Retained::default) };
-                    let mut scratch = (Vec::new(), Vec::new());
-                    if dim > GATHER_MAX_DIM {
-                        let mut rows: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-                        local_subtree(data, dim, data, &mut ids, &mut rows, node.depth, node.seed, node.path, leaf_size, angular, max_depth, &mut out, &mut scratch);
-                        return out;
-                    }
-                    let mut buffer = Vec::with_capacity(ids.len() * dim);
-                    for &id in &ids {
-                        buffer.extend_from_slice(&data[id as usize * dim..(id as usize + 1) * dim]);
-                    }
-                    let mut rows: Vec<u32> = (0..ids.len() as u32).collect();
-                    local_subtree(data, dim, &buffer, &mut ids, &mut rows, node.depth, node.seed, node.path, leaf_size, angular, max_depth, &mut out, &mut scratch);
+                    let mut out = Vec::new();
+                    let (mut local, mut rows) = space.gather(&ids);
+                    let mut sides = Vec::new();
+                    local_subtree(space, &mut local, &mut ids, &mut rows, node.depth, node.seed, node.path, leaf_size, max_depth, &mut out, &mut sides);
                     out
                 })
                 .collect();
-            for out in local {
-                leaves.extend(out.leaves);
-                if let (Some(retained), Some(local_retained)) = (&mut retained, out.retained) {
-                    retained.extend(local_retained);
-                }
-            }
+            leaves.extend(local.into_iter().flatten());
             leaves.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-            let flat = retained.map(|retained| flat_tree(dim, &leaves, retained.splits));
-            (flat, leaves.into_iter().map(|leaf| leaf.2).collect::<Vec<_>>())
+            leaves.into_iter().map(|leaf| leaf.2).collect()
         })
         .collect();
-    let mut flat_trees = Vec::with_capacity(n_retained.min(n_trees));
-    let mut all_leaves = Vec::new();
-    for (flat, leaves) in built {
-        flat_trees.extend(flat);
-        all_leaves.extend(leaves);
-    }
-    (flat_trees, all_leaves)
+    built.into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -571,42 +545,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_trees_match_leaves_and_route_training_points() {
-        for &(n, dim, angular, local, retained) in &[
-            (6000, 37, false, 800, 2),
-            (6000, 37, true, 0, 1),
-            (3000, GATHER_MAX_DIM + 72, false, 500, 3),
-            (3000, 16, false, 10_000, 7), // whole tree deferred at the root
-            (40, 16, false, 800, 1),      // root is a leaf
-        ] {
-            let x = data(n, dim, 4);
-            let expected = build_hybrid_leaf_forest(&x, n, dim, 7, 60, &mut FastRng::new(9), angular, 200, 6, local);
-            let (trees, leaves) = build_hybrid_forest(&x, n, dim, 7, 60, &mut FastRng::new(9), angular, 200, 6, local, retained);
-            assert_eq!(leaves, expected);
-            assert_eq!(trees.len(), retained);
-
-            let mut offset = 0;
-            for tree in &trees {
-                let n_leaves = tree.get_all_leaves().len();
-                assert_eq!(tree.n_nodes, 2 * n_leaves - 1);
-                let mut from_tree: Vec<Vec<i32>> =
-                    tree.get_all_leaves().into_iter().map(|(s, e)| tree.indices[s..e].to_vec()).collect();
-                let mut from_forest = leaves[offset..offset + n_leaves].to_vec();
-                from_tree.sort();
-                from_forest.sort();
-                assert_eq!(from_tree, from_forest);
-                offset += n_leaves;
-
-                let mut rng = FastRng::new(1);
-                for point in 0..n {
-                    let leaf = tree.get_leaf_indices(&x[point * dim..(point + 1) * dim], &mut rng);
-                    assert!(leaf.contains(&(point as i32)), "point {point} routed to the wrong leaf");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn failed_splits_are_retried_and_leaves_stay_bounded() {
         // Duplicates and zero vectors make many splits fail.
         let (n, dim) = (3000, 16);
@@ -616,16 +554,10 @@ mod tests {
         for angular in [false, true] {
             let (a, b) = both(&x, n, dim, 3, 20, angular, 200, 6, 500, 2);
             assert_eq!(a, b);
-            let (trees, leaves) = build_hybrid_forest(&x, n, dim, 3, 20, &mut FastRng::new(9), angular, 200, 6, 500, 3);
-            assert_eq!(leaves, b);
-            assert!(leaves.iter().all(|leaf| !leaf.is_empty() && leaf.len() <= 20), "angular={angular}");
-            for tree in &trees {
-                let tree_leaves = tree.get_all_leaves();
-                assert_eq!(tree.n_nodes, 2 * tree_leaves.len() - 1);
-                let mut points = tree.indices.clone();
-                points.sort_unstable();
-                assert_eq!(points, (0..n as i32).collect::<Vec<_>>());
-            }
+            assert!(b.iter().all(|leaf| !leaf.is_empty() && leaf.len() <= 20), "angular={angular}");
+            let mut points: Vec<i32> = b.iter().flatten().copied().collect();
+            points.sort_unstable();
+            assert_eq!(points, (0..n as i32).flat_map(|p| [p; 3]).collect::<Vec<_>>());
         }
     }
 

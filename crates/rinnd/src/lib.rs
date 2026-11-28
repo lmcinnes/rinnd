@@ -20,6 +20,7 @@ use rinnd_core::distance::quantized::{
 use rinnd_core::distance::*;
 use rinnd_core::graph::{NeighborGraph, SearchGraph};
 use rinnd_core::index::{BuildStats, GraphBuildResult, NNDescentBuilder, NNDescentIndex, VertexOrder};
+use rinnd_core::ProgressiveBuild;
 use rinnd_core::query_sample::{QuerySample, QuerySampleOptions};
 use rinnd_core::search::SearchWorkspace;
 use rinnd_core::tree::{FlatTree, QuantizedFlatTree};
@@ -96,10 +97,24 @@ fn install_in_pool<R: Send>(
 ///     ``diversify_alpha`` (alpha-pruning). Values above 1.0 keep more long
 ///     edges, giving a denser graph that can help harder (e.g.
 ///     out-of-distribution) queries.
+/// progressive_build : {'auto', True, False}, optional
+///     Whether the RP-tree leaf join and the first NN-descent iterations run
+///     on 8-bit codes (integer dot products, AVX-512 VNNI where available),
+///     with wider heaps, before every candidate is re-scored exactly and
+///     NN-descent finishes with float32 distances. ``None`` or 'auto' does so
+///     from 512 features up, for euclidean metrics and normalized cosine.
 /// vertex_order : {'tree', 'rcm'}, default='tree'
 ///     How the search index numbers (and lays out) the points: in the leaf
 ///     order of the first search tree, or by reverse Cuthill-McKee on the
 ///     search graph, which places graph neighbours close together in memory.
+/// search_tree_leaf_size : int, optional
+///     Leaf size of the search tree (default 48): the number of points a
+///     search starts from. ``prepare()`` builds the tree from the k-NN graph,
+///     splitting each node between two of its highest in-degree points
+///     ("hubs"), as pynndescent does; it also sets the 'tree' vertex order. A
+///     query sample's tree (``query_sample``) replaces it for searches.
+/// search_tree_leaf_budget : int, default=1
+///     Search tree leaves visited to start a search.
 ///
 /// Attributes
 /// ----------
@@ -303,7 +318,7 @@ impl QuantizedI8Index {
         let initial_k = index.n_neighbors.max(1);
         let released_fp32_tree_bytes = if quantize_trees {
             index
-                .search_trees
+                .search_tree
                 .iter()
                 .map(|tree| {
                     tree.hyperplanes.len() * std::mem::size_of::<f32>()
@@ -316,7 +331,9 @@ impl QuantizedI8Index {
             0
         };
         let quantized_trees = if quantize_trees {
-            std::mem::take(&mut index.search_trees)
+            index
+                .search_tree
+                .take()
                 .into_iter()
                 .map(QuantizedFlatTree::from_owned_flat_tree)
                 .collect()
@@ -620,7 +637,7 @@ impl AnyIndex for QuantizedI8Index {
 
     fn retained_fp32_tree_topology_bytes(&self) -> usize {
         self.index
-            .search_trees
+            .search_tree
             .iter()
             .map(|tree| {
                 tree.children.len() * std::mem::size_of::<[i32; 2]>()
@@ -1226,13 +1243,12 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
 #[pymethods]
 impl PyNNDescent {
     #[new]
-    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6, n_jobs=None, quantization=None, quantization_dims=None, rerank_precision="float32", quantization_clip=None, query_sample=None, query_neighbors=None, query_sample_options=None, diversify_alpha=1.0, vertex_order="tree"))]
+    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6, n_jobs=None, quantization=None, quantization_dims=None, rerank_precision="float32", quantization_clip=None, query_sample=None, query_neighbors=None, query_sample_options=None, diversify_alpha=1.0, vertex_order="tree", progressive_build=None, search_tree_leaf_size=None))]
     fn new(
         data: PyReadonlyArray2<f32>,
         metric: &str,
         n_neighbors: usize,
         n_trees: Option<usize>,
-        n_search_trees: usize,
         search_tree_leaf_budget: usize,
         leaf_size: Option<usize>,
         max_candidates: Option<usize>,
@@ -1262,6 +1278,8 @@ impl PyNNDescent {
         query_sample_options: Option<&Bound<'_, PyDict>>,
         diversify_alpha: f32,
         vertex_order: &str,
+        progressive_build: Option<&Bound<'_, PyAny>>,
+        search_tree_leaf_size: Option<usize>,
     ) -> PyResult<Self> {
         let shape = data.shape();
         let n_points = shape[0];
@@ -1306,6 +1324,27 @@ impl PyNNDescent {
                 return Err(PyValueError::new_err(format!(
                     "Unknown vertex_order: {other}; expected 'tree' or 'rcm'"
                 )))
+            }
+        };
+        if search_tree_leaf_size == Some(0) {
+            return Err(PyValueError::new_err("search_tree_leaf_size must be at least 1"));
+        }
+        let progressive = match progressive_build {
+            None => ProgressiveBuild::Auto,
+            Some(value) => {
+                if let Ok(flag) = value.extract::<bool>() {
+                    if flag {
+                        ProgressiveBuild::Always
+                    } else {
+                        ProgressiveBuild::Never
+                    }
+                } else if value.extract::<String>().is_ok_and(|text| text == "auto") {
+                    ProgressiveBuild::Auto
+                } else {
+                    return Err(PyValueError::new_err(
+                        "progressive_build must be 'auto', True or False",
+                    ));
+                }
             }
         };
 
@@ -1479,15 +1518,14 @@ impl PyNNDescent {
                         "query_neighbors must have a row of neighbor indices for each sample query",
                     ));
                 }
-                let mut queries: Vec<f32> = sample.as_array().iter().copied().collect();
+                let sample_view = sample.as_array();
+                let mut queries =
+                    install_in_pool(thread_pool.as_ref(), || owned_rows(sample_view, normalize_cosine));
                 let neighbors: Vec<i32> = neighbors.as_array().iter().copied().collect();
                 if neighbors.iter().any(|&idx| idx >= n_points as i32 || idx < -1) {
                     return Err(PyValueError::new_err(
                         "query_neighbors holds indices beyond the indexed data",
                     ));
-                }
-                if normalize_cosine {
-                    normalize_rows_inplace(&mut queries, dim);
                 }
                 if mips {
                     queries = queries
@@ -1552,21 +1590,16 @@ impl PyNNDescent {
                     random_state.unwrap_or(42),
                     verbose,
                     breadth_first_batch_width,
+                    progressive,
                 )
             };
             let index_data = if data.is_c_contiguous() && (!normalize_cosine || input_normalized) {
                 let data_slice = data.as_slice()?;
                 install_in_pool(thread_pool.as_ref(), || build(data_slice))
             } else {
-                let mut temporary = Vec::with_capacity(n_points * dim);
-                for row in 0..n_points {
-                    for column in 0..dim {
-                        temporary.push(*data.get([row, column]).unwrap());
-                    }
-                }
-                if normalize_cosine && !input_normalized {
-                    normalize_rows_inplace(&mut temporary, dim);
-                }
+                let view = data.as_array();
+                let normalize_rows = normalize_cosine && !input_normalized;
+                let temporary = install_in_pool(thread_pool.as_ref(), || owned_rows(view, normalize_rows));
                 install_in_pool(thread_pool.as_ref(), || build(&temporary))
             }?;
 
@@ -1584,24 +1617,15 @@ impl PyNNDescent {
 
         let (index_dim, mips_norm2) = if mips { (dim + 1, Some(0.0)) } else { (dim, None) };
         // Search-capable indexes own their input after construction.
-        let (mut data_vec, mips_norm2): (Vec<f32>, Option<f32>) = if mips_norm2.is_some() {
+        let (data_vec, mips_norm2): (Vec<f32>, Option<f32>) = if mips_norm2.is_some() {
             let view = data.as_array();
             let (augmented, norm2) = install_in_pool(thread_pool.as_ref(), || mips_augment(view));
             (augmented, Some(norm2))
-        } else if data.is_c_contiguous() {
-            (data.as_slice()?.to_vec(), None)
         } else {
-            let mut values = Vec::with_capacity(n_points * dim);
-            for row in 0..n_points {
-                for column in 0..dim {
-                    values.push(*data.get([row, column]).unwrap());
-                }
-            }
-            (values, None)
+            let view = data.as_array();
+            let normalize_rows = normalize_cosine && !input_normalized;
+            (install_in_pool(thread_pool.as_ref(), || owned_rows(view, normalize_rows)), None)
         };
-        if normalize_cosine && !input_normalized {
-            normalize_rows_inplace(&mut data_vec, dim);
-        }
 
         let retain_fp32_data = retain_fp32_data.unwrap_or_else(|| {
             // Preserve legacy behavior: FP32 data was released only when both
@@ -1625,7 +1649,6 @@ impl PyNNDescent {
                 retain_fp32_data,
                 n_neighbors,
                 n_trees,
-                n_search_trees,
                 search_tree_leaf_budget,
                 leaf_size,
                 max_candidates,
@@ -1641,6 +1664,8 @@ impl PyNNDescent {
                 mips_norm2,
                 diversify_relax,
                 vertex_order,
+                progressive,
+                search_tree_leaf_size,
             )
         })?;
         let index_data = match mips_norm2 {
@@ -2061,6 +2086,9 @@ impl PyNNDescent {
         let stats = self.index_data.build_stats();
         let result = PyDict::new(py);
         result.set_item("forest_seconds", stats.nn_descent.forest_seconds)?;
+        result.set_item("code_seconds", stats.nn_descent.code_seconds)?;
+        result.set_item("approximate_iterations", stats.nn_descent.approximate_iterations)?;
+        result.set_item("rescore_seconds", stats.nn_descent.rescore_seconds)?;
         result.set_item(
             "leaf_initialization_seconds",
             stats.nn_descent.leaf_initialization_seconds,
@@ -2104,11 +2132,12 @@ impl PyNNDescent {
         result.set_item("raw_graph_seconds", stats.raw_graph_seconds)?;
         result.set_item("search_graph_seconds", stats.search_graph_seconds)?;
         result.set_item("layout_seconds", stats.layout_seconds)?;
+        result.set_item("search_tree_seconds", stats.search_tree_seconds)?;
         result.set_item("total_seconds", stats.total_seconds)?;
         Ok(result)
     }
 
-    /// Export the first retained RP tree in original input-ID space.
+    /// Export the search tree (built by ``prepare()``) in original input-ID space.
     ///
     /// Returns `(hyperplanes, offsets, children, leaf_indices)`.
     fn export_search_tree<'py>(
@@ -2140,15 +2169,52 @@ fn normalize_rows_inplace(data: &mut [f32], dim: usize) {
     }
 
     for row in data.chunks_mut(dim) {
-        let norm_sq = row.iter().map(|&x| x * x).sum::<f32>();
-        if norm_sq <= 1e-12 {
-            continue;
-        }
-        let inv_norm = norm_sq.sqrt().recip();
-        for x in row {
-            *x *= inv_norm;
+        normalize_row(row);
+    }
+}
+
+#[inline]
+fn normalize_row(row: &mut [f32]) {
+    // Independent lane sums vectorize; one running sum is a serial chain.
+    const LANES: usize = 16;
+    let mut lanes = [0.0f32; LANES];
+    let mut chunks = row.chunks_exact(LANES);
+    for chunk in &mut chunks {
+        for (lane, &x) in lanes.iter_mut().zip(chunk) {
+            *lane += x * x;
         }
     }
+    let norm_sq = lanes.iter().sum::<f32>() + chunks.remainder().iter().map(|&x| x * x).sum::<f32>();
+    if norm_sq <= 1e-12 {
+        return;
+    }
+    let inv_norm = norm_sq.sqrt().recip();
+    for x in row {
+        *x *= inv_norm;
+    }
+}
+
+/// A Rust-owned copy of `data` (any strides), each row L2-normalized when
+/// `normalize`: one pass, parallel over rows (run it in the index's pool).
+fn owned_rows(data: numpy::ndarray::ArrayView2<'_, f32>, normalize: bool) -> Vec<f32> {
+    use rayon::prelude::*;
+    let (n_rows, dim) = data.dim();
+    // Zeroed allocations are lazily mapped, so the threads fault their own pages in.
+    let mut out = vec![0.0f32; n_rows * dim];
+    if dim == 0 {
+        return out;
+    }
+    out.par_chunks_mut(dim).with_min_len(64).enumerate().for_each(|(index, row)| {
+        let source = data.row(index);
+        match source.as_slice() {
+            Some(values) => row.copy_from_slice(values),
+            None => row.iter_mut().zip(source.iter()).for_each(|(out, &value)| *out = value),
+        }
+        if normalize {
+            normalize_row(row);
+        }
+    });
+    out
 }
 
 fn validate_quantized_widths(
@@ -2258,6 +2324,7 @@ impl PyNNDescent {
         random_seed: u64,
         verbose: bool,
         breadth_first_batch_width: Option<usize>,
+        progressive: ProgressiveBuild,
     ) -> PyResult<Box<dyn AnyIndex>> {
         let effective_n_trees = n_trees.unwrap_or_else(|| {
             let log_val = 2.0 * (n_points as f64).log10();
@@ -2269,6 +2336,7 @@ impl PyNNDescent {
             .n_trees(effective_n_trees)
             .delta(delta)
             .random_seed(random_seed)
+            .progressive_build(progressive)
             .verbose(verbose);
         if let Some(leaf_size) = leaf_size {
             builder = builder.leaf_size(leaf_size);
@@ -2349,7 +2417,6 @@ impl PyNNDescent {
         retain_fp32_data: bool,
         n_neighbors: usize,
         n_trees: Option<usize>,
-        n_search_trees: usize,
         search_tree_leaf_budget: usize,
         leaf_size: Option<usize>,
         max_candidates: Option<usize>,
@@ -2365,6 +2432,8 @@ impl PyNNDescent {
         mips_norm2: Option<f32>,
         diversify_relax: f32,
         vertex_order: VertexOrder,
+        progressive: ProgressiveBuild,
+        search_tree_leaf_size: Option<usize>,
     ) -> PyResult<Box<dyn AnyIndex>> {
         // Compute default n_trees matching PyNNDescent: max(3, min(12, round(2*log10(n))))
         let effective_n_trees = n_trees.unwrap_or_else(|| {
@@ -2376,15 +2445,18 @@ impl PyNNDescent {
             .metric(metric)
             .n_neighbors(n_neighbors)
             .n_trees(effective_n_trees)
-            .n_search_trees(n_search_trees)
             .search_tree_leaf_budget(search_tree_leaf_budget)
             .delta(delta)
             .random_seed(random_seed)
             .diversify_prob(diversify_prob)
             .diversify_relax(diversify_relax)
             .vertex_order(vertex_order)
+            .progressive_build(progressive)
             .pruning_degree_multiplier(pruning_degree_multiplier)
             .verbose(verbose);
+        if let Some(size) = search_tree_leaf_size {
+            builder = builder.search_tree_leaf_size(size);
+        }
 
         if let Some(ls) = leaf_size {
             builder = builder.leaf_size(ls);
@@ -2955,7 +3027,6 @@ mod quantization_tests {
         let builder = NNDescentBuilder::new(data, n, dim)
             .n_neighbors(10)
             .n_trees(3)
-            .n_search_trees(2)
             .n_iters(3)
             .random_seed(41);
         QuantizedI8Index::new(
@@ -3027,8 +3098,7 @@ mod quantization_tests {
                 let builder = NNDescentBuilder::new(&data, n, dim)
                     .n_neighbors(10)
                     .n_trees(3)
-                    .n_search_trees(2)
-                    .n_iters(3)
+                            .n_iters(3)
                     .random_seed(41);
                 let index = QuantizedI8Index::new(
                     builder.build_with_distance(DirectNormalizedCosine, None),
@@ -3098,7 +3168,6 @@ mod quantization_tests {
         let builder = NNDescentBuilder::new(&data, n, dim)
             .n_neighbors(10)
             .n_trees(3)
-            .n_search_trees(2)
             .n_iters(3)
             .random_seed(43);
         let index = QuantizedI8Index::new(

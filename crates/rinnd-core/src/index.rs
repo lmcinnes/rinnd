@@ -3,7 +3,8 @@
 use crate::distance::affine::{AffineCodes, AffineQuery, HalfQuery, HalfRows};
 use crate::distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 use crate::graph::{NeighborGraph, SearchGraph};
-use crate::nndescent::{nn_descent_graph, nn_descent_retained, NNDescentParams, NNDescentStats};
+use crate::nndescent::{nn_descent_graph, NNDescentParams, NNDescentStats, ProgressiveBuild};
+use crate::tree::build_hub_tree;
 use crate::query_sample::{query_induced_edges, query_search_tree, QuerySample, QuerySampleOptions};
 use crate::rng::FastRng;
 use crate::search::{
@@ -25,6 +26,8 @@ pub struct BuildStats {
     pub distance_correction_seconds: f64,
     pub search_graph_seconds: f64,
     pub layout_seconds: f64,
+    /// Building a hub search tree (zero for construction trees).
+    pub search_tree_seconds: f64,
     pub raw_graph_seconds: f64,
     pub total_seconds: f64,
 }
@@ -62,9 +65,10 @@ pub struct NNDescentIndex<D: Distance<f32>> {
     pub neighbor_distances: Vec<f32>,
     /// Search graph (CSR format)
     pub search_graph: SearchGraph,
-    /// RP trees retained for query initialization.
-    pub search_trees: Vec<FlatTree>,
-    /// Maximum leaves visited per retained RP tree during query initialization.
+    /// The tree searches start from: the hub tree built by [`Self::prepare`]
+    /// (see [`crate::tree::build_hub_tree`]), or a query sample's tree.
+    pub search_tree: Option<FlatTree>,
+    /// Maximum leaves of the search tree visited during query initialization.
     pub search_tree_leaf_budget: usize,
     /// Vertex ordering (for tree leaf order)
     pub vertex_order: Vec<usize>,
@@ -81,10 +85,15 @@ pub struct NNDescentIndex<D: Distance<f32>> {
     reverse_diversify: bool,
     pruning_degree_multiplier: f32,
     vertex_order_method: VertexOrder,
+    search_tree_leaf_size: usize,
     /// Whether random projection trees split by angle (angular metrics).
     angular_trees: bool,
     prepared: bool,
 }
+
+/// Leaf size of the hub search tree unless set: the number of points a search
+/// starts from (32-64 searched fastest on VIBE's datasets).
+pub const DEFAULT_HUB_LEAF_SIZE: usize = 48;
 
 /// How [`NNDescentIndex::prepare`] numbers the points (and lays out their rows).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -184,8 +193,26 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
         );
         self.build_stats.search_graph_seconds = search_graph_start.elapsed().as_secs_f64();
 
+        // A query sample's tree replaces the hub tree for searches, which then
+        // only sets the 'tree' layout.
+        let sample_tree = sample.filter(|(_, options)| options.tree_leaf_size > 0);
+        if sample_tree.is_none() || self.vertex_order_method == VertexOrder::Tree {
+            let started = Instant::now();
+            self.search_tree = Some(build_hub_tree(
+                &self.data,
+                self.n_points,
+                self.dim,
+                &self.neighbor_indices,
+                self.search_tree_leaf_size,
+                200,
+                self.angular_trees,
+            ));
+            self.build_stats.search_tree_seconds = started.elapsed().as_secs_f64();
+            self.build_stats.total_seconds += self.build_stats.search_tree_seconds;
+        }
+
         let layout_start = Instant::now();
-        let vertex_order: Vec<usize> = match (self.vertex_order_method, self.search_trees.first()) {
+        let vertex_order: Vec<usize> = match (self.vertex_order_method, self.search_tree.as_ref()) {
             (VertexOrder::Rcm, _) => search_graph.reverse_cuthill_mckee(),
             (VertexOrder::Tree, Some(tree)) => tree.indices.iter().map(|&idx| idx as usize).collect(),
             (VertexOrder::Tree, None) => (0..self.n_points).collect(),
@@ -207,16 +234,15 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
 
         search_graph.reorder(&vertex_order);
         search_graph.build_padded();
-        for tree in &mut self.search_trees {
+        if let Some(tree) = &mut self.search_tree {
             tree.remap_indices(&old_to_new);
         }
-        if let Some((sample, options)) = sample.filter(|(_, options)| options.tree_leaf_size > 0) {
-            // The data tree still sets the layout above; searches start from the query tree.
+        if let Some((sample, options)) = sample_tree {
             let mut rng = FastRng::new(self.rng_seed ^ 0x9e37_79b9_7f4a_7c15);
             let mut tree =
                 query_search_tree(sample, self.dim, self.n_points, options, self.angular_trees, &mut rng);
             tree.remap_indices(&old_to_new);
-            self.search_trees = vec![tree];
+            self.search_tree = Some(tree);
         }
 
         self.data = reordered_data;
@@ -234,10 +260,9 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
     /// initialization, or optional exact reranking.
     pub fn retained_fp32_bytes(&self) -> usize {
         let tree_floats: usize = self
-            .search_trees
-            .iter()
-            .map(|tree| tree.hyperplanes.len() + tree.offsets.len())
-            .sum();
+            .search_tree
+            .as_ref()
+            .map_or(0, |tree| tree.hyperplanes.len() + tree.offsets.len());
         (self.data.len() + self.neighbor_distances.len() + tree_floats) * std::mem::size_of::<f32>()
     }
 
@@ -323,7 +348,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
             query,
             codes,
             &self.search_graph,
-            &self.search_trees,
+            self.search_tree.as_slice(),
             self.search_tree_leaf_budget,
             search_k,
             epsilon,
@@ -412,7 +437,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
     /// Return the first retained search tree with leaf IDs mapped back to
     /// original input IDs.
     pub fn export_search_tree(&self) -> Option<FlatTree> {
-        self.search_trees.first().map(|tree| {
+        self.search_tree.as_ref().map(|tree| {
             let mut exported = tree.clone();
             for idx in &mut exported.indices {
                 debug_assert!(*idx >= 0 && (*idx as usize) < self.vertex_order.len());
@@ -438,7 +463,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
             &self.data,
             self.dim,
             &self.search_graph,
-            &self.search_trees,
+            self.search_tree.as_slice(),
             self.search_tree_leaf_budget,
             &self.distance,
             k,
@@ -485,7 +510,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
             &self.data,
             self.dim,
             &self.search_graph,
-            &self.search_trees,
+            self.search_tree.as_slice(),
             self.search_tree_leaf_budget,
             &self.distance,
             k,
@@ -574,7 +599,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
             inv_norms,
             self.dim,
             &self.search_graph,
-            &self.search_trees,
+            self.search_tree.as_slice(),
             self.search_tree_leaf_budget,
             search_k,
             epsilon,
@@ -626,7 +651,7 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
             greedy_search_quantized_custom_with_workspace_initialized(
                 tree_query,
                 &self.search_graph,
-                &self.search_trees,
+                self.search_tree.as_slice(),
                 self.search_tree_leaf_budget,
                 search_k,
                 epsilon,
@@ -722,7 +747,6 @@ pub struct NNDescentBuilder<'a> {
     metric: Metric,
     n_neighbors: usize,
     n_trees: usize,
-    n_search_trees: usize,
     search_tree_leaf_budget: usize,
     leaf_size: Option<usize>,
     max_candidates: Option<usize>,
@@ -735,6 +759,9 @@ pub struct NNDescentBuilder<'a> {
     reverse_diversify: bool,
     pruning_degree_multiplier: f32,
     vertex_order: VertexOrder,
+    search_tree_leaf_size: Option<usize>,
+    progressive: ProgressiveBuild,
+    code_trees: bool,
     breadth_first_batch_width: Option<usize>,
 }
 
@@ -753,7 +780,6 @@ impl<'a> NNDescentBuilder<'a> {
             metric: Metric::Euclidean,
             n_neighbors: 30,
             n_trees: 8,
-            n_search_trees: 1,
             search_tree_leaf_budget: 1,
             leaf_size: None,
             max_candidates: None,
@@ -766,6 +792,9 @@ impl<'a> NNDescentBuilder<'a> {
             reverse_diversify: false,
             pruning_degree_multiplier: 1.5,
             vertex_order: VertexOrder::Tree,
+            search_tree_leaf_size: None,
+            progressive: ProgressiveBuild::Auto,
+            code_trees: true,
             breadth_first_batch_width: Some(6),
         }
     }
@@ -779,7 +808,6 @@ impl<'a> NNDescentBuilder<'a> {
             metric: Metric::Euclidean,
             n_neighbors: 30,
             n_trees: 8,
-            n_search_trees: 1,
             search_tree_leaf_budget: 1,
             leaf_size: None,
             max_candidates: None,
@@ -792,6 +820,9 @@ impl<'a> NNDescentBuilder<'a> {
             reverse_diversify: false,
             pruning_degree_multiplier: 1.5,
             vertex_order: VertexOrder::Tree,
+            search_tree_leaf_size: None,
+            progressive: ProgressiveBuild::Auto,
+            code_trees: true,
             breadth_first_batch_width: Some(6),
         }
     }
@@ -838,16 +869,7 @@ impl<'a> NNDescentBuilder<'a> {
         self
     }
 
-    /// Set the number of construction RP trees retained for query seeding.
-    ///
-    /// This is independent of `n_trees`, which controls construction. Values
-    /// larger than the constructed forest are clamped to the forest size.
-    pub fn n_search_trees(mut self, n: usize) -> Self {
-        self.n_search_trees = n;
-        self
-    }
-
-    /// Set the number of leaves visited in each retained search tree.
+    /// Set the number of search tree leaves visited to start a search.
     pub fn search_tree_leaf_budget(mut self, n: usize) -> Self {
         self.search_tree_leaf_budget = n.max(1);
         self
@@ -909,6 +931,29 @@ impl<'a> NNDescentBuilder<'a> {
     /// them, which gives a denser graph that searches better).
     pub fn reverse_diversify(mut self, reverse: bool) -> Self {
         self.reverse_diversify = reverse;
+        self
+    }
+
+    /// Set whether the leaf join and first iterations run on 8-bit codes
+    /// (default: from 512 features up, for euclidean and dot-ordered
+    /// distances; see [`crate::nndescent::progressive`]).
+    pub fn progressive_build(mut self, mode: ProgressiveBuild) -> Self {
+        self.progressive = mode;
+        self
+    }
+
+    /// Leaf size of the hub search tree (default [`DEFAULT_HUB_LEAF_SIZE`]).
+    pub fn search_tree_leaf_size(mut self, size: usize) -> Self {
+        self.search_tree_leaf_size = Some(size.max(1));
+        self
+    }
+
+    /// Whether the breadth-first forest splits 8-bit codes rather than the
+    /// data, in progressive builds and from
+    /// [`crate::nndescent::CODE_TREE_MIN_DIM`] features (default true).
+    #[doc(hidden)]
+    pub fn code_trees(mut self, enabled: bool) -> Self {
+        self.code_trees = enabled;
         self
     }
 
@@ -974,9 +1019,11 @@ impl<'a> NNDescentBuilder<'a> {
             angular,
             max_depth: 200,
             verbose: self.verbose,
+            progressive: self.progressive,
+            code_trees: self.code_trees,
         };
         let mut rng = FastRng::new(self.random_seed);
-        let (mut neighbor_heap, _forest, nn_descent_stats) = nn_descent_graph(
+        let (mut neighbor_heap, nn_descent_stats) = nn_descent_graph(
             &self.data,
             self.n_points,
             self.dim,
@@ -1017,6 +1064,7 @@ impl<'a> NNDescentBuilder<'a> {
                 distance_correction_seconds,
                 search_graph_seconds: 0.0,
                 layout_seconds: 0.0,
+                search_tree_seconds: 0.0,
                 raw_graph_seconds,
                 total_seconds: build_start.elapsed().as_secs_f64(),
             },
@@ -1072,12 +1120,14 @@ impl<'a> NNDescentBuilder<'a> {
             angular,
             max_depth: 200,
             verbose: self.verbose,
+            progressive: self.progressive,
+            code_trees: self.code_trees,
         };
 
         let mut rng = FastRng::new(self.random_seed);
 
         // Run NN-descent
-        let (mut neighbor_heap, forest, nn_descent_stats) = nn_descent_retained(
+        let (mut neighbor_heap, nn_descent_stats) = nn_descent_graph(
             &self.data,
             self.n_points,
             self.dim,
@@ -1085,7 +1135,6 @@ impl<'a> NNDescentBuilder<'a> {
             &params,
             &mut rng,
             self.breadth_first_batch_width,
-            self.n_search_trees,
         );
 
         // Sort the heap so neighbors are in ascending distance order
@@ -1103,7 +1152,6 @@ impl<'a> NNDescentBuilder<'a> {
         };
         let distance_correction_seconds = distance_correction_start.elapsed().as_secs_f64();
 
-        let search_trees: Vec<FlatTree> = forest.into_iter().take(self.n_search_trees).collect();
         let raw_graph_seconds =
             nn_descent_stats.total_seconds() + sort_seconds + distance_correction_seconds;
         let build_stats = BuildStats {
@@ -1112,6 +1160,7 @@ impl<'a> NNDescentBuilder<'a> {
             distance_correction_seconds,
             search_graph_seconds: 0.0,
             layout_seconds: 0.0,
+            search_tree_seconds: 0.0,
             raw_graph_seconds,
             total_seconds: build_start.elapsed().as_secs_f64(),
         };
@@ -1128,7 +1177,7 @@ impl<'a> NNDescentBuilder<'a> {
             neighbor_indices: neighbor_heap.indices,
             neighbor_distances,
             search_graph: SearchGraph::new(self.n_points),
-            search_trees,
+            search_tree: None,
             search_tree_leaf_budget: self.search_tree_leaf_budget,
             vertex_order: (0..self.n_points).collect(),
             min_distance: f32::INFINITY,
@@ -1140,6 +1189,7 @@ impl<'a> NNDescentBuilder<'a> {
             reverse_diversify: self.reverse_diversify,
             pruning_degree_multiplier: self.pruning_degree_multiplier,
             vertex_order_method: self.vertex_order,
+            search_tree_leaf_size: self.search_tree_leaf_size.unwrap_or(DEFAULT_HUB_LEAF_SIZE),
             angular_trees: angular,
             prepared: false,
         }
@@ -1229,8 +1279,7 @@ mod tests {
         plain.prepare();
         let mut adapted = build();
         adapted.prepare_with_query_sample(&sample, &QuerySampleOptions::default());
-        assert_eq!(adapted.search_trees.len(), 1);
-        assert!(adapted.search_trees[0].indices.len() <= n);
+        assert!(adapted.search_tree.as_ref().expect("query tree").indices.len() <= n);
         assert!(adapted.search_graph.indices.len() > plain.search_graph.indices.len());
 
         let recall = |index: &NNDescentIndex<SquaredEuclidean>| {
@@ -1245,6 +1294,93 @@ mod tests {
         let (plain_recall, adapted_recall) = (recall(&plain), recall(&adapted));
         assert!(adapted_recall > 0.9, "adapted recall {adapted_recall}");
         assert!(adapted_recall >= plain_recall - 0.01, "{adapted_recall} vs {plain_recall}");
+    }
+
+    #[test]
+    fn progressive_build_matches_exact_build_quality() {
+        let (n, dim, k) = (1500, 64, 10);
+        let mut rng = FastRng::new(31);
+        let centres: Vec<f32> = (0..15 * dim).map(|_| rng.next_float() * 4.0 - 2.0).collect();
+        let mut data = Vec::with_capacity(n * dim);
+        for _ in 0..n {
+            let centre = rng.next_index(15);
+            data.extend((0..dim).map(|t| centres[centre * dim + t] + rng.next_float() - 0.5));
+        }
+        let build = |mode: ProgressiveBuild| {
+            NNDescentBuilder::new(&data, n, dim)
+                .n_neighbors(k)
+                .random_seed(1)
+                .progressive_build(mode)
+                .build_graph_with_distance(SquaredEuclidean, None)
+        };
+        let row = |i: usize| &data[i * dim..(i + 1) * dim];
+        let recall = |graph: &NeighborGraph| {
+            let mut hits = 0;
+            for point in (0..n).step_by(15) {
+                let mut exact: Vec<(f32, usize)> =
+                    (0..n).filter(|&q| q != point).map(|q| (SquaredEuclidean.distance(row(point), row(q)), q)).collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let truth: Vec<i32> = exact[..k].iter().map(|&(_, q)| q as i32).collect();
+                hits += graph.indices[point * k..(point + 1) * k].iter().filter(|q| truth.contains(q)).count();
+            }
+            hits as f64 / (n.div_ceil(15) * k) as f64
+        };
+        let progressive = build(ProgressiveBuild::Always);
+        let exact = build(ProgressiveBuild::Never);
+        assert!(progressive.stats.nn_descent.approximate_iterations > 0);
+        assert_eq!(exact.stats.nn_descent.approximate_iterations, 0);
+        let (progressive_recall, exact_recall) = (recall(&progressive.graph), recall(&exact.graph));
+        assert!(progressive_recall > 0.97, "progressive recall {progressive_recall}");
+        assert!(progressive_recall >= exact_recall - 0.01, "{progressive_recall} vs {exact_recall}");
+        // The graph holds exact distances.
+        for point in 0..n {
+            for slot in 0..k {
+                let q = progressive.graph.indices[point * k + slot];
+                if q >= 0 {
+                    let d = SquaredEuclidean.distance(row(point), row(q as usize));
+                    assert!((progressive.graph.distances[point * k + slot] - d).abs() <= 1e-4 * (1.0 + d));
+                }
+            }
+        }
+        // Auto leaves narrow data exact.
+        assert_eq!(build(ProgressiveBuild::Auto).stats.nn_descent.approximate_iterations, 0);
+    }
+
+    #[test]
+    fn code_tree_forest_matches_float_forest_quality() {
+        // From CODE_TREE_MIN_DIM features the forest splits 8-bit codes, also
+        // without a progressive build.
+        let (n, dim, k) = (1500, crate::nndescent::CODE_TREE_MIN_DIM, 10);
+        let mut rng = FastRng::new(37);
+        let centres: Vec<f32> = (0..15 * dim).map(|_| rng.next_float() * 4.0 - 2.0).collect();
+        let mut data = Vec::with_capacity(n * dim);
+        for _ in 0..n {
+            let centre = rng.next_index(15);
+            data.extend((0..dim).map(|t| centres[centre * dim + t] + rng.next_float() - 0.5));
+        }
+        let build = |code_trees: bool| {
+            NNDescentBuilder::new(&data, n, dim)
+                .n_neighbors(k)
+                .random_seed(3)
+                .code_trees(code_trees)
+                .build_graph_with_distance(SquaredEuclidean, None)
+        };
+        let row = |i: usize| &data[i * dim..(i + 1) * dim];
+        let recall = |graph: &NeighborGraph| {
+            let mut hits = 0;
+            for point in (0..n).step_by(15) {
+                let mut exact: Vec<(f32, usize)> =
+                    (0..n).filter(|&q| q != point).map(|q| (SquaredEuclidean.distance(row(point), row(q)), q)).collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let truth: Vec<i32> = exact[..k].iter().map(|&(_, q)| q as i32).collect();
+                hits += graph.indices[point * k..(point + 1) * k].iter().filter(|q| truth.contains(q)).count();
+            }
+            hits as f64 / (n.div_ceil(15) * k) as f64
+        };
+        let (code, float) = (build(true), build(false));
+        assert_eq!(code.stats.nn_descent.approximate_iterations, 0);
+        let (code_recall, float_recall) = (recall(&code.graph), recall(&float.graph));
+        assert!(code_recall > 0.97 && code_recall >= float_recall - 0.01, "{code_recall} vs {float_recall}");
     }
 
     #[test]
@@ -1341,7 +1477,7 @@ mod tests {
             );
         }
 
-        let tree = index.search_trees.first().expect("search tree");
+        let tree = index.search_tree.as_ref().expect("search tree");
         assert_eq!(tree.indices, (0..n as i32).collect::<Vec<_>>());
 
         let exported_graph = index.search_graph_original_order();
@@ -1357,24 +1493,25 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_search_trees_are_retained_and_remapped() {
-        let n = 100;
+    fn test_prepare_builds_the_hub_search_tree() {
+        let n = 300;
         let dim = 10;
         let data = create_test_data(n, dim);
 
-        let index = NNDescentBuilder::new(&data, n, dim)
+        let mut index = NNDescentBuilder::new(&data, n, dim)
             .n_neighbors(10)
             .n_trees(3)
-            .n_search_trees(2)
             .n_iters(3)
-            .build_euclidean();
-
-        assert_eq!(index.search_trees.len(), 2);
-        for tree in &index.search_trees {
-            let mut indices = tree.indices.clone();
-            indices.sort_unstable();
-            assert_eq!(indices, (0..n as i32).collect::<Vec<_>>());
-        }
+            .search_tree_leaf_size(20)
+            .build_unprepared_with_distance(SquaredEuclidean, None);
+        assert!(index.search_tree.is_none());
+        index.prepare();
+        let tree = index.search_tree.as_ref().expect("hub tree");
+        let mut indices = tree.indices.clone();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..n as i32).collect::<Vec<_>>());
+        assert!(tree.get_all_leaves().iter().all(|&(start, end)| end - start <= 20));
+        assert!(index.build_stats.search_tree_seconds > 0.0);
 
         let query_id = 37usize;
         let query = &data[query_id * dim..(query_id + 1) * dim];

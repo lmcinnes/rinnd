@@ -106,6 +106,11 @@ unsafe fn horizontal_sum_avx(value: std::arch::x86_64::__m256) -> f32 {
 impl Distance<f32> for AlternativeDot {
     const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
 
+    /// Ordered by the dot product, as `1 - <x, y>` codes are.
+    fn build_code_kind(&self) -> Option<super::affine::AffineKind> {
+        Some(super::affine::AffineKind::Dot)
+    }
+
     #[inline]
     fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
         normalized_dot_four(query, candidates).map(alternative_dot_from_similarity)
@@ -145,6 +150,10 @@ pub struct DirectNormalizedCosine;
 
 impl Distance<f32> for DirectNormalizedCosine {
     const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-angular");
+
+    fn build_code_kind(&self) -> Option<super::affine::AffineKind> {
+        Some(super::affine::AffineKind::Dot)
+    }
 
     #[inline]
     fn distance_four(&self, query: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {

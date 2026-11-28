@@ -51,6 +51,7 @@ pub mod visited;
 pub use distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 pub use heap::NeighborHeap;
 pub use index::{GraphBuildResult, NNDescentBuilder, NNDescentIndex, VertexOrder};
+pub use nndescent::ProgressiveBuild;
 pub use rng::{FastRng, TauRand};
 pub use visited::VisitedSet;
 

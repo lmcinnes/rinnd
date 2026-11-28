@@ -18,6 +18,30 @@ pub const LINE: usize = 64;
 #[repr(C, align(64))]
 pub struct Line(pub [u8; LINE]);
 
+/// Lines from which [`zeroed_lines`] zeroes in parallel (4 MiB).
+const PARALLEL_ZERO_LINES: usize = 1 << 16;
+
+/// `n` zero lines. A large buffer is zeroed in parallel: `vec![line; n]` writes
+/// it serially (`Line` misses the standard library's zeroed-allocation fast
+/// path, as would `alloc_zeroed`, which falls back to `memset` for 64-byte
+/// alignment), so filling and faulting in gigabytes of codes would take a
+/// single thread most of a second.
+fn zeroed_lines(n: usize) -> Vec<Line> {
+    use rayon::prelude::*;
+    if n < PARALLEL_ZERO_LINES {
+        return vec![Line([0; LINE]); n];
+    }
+    let mut lines = Vec::with_capacity(n);
+    lines.spare_capacity_mut()[..n].par_chunks_mut(4096).for_each(|chunk| {
+        for line in chunk {
+            line.write(Line([0; LINE]));
+        }
+    });
+    // SAFETY: the first `n` lines were initialized above.
+    unsafe { lines.set_len(n) };
+    lines
+}
+
 /// Bytes stored in whole, 64-byte aligned lines.
 #[derive(Clone, Debug, Default)]
 pub struct AlignedBytes {
@@ -27,9 +51,7 @@ pub struct AlignedBytes {
 impl AlignedBytes {
     /// `n_bytes` zero bytes (rounded up to whole lines).
     pub fn zeroed(n_bytes: usize) -> Self {
-        Self {
-            lines: vec![Line([0; LINE]); n_bytes.div_ceil(LINE)],
-        }
+        Self { lines: zeroed_lines(n_bytes.div_ceil(LINE)) }
     }
 
     /// Make this `n_bytes` long (rounded up to whole lines), all zero.
@@ -129,6 +151,29 @@ pub fn dot4_u8(kernel: Kernel, rows: [&[u8]; 4], weights: &[i8]) -> [i32; 4] {
     }
 }
 
+/// [`dot_u8`] of one row with the first `count` (at most 4) of `weights`; the
+/// other results are zero.
+#[inline(always)]
+pub fn dot_u8_weights4(kernel: Kernel, row: &[u8], weights: [&[i8]; 4], count: usize) -> [i32; 4] {
+    debug_assert!(count <= 4);
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Vnni => unsafe { vnni::dot_u8_weights4(row, weights, count) },
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx2 => unsafe { avx2::dot_u8_weights4(row, weights, count) },
+        _ => portable_dot_u8_weights4(row, weights, count),
+    }
+}
+
+#[inline(always)]
+fn portable_dot_u8_weights4(row: &[u8], weights: [&[i8]; 4], count: usize) -> [i32; 4] {
+    let mut out = [0; 4];
+    for (out, weights) in out.iter_mut().zip(weights).take(count) {
+        *out = portable_dot_u8(row, weights);
+    }
+    out
+}
+
 /// `sum_t lo(row[t]) * weights[t] + hi(row[t]) * weights[n + t]` for 4-bit
 /// codes (`n == row.len()`, `weights.len() == 2 * n`).
 #[inline(always)]
@@ -172,7 +217,12 @@ fn portable_dot_u4(row: &[u8], weights: &[i8]) -> i32 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{portable_dot_u4, portable_dot_u8};
+    use super::{portable_dot_u4, portable_dot_u8, portable_dot_u8_weights4};
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn dot_u8_weights4(row: &[u8], weights: [&[i8]; 4], count: usize) -> [i32; 4] {
+        portable_dot_u8_weights4(row, weights, count)
+    }
 
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn dot_u8(row: &[u8], weights: &[i8]) -> i32 {
@@ -219,6 +269,29 @@ mod vnni {
         let mut out = [0i32; 4];
         for r in 0..count {
             out[r] = _mm512_reduce_add_epi32(acc[r]);
+        }
+        out
+    }
+
+    /// One row against the first `count` (at most 4) of `weights`; the rest are
+    /// zero. The row must be whole lines long.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    pub(super) unsafe fn dot_u8_weights4(row: &[u8], weights: [&[i8]; 4], count: usize) -> [i32; 4] {
+        let n = row.len();
+        debug_assert_eq!(n % super::LINE, 0);
+        let mut acc = [_mm512_setzero_si512(); 4];
+        let mut offset = 0;
+        while offset < n {
+            let c = _mm512_loadu_si512(row.as_ptr().add(offset).cast());
+            for w in 0..count {
+                let wv = _mm512_loadu_si512(weights[w].as_ptr().add(offset).cast());
+                acc[w] = _mm512_dpbusd_epi32(acc[w], c, wv);
+            }
+            offset += super::LINE;
+        }
+        let mut out = [0i32; 4];
+        for w in 0..count {
+            out[w] = _mm512_reduce_add_epi32(acc[w]);
         }
         out
     }
@@ -296,6 +369,10 @@ mod tests {
                 assert_eq!(dot4_u8(kernel, views, &w[..n]), expect8, "{kernel:?} n={n}");
                 assert_eq!(dot4_u4(kernel, views, w), expect4, "{kernel:?} n={n}");
                 assert_eq!(dot_u8(kernel, views[2], &w[..n]), expect8[2]);
+                let planes = [&w[..n], &w[n..], &w[..n], &w[n..]];
+                let expect = planes.map(|plane| portable_dot_u8(views[1], plane));
+                assert_eq!(dot_u8_weights4(kernel, views[1], planes, 4), expect, "{kernel:?} n={n}");
+                assert_eq!(dot_u8_weights4(kernel, views[1], planes, 3), [expect[0], expect[1], expect[2], 0]);
                 assert_eq!(dot_u4(kernel, views[3], w), expect4[3]);
             }
             // Spot check the portable loops themselves.

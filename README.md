@@ -186,7 +186,7 @@ by graph-only builds. It runs breadth-first levels while nodes are large, then
 gathers each node of at most 4 MiB of vectors into a contiguous buffer and finishes
 its subtree locally. Seeds, splits, the dot-product kernel, tie rule and partition
 match the breadth-first builder, and leaves are emitted in the same order, so leaves
-and graphs are identical. Index builds with retained search trees are unaffected.
+and graphs are identical. Index builds use the same forest (it only provides leaves).
 
 The full-corpus paired profile found identical graphs in all measured pairs and
 forest time 10-35% lower; see the
@@ -312,9 +312,23 @@ retain the input data or query structures, so `query()`, `prepare()`,
 Graph-only indexes use breadth-first RP forest construction with a tree batch
 width of 6 by default. Set `tree_build_strategy="depth_first"` to use the
 legacy builder, or set `tree_batch_width` to tune breadth-first batching.
-Search-capable indexes use the same breadth-first forest by default and keep its
-first `n_search_trees` trees for query seeding, so their k-NN graph matches the
-graph-only build for the same parameters.
+Search-capable indexes use the same breadth-first forest by default, so their
+k-NN graph matches the graph-only build for the same parameters; searches start
+from a tree built from that graph (see [Search trees](#search-trees)).
+
+### Progressive builds
+
+On wide data most of a build goes into distances in the RP-tree leaf join and
+the first NN-descent iterations, which only need to find roughly the right
+neighbours. From 512 features up (euclidean metrics, and `metric="cosine"` with
+`normalize=True`), those phases run on 8-bit codes scored with integer dot
+products (AVX-512 VNNI where available), with heaps 1.25 times wider; then
+every candidate is re-scored exactly and NN-descent finishes with float32
+distances, so the graph holds exact distances. `progressive_build=False`
+keeps every distance exact, and `True` applies it at any width. From 128
+features up, the breadth-first forest also splits 8-bit codes (only its
+leaves are needed), in every build with such a metric. `build_stats` reports
+`code_seconds`, `approximate_iterations` and `rescore_seconds`.
 
 ### Quantized search
 
@@ -361,6 +375,19 @@ factor, so values above 1 keep more long edges (a denser graph that can help
 out-of-distribution queries). `vertex_order="rcm"` numbers the points by
 reverse Cuthill-McKee on the search graph instead of by search-tree leaf
 order, placing graph neighbours close together in memory.
+
+### Search trees
+
+Searches start from the points in their query's leaf of a search tree, which
+`prepare()` builds from the k-NN graph, as pynndescent does: each node splits
+on the hyperplane between two of its three highest in-degree points ("hubs"),
+taking the most balanced pair, or moving it to the median margin when no pair
+puts 10% of the points on its smaller side. Its leaf size,
+`search_tree_leaf_size` (default 48), is the number of points a search starts
+from, and `search_tree_leaf_budget` (default 1) visits more leaves. The tree
+also sets the default (`vertex_order="tree"`) layout. The construction forest
+only provides the graph's initial neighbours, so the build keeps just its
+leaves.
 
 ## Rust Usage
 

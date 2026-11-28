@@ -637,3 +637,84 @@ def test_diversify_alpha_and_vertex_order():
         rinnd.RINND(data, diversify_alpha=0.9, **base)
     with pytest.raises(ValueError):
         rinnd.RINND(data, vertex_order="random", **base)
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+def test_progressive_build_matches_exact_build(metric):
+    data, _ = clustered_data(n_points=1500, dimension=64)
+    kwargs = dict(normalize=True, cosine_distance_mode="direct") if metric == "cosine" else {}
+    base = dict(metric=metric, n_neighbors=10, graph_only=True, random_state=42, **kwargs)
+    if metric == "euclidean":
+        squared = (data**2).sum(1)
+        d = squared[:, None] - 2 * data @ data.T + squared[None]
+    else:
+        unit = data / np.linalg.norm(data, axis=1, keepdims=True)
+        d = 1.0 - unit @ unit.T
+    np.fill_diagonal(d, np.inf)
+    true = np.argsort(d, axis=1)[:, :10]
+
+    graphs = {}
+    for mode in (True, False):
+        index = rinnd.RINND(data, progressive_build=mode, **base)
+        stats = dict(index.build_stats)
+        assert (stats["approximate_iterations"] > 0) == mode
+        assert (stats["code_seconds"] > 0) == mode
+        graphs[mode] = index.neighbor_graph
+    recall = {
+        mode: np.mean([len(set(a) & set(b)) / 10 for a, b in zip(indices, true)])
+        for mode, (indices, _) in graphs.items()
+    }
+    assert recall[True] > 0.97 and recall[True] >= recall[False] - 0.01
+    # Both graphs hold exact distances.
+    exact = {}
+    for indices, distances in graphs.values():
+        for point, (row, values) in enumerate(zip(indices, distances)):
+            for neighbor, value in zip(row, values):
+                exact.setdefault((point, neighbor), value)
+                assert np.isclose(exact[(point, neighbor)], value, rtol=1e-4, atol=1e-5)
+
+    # 'auto' (the default) leaves narrow data exact.
+    for mode in ("auto", None):
+        kwargs = {} if mode is None else dict(progressive_build=mode)
+        assert dict(rinnd.RINND(data, **kwargs, **base).build_stats)["approximate_iterations"] == 0
+    with pytest.raises(ValueError, match="progressive_build"):
+        rinnd.RINND(data, progressive_build="always", **base)
+
+
+def test_normalize_copies_any_layout_in_parallel():
+    data, _ = clustered_data(n_points=2000, dimension=40)
+    unit = data / np.linalg.norm(data, axis=1, keepdims=True)
+    d = 1.0 - unit @ unit.T
+    np.fill_diagonal(d, np.inf)
+    true = np.argsort(d, axis=1)[:, :8]
+    base = dict(metric="cosine", normalize=True, cosine_distance_mode="direct", n_neighbors=8, random_state=7)
+    # Reversing the features keeps cosine distances, through negative strides.
+    for layout in (data, np.asfortranarray(data), data[:, ::-1]):
+        indices, distances = rinnd.RINND(layout, graph_only=True, n_jobs=4, **base).neighbor_graph
+        assert np.mean([len(set(a) & set(b)) / 8 for a, b in zip(indices, true)]) > 0.97
+        assert np.allclose(distances, np.take_along_axis(d, indices, axis=1), atol=1e-5)
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+def test_hub_search_tree(metric):
+    data, queries = clustered_data(n_points=3000)
+    kwargs = dict(normalize=True, cosine_distance_mode="direct") if metric == "cosine" else {}
+    base = dict(metric=metric, n_neighbors=15, random_state=42, **kwargs)
+    graph = rinnd.RINND(data, graph_only=True, **base).neighbor_graph
+    index = rinnd.RINND(data, search_tree_leaf_size=40, **base)
+    # The forest only gives leaves: the search index's graph is the graph-only one.
+    np.testing.assert_array_equal(index.neighbor_graph[0], graph[0])
+    index.prepare()
+    assert dict(index.build_stats)["search_tree_seconds"] > 0
+    _, _, children, leaf_indices = index.export_search_tree()
+    assert sorted(leaf_indices) == list(range(len(data)))
+    leaves = children[children[:, 0] <= 0]
+    assert np.all(leaves[:, 0] - leaves[:, 1] <= 40)
+    exact = exact_neighbors(data, queries, 10, metric)
+    found = np.vstack([index.query_one_indices(q, k=10, epsilon=0.1) for q in queries])
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, exact)]) > 0.95
+
+    with pytest.raises(ValueError, match="search_tree_leaf_size"):
+        rinnd.RINND(data, search_tree_leaf_size=0, **base)
+    with pytest.raises(TypeError):
+        rinnd.RINND(data, n_search_trees=2, **base)

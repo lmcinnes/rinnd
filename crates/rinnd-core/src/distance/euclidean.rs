@@ -14,6 +14,10 @@ pub struct SquaredEuclidean;
 impl Distance<f32> for SquaredEuclidean {
     const USE_DISTANCE_FOUR: bool = cfg!(feature = "batched-euclidean");
 
+    fn build_code_kind(&self) -> Option<super::affine::AffineKind> {
+        Some(super::affine::AffineKind::SquaredEuclidean)
+    }
+
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());

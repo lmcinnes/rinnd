@@ -56,6 +56,13 @@ pub trait Distance<T>: Send + Sync + Clone {
 
     /// Get the name of this distance metric.
     fn name(&self) -> &'static str;
+
+    /// The distance 8-bit codes approximate for building a k-NN graph
+    /// progressively (see `nndescent::progressive`): codes order pairs like this
+    /// distance does, or `None` if they cannot.
+    fn build_code_kind(&self) -> Option<super::affine::AffineKind> {
+        None
+    }
 }
 
 /// Marker trait for distances that have a squared form.

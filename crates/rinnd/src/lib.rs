@@ -3,19 +3,24 @@
 //! This crate provides Python-compatible classes that mirror the PyNNDescent API.
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
+use rinnd_core::distance::affine::{
+    AffineCodes, AffineKind, AffineQuery, HalfQuery, HalfRows, PcaProjection, ProjectionDims,
+    DEFAULT_SQ4_CLIP_QUANTILE,
+};
 use rinnd_core::distance::quantized::{
     quantized_i8_alternative_dot, quantized_i8_dot, quantized_u8_sq_euclidean,
 };
 use rinnd_core::distance::*;
 use rinnd_core::graph::{NeighborGraph, SearchGraph};
-use rinnd_core::index::{BuildStats, GraphBuildResult, NNDescentBuilder, NNDescentIndex};
+use rinnd_core::index::{BuildStats, GraphBuildResult, NNDescentBuilder, NNDescentIndex, VertexOrder};
+use rinnd_core::query_sample::{QuerySample, QuerySampleOptions};
 use rinnd_core::search::SearchWorkspace;
 use rinnd_core::tree::{FlatTree, QuantizedFlatTree};
 
@@ -61,7 +66,10 @@ fn install_in_pool<R: Send>(
 ///     2D array of shape (n_samples, n_features) containing the data points.
 /// metric : str, default='euclidean'
 ///     Distance metric to use. Options: 'euclidean', 'l2', 'cosine',
-///     'inner_product', 'dot'.
+///     'inner_product', 'dot', 'mips'. 'mips' (maximum inner product search)
+///     indexes each point augmented to the largest data norm and returns
+///     negative inner products as distances; it supports quantization but
+///     not quantization_dims or graph_only, and has no neighbor_graph.
 /// n_neighbors : int, default=30
 ///     Number of neighbors to compute.
 /// n_trees : int, default=8
@@ -82,6 +90,16 @@ fn install_in_pool<R: Send>(
 ///     Maximum number of worker threads for this index. Use -1 for all
 ///     available cores. Positive values select an exact thread count. If
 ///     omitted, RINND uses Rayon's global thread pool configuration.
+/// diversify_alpha : float, default=1.0
+///     Search graph diversification drops an edge to a neighbour when a
+///     closer retained neighbour is nearer to it by a factor of
+///     ``diversify_alpha`` (alpha-pruning). Values above 1.0 keep more long
+///     edges, giving a denser graph that can help harder (e.g.
+///     out-of-distribution) queries.
+/// vertex_order : {'tree', 'rcm'}, default='tree'
+///     How the search index numbers (and lays out) the points: in the leaf
+///     order of the first search tree, or by reverse Cuthill-McKee on the
+///     search graph, which places graph neighbours close together in memory.
 ///
 /// Attributes
 /// ----------
@@ -101,6 +119,8 @@ pub struct PyNNDescent {
     dim: usize,
     /// Whether queries should be L2-normalized before search.
     normalize: bool,
+    /// Whether this is a `metric="mips"` index (see `MipsIndex`).
+    mips: bool,
     /// Index parameters
     n_neighbors: usize,
     /// The internal index (type-erased)
@@ -614,6 +634,430 @@ impl AnyIndex for QuantizedI8Index {
     }
 }
 
+/// Sample queries and their nearest data points (`query_sample=...`), owned.
+struct OwnedQuerySample {
+    queries: Vec<f32>,
+    neighbors: Vec<i32>,
+    n_queries: usize,
+    width: usize,
+    options: QuerySampleOptions,
+}
+
+impl OwnedQuerySample {
+    fn sample(&self) -> QuerySample<'_> {
+        QuerySample {
+            queries: &self.queries,
+            neighbors: &self.neighbors,
+            n_queries: self.n_queries,
+            width: self.width,
+        }
+    }
+}
+
+/// Prepare `index` for search, adapted to `sample` when given.
+fn prepare_index<D: Distance<f32>>(index: &mut NNDescentIndex<D>, sample: Option<&OwnedQuerySample>) {
+    match sample {
+        Some(sample) => index.prepare_with_query_sample(&sample.sample(), &sample.options),
+        None => index.prepare(),
+    }
+}
+
+/// How a `quantization="sq8"` / `"sq4"` index is encoded.
+#[derive(Clone, Copy, Debug)]
+struct SqOptions {
+    bits: u32,
+    clip_quantile: Option<f32>,
+    rerank_half: bool,
+    dims: Option<ProjectionDims>,
+}
+
+/// Search over per-feature affine 8-bit or 4-bit codes with an int8-weighted
+/// query, reranking the best candidates with the exact distance (from a
+/// float16 copy with `rerank_precision="float16"`).
+struct QuantizedSqIndex<D: Distance<f32> + Send + Sync> {
+    index: NNDescentIndex<D>,
+    codes: AffineCodes,
+    /// When set, the codes are of the data projected onto its top principal
+    /// axes (`quantization_dims`); reranking still uses every feature.
+    projection: Option<PcaProjection>,
+    /// Float16 rows for reranking.
+    half: Option<HalfRows>,
+    /// Leading features of each indexed point that are coded (all but the
+    /// augmenting one for mips).
+    features: usize,
+    workspace: Mutex<SearchWorkspace>,
+    /// Prepared code query, projected query, prepared float16 query.
+    query_scratch: Mutex<(AffineQuery, Vec<f32>, HalfQuery)>,
+    candidate_width: usize,
+    rerank_width: usize,
+    encode_seconds: f64,
+}
+
+impl<D: Distance<f32> + Send + Sync> QuantizedSqIndex<D> {
+    fn new(
+        index: NNDescentIndex<D>,
+        kind: AffineKind,
+        options: SqOptions,
+        candidate_width: usize,
+        rerank_width: usize,
+        seed: u64,
+    ) -> Self {
+        let encode_start = Instant::now();
+        let mips = matches!(kind, AffineKind::Mips { .. });
+        let features = if mips { index.dim - 1 } else { index.dim };
+        // The index is prepared, so its data is already in search order.
+        let projection = options
+            .dims
+            .filter(|_| !mips)
+            .and_then(|dims| PcaProjection::fit(&index.data, index.dim, dims, 20_000, seed));
+        let codes = match &projection {
+            Some(projection) => {
+                let projected = projection.project_rows(&index.data);
+                AffineCodes::encode_bits(
+                    &projected,
+                    projection.n_components,
+                    kind,
+                    options.bits,
+                    options.clip_quantile,
+                )
+            }
+            None => AffineCodes::encode_columns(
+                &index.data,
+                index.dim,
+                features,
+                kind,
+                options.bits,
+                options.clip_quantile,
+            ),
+        };
+        let half = options
+            .rerank_half
+            .then(|| HalfRows::encode_columns(&index.data, index.dim, features, kind));
+        let n_points = index.n_points;
+        let initial_k = index.n_neighbors.max(1);
+        Self {
+            index,
+            codes,
+            projection,
+            half,
+            features,
+            workspace: Mutex::new(SearchWorkspace::new(n_points, initial_k)),
+            query_scratch: Mutex::new((AffineQuery::default(), Vec::new(), HalfQuery::default())),
+            candidate_width,
+            rerank_width,
+            encode_seconds: encode_start.elapsed().as_secs_f64(),
+        }
+    }
+
+    fn default_widths(&self, k: usize) -> (usize, usize) {
+        // Without explicit widths, keep twice k candidates and rerank them all.
+        let candidate_width = if self.candidate_width > 0 { self.candidate_width } else { 2 * k };
+        let rerank_width = if self.rerank_width > 0 { self.rerank_width } else { candidate_width };
+        (candidate_width.max(k), rerank_width.min(candidate_width.max(k)))
+    }
+
+    fn query_one_widths(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> (Vec<i32>, Vec<f32>) {
+        // Always acquire these mutexes in scratch-then-workspace order.
+        let mut scratch = self.query_scratch.lock().expect("quantized query mutex poisoned");
+        let (prepared, projected, half_query) = &mut *scratch;
+        let features = &query[..self.features];
+        match &self.projection {
+            Some(projection) => {
+                let shift = projection.project_query(self.codes.kind(), query, projected);
+                self.codes.prepare_query(projected, prepared);
+                prepared.add_to_dot(shift);
+            }
+            None => self.codes.prepare_query(features, prepared),
+        }
+        let half = match &self.half {
+            Some(rows) => {
+                rows.prepare_query(features, half_query);
+                Some((rows, &*half_query))
+            }
+            None => None,
+        };
+        let mut workspace = self.workspace.lock().expect("query workspace mutex poisoned");
+        self.index.query_one_codes(
+            query,
+            prepared,
+            &self.codes,
+            half,
+            k,
+            candidate_width,
+            rerank_width,
+            epsilon,
+            &mut workspace,
+        )
+    }
+}
+
+impl<D: Distance<f32> + Send + Sync> AnyIndex for QuantizedSqIndex<D> {
+    fn prepare(&self) {}
+
+    fn is_prepared(&self) -> bool {
+        true
+    }
+
+    fn search_enabled(&self) -> bool {
+        true
+    }
+
+    fn query(
+        &self,
+        queries: &[f32],
+        n_queries: usize,
+        k: usize,
+        epsilon: f32,
+    ) -> (Vec<i32>, Vec<f32>) {
+        let (candidate_width, rerank_width) = self.default_widths(k);
+        let mut all_indices = Vec::with_capacity(n_queries * k);
+        let mut all_distances = Vec::with_capacity(n_queries * k);
+        for query in queries.chunks_exact(self.index.dim).take(n_queries) {
+            let (indices, distances) =
+                self.query_one_widths(query, k, epsilon, candidate_width, rerank_width);
+            all_indices.extend(indices);
+            all_distances.extend(distances);
+        }
+        (all_indices, all_distances)
+    }
+
+    fn query_quantized_widths(
+        &self,
+        queries: &[f32],
+        n_queries: usize,
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        let mut all_indices = Vec::with_capacity(n_queries * k);
+        let mut all_distances = Vec::with_capacity(n_queries * k);
+        for query in queries.chunks_exact(self.index.dim).take(n_queries) {
+            let (indices, distances) =
+                self.query_one_widths(query, k, epsilon, candidate_width, rerank_width);
+            all_indices.extend(indices);
+            all_distances.extend(distances);
+        }
+        Ok((all_indices, all_distances))
+    }
+
+    fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        let (candidate_width, rerank_width) = self.default_widths(k);
+        self.query_one_widths(query, k, epsilon, candidate_width, rerank_width)
+    }
+
+    fn query_one_indices(&self, query: &[f32], k: usize, epsilon: f32) -> Vec<i32> {
+        self.query_one(query, k, epsilon).0
+    }
+
+    fn query_one_quantized_widths(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        Ok(self.query_one_widths(query, k, epsilon, candidate_width, rerank_width))
+    }
+
+    fn neighbor_graph(&self) -> (Vec<i32>, Vec<f32>) {
+        (
+            self.index.neighbor_indices.clone(),
+            self.index.neighbor_distances.clone(),
+        )
+    }
+    fn build_stats(&self) -> BuildStats {
+        self.index.build_stats.clone()
+    }
+    fn search_graph_original_order(&self) -> SearchGraph {
+        self.index.search_graph_original_order()
+    }
+    fn search_graph_min_distance(&self) -> f32 {
+        self.index.min_distance
+    }
+    fn export_search_tree(&self) -> Option<FlatTree> {
+        self.index.export_search_tree()
+    }
+    fn storage_info(&self) -> (&'static str, usize, usize, usize, f64) {
+        let projection_bytes = self.projection.as_ref().map_or(0, |projection| {
+            projection.projection8.len()
+                + (projection.mean.len() + projection.column_scale.len()) * std::mem::size_of::<f32>()
+        });
+        let encoding = match (self.codes.bits, self.projection.is_some()) {
+            (8, false) => "sq8_affine",
+            (8, true) => "sq8_affine_pca",
+            (_, false) => "sq4_affine",
+            (_, true) => "sq4_affine_pca",
+        };
+        (
+            encoding,
+            self.codes.storage_bytes(),
+            (self.codes.offsets.len() + self.codes.scales.len()) * std::mem::size_of::<f32>()
+                + projection_bytes
+                + self.half.as_ref().map_or(0, HalfRows::storage_bytes),
+            self.index.retained_fp32_bytes(),
+            self.encode_seconds,
+        )
+    }
+}
+
+/// `metric="mips"`: the wrapped index searches points augmented with
+/// `sqrt(norm2 - |x|^2)` (so all have norm `sqrt(norm2)`, the largest data
+/// norm) by squared euclidean distance, for which zero-padded queries find the
+/// largest inner products: `|q' - x'|^2 = |q|^2 + norm2 - 2 <q, x>`. Returned
+/// distances are negative inner products.
+struct MipsIndex {
+    inner: Box<dyn AnyIndex>,
+    /// Features per (unaugmented) point.
+    dim: usize,
+    norm2: f32,
+}
+
+impl MipsIndex {
+    /// Zero-pad each query; also returns the squared query norms.
+    fn pad(&self, queries: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let n_queries = queries.len() / self.dim;
+        let mut padded = Vec::with_capacity(n_queries * (self.dim + 1));
+        let mut norms = Vec::with_capacity(n_queries);
+        for query in queries.chunks_exact(self.dim) {
+            padded.extend_from_slice(query);
+            padded.push(0.0);
+            norms.push(query.iter().map(|&q| q * q).sum());
+        }
+        (padded, norms)
+    }
+
+    /// Turn squared euclidean distances (`k` per query) into negative inner products.
+    fn to_inner_products(&self, distances: &mut [f32], k: usize, query_norms: &[f32]) {
+        if k == 0 {
+            return;
+        }
+        for (row, &query_norm) in distances.chunks_mut(k).zip(query_norms) {
+            for distance in row.iter_mut().filter(|d| d.is_finite()) {
+                *distance = 0.5 * (*distance - query_norm - self.norm2);
+            }
+        }
+    }
+}
+
+impl AnyIndex for MipsIndex {
+    fn prepare(&self) {
+        self.inner.prepare()
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.inner.is_prepared()
+    }
+
+    fn search_enabled(&self) -> bool {
+        self.inner.search_enabled()
+    }
+
+    fn query(&self, queries: &[f32], n_queries: usize, k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        let (padded, norms) = self.pad(&queries[..n_queries * self.dim]);
+        let (indices, mut distances) = self.inner.query(&padded, n_queries, k, epsilon);
+        self.to_inner_products(&mut distances, k, &norms);
+        (indices, distances)
+    }
+
+    fn query_quantized_widths(
+        &self,
+        queries: &[f32],
+        n_queries: usize,
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        let (padded, norms) = self.pad(&queries[..n_queries * self.dim]);
+        let (indices, mut distances) =
+            self.inner
+                .query_quantized_widths(&padded, n_queries, k, epsilon, candidate_width, rerank_width)?;
+        self.to_inner_products(&mut distances, k, &norms);
+        Ok((indices, distances))
+    }
+
+    fn query_one(&self, query: &[f32], k: usize, epsilon: f32) -> (Vec<i32>, Vec<f32>) {
+        let (padded, norms) = self.pad(query);
+        let (indices, mut distances) = self.inner.query_one(&padded, k, epsilon);
+        self.to_inner_products(&mut distances, k, &norms);
+        (indices, distances)
+    }
+
+    fn query_one_indices(&self, query: &[f32], k: usize, epsilon: f32) -> Vec<i32> {
+        self.inner.query_one_indices(&self.pad(query).0, k, epsilon)
+    }
+
+    fn query_one_quantized_widths(
+        &self,
+        query: &[f32],
+        k: usize,
+        epsilon: f32,
+        candidate_width: usize,
+        rerank_width: usize,
+    ) -> PyResult<(Vec<i32>, Vec<f32>)> {
+        let (padded, norms) = self.pad(query);
+        let (indices, mut distances) =
+            self.inner
+                .query_one_quantized_widths(&padded, k, epsilon, candidate_width, rerank_width)?;
+        self.to_inner_products(&mut distances, k, &norms);
+        Ok((indices, distances))
+    }
+
+    /// The euclidean k-NN graph of the augmented points.
+    fn neighbor_graph(&self) -> (Vec<i32>, Vec<f32>) {
+        self.inner.neighbor_graph()
+    }
+    fn build_stats(&self) -> BuildStats {
+        self.inner.build_stats()
+    }
+    fn search_graph_original_order(&self) -> SearchGraph {
+        self.inner.search_graph_original_order()
+    }
+    fn search_graph_min_distance(&self) -> f32 {
+        self.inner.search_graph_min_distance()
+    }
+    fn export_search_tree(&self) -> Option<FlatTree> {
+        self.inner.export_search_tree()
+    }
+    fn storage_info(&self) -> (&'static str, usize, usize, usize, f64) {
+        self.inner.storage_info()
+    }
+}
+
+/// Points augmented for [`MipsIndex`], and the squared norm they all have.
+fn mips_augment(data: numpy::ndarray::ArrayView2<'_, f32>) -> (Vec<f32>, f32) {
+    use rayon::prelude::*;
+    let (n_points, dim) = data.dim();
+    let mut augmented = vec![0.0f32; n_points * (dim + 1)];
+    let norms: Vec<f32> = augmented
+        .par_chunks_mut(dim + 1)
+        .enumerate()
+        .map(|(index, out)| {
+            let mut norm = 0.0f32;
+            for (o, &x) in out.iter_mut().zip(data.row(index).iter()) {
+                *o = x;
+                norm += x * x;
+            }
+            norm
+        })
+        .collect();
+    let norm2 = norms.iter().fold(0.0f32, |m, &v| m.max(v));
+    augmented
+        .par_chunks_mut(dim + 1)
+        .zip(norms.par_iter())
+        .for_each(|(row, &norm)| row[dim] = (norm2 - norm).max(0.0).sqrt());
+    (augmented, norm2)
+}
+
 impl AnyIndex for GraphOnlyIndex {
     fn prepare(&self) {}
 
@@ -782,7 +1226,7 @@ impl<D: Distance<f32> + Send + Sync> AnyIndex for AnyIndexWithWorkspace<D> {
 #[pymethods]
 impl PyNNDescent {
     #[new]
-    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6, n_jobs=None))]
+    #[pyo3(signature = (data, metric="euclidean", n_neighbors=30, n_trees=None, n_search_trees=1, search_tree_leaf_budget=1, leaf_size=None, max_candidates=None, n_iters=None, delta=0.001, random_state=None, diversify_prob=1.0, pruning_degree_multiplier=1.5, verbose=false, normalize=false, cosine_distance_mode="log", quantized_candidate_width=0, quantized_rerank_width=0, tree_quantization="none", retain_fp32_data=None, input_normalized=false, graph_only=false, tree_build_strategy="auto", tree_batch_width=6, n_jobs=None, quantization=None, quantization_dims=None, rerank_precision="float32", quantization_clip=None, query_sample=None, query_neighbors=None, query_sample_options=None, diversify_alpha=1.0, vertex_order="tree"))]
     fn new(
         data: PyReadonlyArray2<f32>,
         metric: &str,
@@ -809,6 +1253,15 @@ impl PyNNDescent {
         tree_build_strategy: &str,
         tree_batch_width: usize,
         n_jobs: Option<isize>,
+        quantization: Option<&str>,
+        quantization_dims: Option<f64>,
+        rerank_precision: &str,
+        quantization_clip: Option<f64>,
+        query_sample: Option<PyReadonlyArray2<f32>>,
+        query_neighbors: Option<PyReadonlyArray2<i32>>,
+        query_sample_options: Option<&Bound<'_, PyDict>>,
+        diversify_alpha: f32,
+        vertex_order: &str,
     ) -> PyResult<Self> {
         let shape = data.shape();
         let n_points = shape[0];
@@ -821,9 +1274,40 @@ impl PyNNDescent {
             ));
         }
 
-        // Parse metric
-        let parsed_metric = Metric::from_str(metric)
-            .ok_or_else(|| PyValueError::new_err(format!("Unknown metric: {}", metric)))?;
+        // Parse metric. "mips" searches augmented points by squared euclidean
+        // distance (see MipsIndex).
+        let mips = metric == "mips";
+        let parsed_metric = if mips {
+            Metric::SquaredEuclidean
+        } else {
+            Metric::from_str(metric)
+                .ok_or_else(|| PyValueError::new_err(format!("Unknown metric: {}", metric)))?
+        };
+        if mips && graph_only {
+            return Err(PyValueError::new_err("graph_only=True is not supported with metric='mips'"));
+        }
+        if !(diversify_alpha >= 1.0 && diversify_alpha.is_finite()) {
+            return Err(PyValueError::new_err(format!(
+                "diversify_alpha must be at least 1, got {diversify_alpha}"
+            )));
+        }
+        // The euclidean and cosine search distances behave like squared
+        // distances, so relaxing the (unsquared) distance by alpha is alpha^2.
+        let squared_distances = mips
+            || matches!(
+                parsed_metric,
+                Metric::Euclidean | Metric::L2 | Metric::SquaredEuclidean | Metric::Cosine
+            );
+        let diversify_relax = if squared_distances { diversify_alpha * diversify_alpha } else { diversify_alpha };
+        let vertex_order = match vertex_order {
+            "tree" => VertexOrder::Tree,
+            "rcm" => VertexOrder::Rcm,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown vertex_order: {other}; expected 'tree' or 'rcm'"
+                )))
+            }
+        };
 
         // For cosine, optional pre-normalization lets query-time distance use a dot-only path.
         let normalize_cosine = normalize && matches!(parsed_metric, Metric::Cosine);
@@ -879,6 +1363,161 @@ impl PyNNDescent {
                 "graph_only=True is incompatible with quantized cosine modes",
             ));
         }
+        let bits = match quantization {
+            None => None,
+            Some("sq8") => Some(8),
+            Some("sq4") => Some(4),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown quantization: {other}; expected None, 'sq8' or 'sq4'"
+                )))
+            }
+        };
+        let sq = bits.is_some();
+        let rerank_half = match rerank_precision {
+            "float32" => false,
+            "float16" => true,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown rerank_precision: {other}; expected 'float32' or 'float16'"
+                )))
+            }
+        };
+        if rerank_half && !sq {
+            return Err(PyValueError::new_err(
+                "rerank_precision='float16' requires quantization='sq8' or 'sq4'",
+            ));
+        }
+        let clip_quantile = match (bits, quantization_clip) {
+            (None, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "quantization_clip requires quantization='sq8' or 'sq4'",
+                ))
+            }
+            (_, Some(value)) if !(0.0..0.5).contains(&value) => {
+                return Err(PyValueError::new_err(format!(
+                    "quantization_clip must be in [0, 0.5), got {value}"
+                )))
+            }
+            (_, Some(value)) => (value > 0.0).then_some(value as f32),
+            (Some(4), None) => Some(DEFAULT_SQ4_CLIP_QUANTILE),
+            _ => None,
+        };
+        let projection_dims = match quantization_dims {
+            None => None,
+            Some(_) if !sq => {
+                return Err(PyValueError::new_err(
+                    "quantization_dims requires quantization='sq8' or 'sq4'",
+                ))
+            }
+            Some(value) if value > 0.0 && value < 1.0 => Some(ProjectionDims::VarianceFraction(value)),
+            Some(value) if value >= 1.0 && value.fract() == 0.0 => {
+                Some(ProjectionDims::Components(value as usize))
+            }
+            Some(value) => {
+                return Err(PyValueError::new_err(format!(
+                    "quantization_dims must be a positive integer or a variance fraction in (0, 1), got {value}"
+                )))
+            }
+        };
+        if mips && projection_dims.is_some() {
+            return Err(PyValueError::new_err(
+                "quantization_dims is not supported with metric='mips'",
+            ));
+        }
+        if sq {
+            let supported = matches!(
+                parsed_metric,
+                Metric::Euclidean | Metric::L2 | Metric::SquaredEuclidean
+            ) || normalize_cosine;
+            if !supported {
+                return Err(PyValueError::new_err(
+                    "quantization='sq8'/'sq4' supports euclidean metrics and metric='cosine' with normalize=True",
+                ));
+            }
+            if quantized_encoding.is_some() || quantize_trees || graph_only {
+                return Err(PyValueError::new_err(
+                    "quantization='sq8'/'sq4' is incompatible with quantized cosine modes, tree_quantization and graph_only",
+                ));
+            }
+        }
+        let sq_options = bits.map(|bits| SqOptions {
+            bits,
+            clip_quantile,
+            rerank_half,
+            dims: projection_dims,
+        });
+
+        let owned_sample = match (query_sample, query_neighbors) {
+            (None, None) => {
+                if query_sample_options.is_some() {
+                    return Err(PyValueError::new_err("query_sample_options requires query_sample"));
+                }
+                None
+            }
+            (Some(_), None) => {
+                return Err(PyValueError::new_err(
+                    "query_sample requires query_neighbors: the indices of each sample query's nearest data points",
+                ))
+            }
+            (None, Some(_)) => return Err(PyValueError::new_err("query_neighbors requires query_sample")),
+            (Some(sample), Some(neighbors)) => {
+                if graph_only || quantized_encoding.is_some() {
+                    return Err(PyValueError::new_err(
+                        "query_sample is incompatible with graph_only and quantized cosine modes",
+                    ));
+                }
+                let (n_queries, sample_dim) = (sample.shape()[0], sample.shape()[1]);
+                if sample_dim != dim {
+                    return Err(PyValueError::new_err(format!(
+                        "query_sample must have {dim} features, got {sample_dim}"
+                    )));
+                }
+                let (n_rows, width) = (neighbors.shape()[0], neighbors.shape()[1]);
+                if n_rows != n_queries || width == 0 {
+                    return Err(PyValueError::new_err(
+                        "query_neighbors must have a row of neighbor indices for each sample query",
+                    ));
+                }
+                let mut queries: Vec<f32> = sample.as_array().iter().copied().collect();
+                let neighbors: Vec<i32> = neighbors.as_array().iter().copied().collect();
+                if neighbors.iter().any(|&idx| idx >= n_points as i32 || idx < -1) {
+                    return Err(PyValueError::new_err(
+                        "query_neighbors holds indices beyond the indexed data",
+                    ));
+                }
+                if normalize_cosine {
+                    normalize_rows_inplace(&mut queries, dim);
+                }
+                if mips {
+                    queries = queries
+                        .chunks_exact(dim)
+                        .flat_map(|query| query.iter().copied().chain([0.0]))
+                        .collect();
+                }
+                let mut options = QuerySampleOptions::default();
+                if let Some(dict) = query_sample_options {
+                    for (key, value) in dict.iter() {
+                        let key: String = key.extract()?;
+                        let value: usize = value.extract()?;
+                        match key.as_str() {
+                            "edges" => options.edges = value,
+                            "pivots" => options.pivots = value,
+                            "candidates" => options.candidates = value,
+                            "tree_leaf_size" => options.tree_leaf_size = value,
+                            "tree_entries" => options.tree_entries = value,
+                            "tree_ranks" => options.tree_ranks = value,
+                            other => {
+                                return Err(PyValueError::new_err(format!(
+                                    "Unknown query_sample_options key: {other}"
+                                )))
+                            }
+                        }
+                    }
+                }
+                Some(OwnedQuerySample { queries, neighbors, n_queries, width, options })
+            }
+        };
 
         let breadth_first_batch_width = match tree_build_strategy {
             "auto" | "breadth_first" => Some(tree_batch_width),
@@ -935,6 +1574,7 @@ impl PyNNDescent {
                 n_points,
                 dim,
                 normalize: normalize_cosine,
+                mips: false,
                 n_neighbors,
                 index_data,
                 query_scratch: Mutex::new(Vec::new()),
@@ -942,9 +1582,14 @@ impl PyNNDescent {
             });
         }
 
+        let (index_dim, mips_norm2) = if mips { (dim + 1, Some(0.0)) } else { (dim, None) };
         // Search-capable indexes own their input after construction.
-        let mut data_vec: Vec<f32> = if data.is_c_contiguous() {
-            data.as_slice()?.to_vec()
+        let (mut data_vec, mips_norm2): (Vec<f32>, Option<f32>) = if mips_norm2.is_some() {
+            let view = data.as_array();
+            let (augmented, norm2) = install_in_pool(thread_pool.as_ref(), || mips_augment(view));
+            (augmented, Some(norm2))
+        } else if data.is_c_contiguous() {
+            (data.as_slice()?.to_vec(), None)
         } else {
             let mut values = Vec::with_capacity(n_points * dim);
             for row in 0..n_points {
@@ -952,7 +1597,7 @@ impl PyNNDescent {
                     values.push(*data.get([row, column]).unwrap());
                 }
             }
-            values
+            (values, None)
         };
         if normalize_cosine && !input_normalized {
             normalize_rows_inplace(&mut data_vec, dim);
@@ -969,7 +1614,7 @@ impl PyNNDescent {
             Self::build_index(
                 data_vec,
                 n_points,
-                dim,
+                index_dim,
                 parsed_metric,
                 normalize_cosine,
                 direct_cosine,
@@ -991,13 +1636,23 @@ impl PyNNDescent {
                 pruning_degree_multiplier,
                 verbose,
                 breadth_first_batch_width,
+                sq_options,
+                owned_sample,
+                mips_norm2,
+                diversify_relax,
+                vertex_order,
             )
         })?;
+        let index_data = match mips_norm2 {
+            Some(norm2) => Box::new(MipsIndex { inner: index_data, dim, norm2 }) as Box<dyn AnyIndex>,
+            None => index_data,
+        };
 
         Ok(Self {
             n_points,
             dim,
             normalize: normalize_cosine,
+            mips,
             n_neighbors,
             index_data,
             query_scratch: Mutex::new(vec![0.0; dim]),
@@ -1159,10 +1814,10 @@ impl PyNNDescent {
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
             py.detach(|| {
-                self.install(|| self.index_data.query_one(&scratch[..], k, epsilon))
+                self.run_single_query(|| self.index_data.query_one(&scratch[..], k, epsilon))
             })
         } else {
-            py.detach(|| self.install(|| self.index_data.query_one(query_slice, k, epsilon)))
+            py.detach(|| self.run_single_query(|| self.index_data.query_one(query_slice, k, epsilon)))
         };
 
         let idx = PyArray1::from_vec(py, indices);
@@ -1203,11 +1858,11 @@ impl PyNNDescent {
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
             py.detach(|| {
-                self.install(|| self.index_data.query_one_indices(&scratch[..], k, epsilon))
+                self.run_single_query(|| self.index_data.query_one_indices(&scratch[..], k, epsilon))
             })
         } else {
             py.detach(|| {
-                self.install(|| self.index_data.query_one_indices(query_slice, k, epsilon))
+                self.run_single_query(|| self.index_data.query_one_indices(query_slice, k, epsilon))
             })
         };
 
@@ -1252,7 +1907,7 @@ impl PyNNDescent {
             scratch.copy_from_slice(query_slice);
             normalize_rows_inplace(&mut scratch[..], qdim);
             py.detach(|| {
-                self.install(|| {
+                self.run_single_query(|| {
                     self.index_data.query_one_quantized_widths(
                         &scratch[..],
                         k,
@@ -1264,7 +1919,7 @@ impl PyNNDescent {
             })
         } else {
             py.detach(|| {
-                self.install(|| {
+                self.run_single_query(|| {
                     self.index_data.query_one_quantized_widths(
                         query_slice,
                         k,
@@ -1380,6 +2035,14 @@ impl PyNNDescent {
         &self,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<f32>>)> {
+        if self.mips {
+            // The graph holds euclidean neighbours of the augmented points, whose
+            // distances |x' - y'|^2 = 2 M^2 - 2 <x, y> - 2 a_x a_y depend on the
+            // appended features a; it is not an inner-product k-NN graph.
+            return Err(PyNotImplementedError::new_err(
+                "metric='mips' indexes have no inner-product neighbor graph; query the index with its data for one",
+            ));
+        }
         // Return the stored neighbor graph (no re-query needed)
         let (indices, distances) = self.index_data.neighbor_graph();
 
@@ -1560,6 +2223,14 @@ impl PyNNDescent {
         install_in_pool(self.thread_pool.as_ref(), operation)
     }
 
+    /// Run a single-query search on the calling thread. One query is searched
+    /// serially, so handing it to the thread pool would only add a thread
+    /// switch (several microseconds) per call.
+    #[inline]
+    fn run_single_query<R>(&self, operation: impl FnOnce() -> R) -> R {
+        operation()
+    }
+
     fn ensure_search_enabled(&self) -> PyResult<()> {
         if self.index_data.search_enabled() {
             Ok(())
@@ -1689,6 +2360,11 @@ impl PyNNDescent {
         pruning_degree_multiplier: f32,
         verbose: bool,
         breadth_first_batch_width: Option<usize>,
+        sq_options: Option<SqOptions>,
+        query_sample: Option<OwnedQuerySample>,
+        mips_norm2: Option<f32>,
+        diversify_relax: f32,
+        vertex_order: VertexOrder,
     ) -> PyResult<Box<dyn AnyIndex>> {
         // Compute default n_trees matching PyNNDescent: max(3, min(12, round(2*log10(n))))
         let effective_n_trees = n_trees.unwrap_or_else(|| {
@@ -1705,6 +2381,8 @@ impl PyNNDescent {
             .delta(delta)
             .random_seed(random_seed)
             .diversify_prob(diversify_prob)
+            .diversify_relax(diversify_relax)
+            .vertex_order(vertex_order)
             .pruning_degree_multiplier(pruning_degree_multiplier)
             .verbose(verbose);
 
@@ -1725,16 +2403,58 @@ impl PyNNDescent {
         // Metrics with fast alternatives use proxy distances + correction.
         // Others use the direct distance function.
         macro_rules! build {
-            ($dist:expr, $corr:expr, $min_override:expr) => {
-                Box::new(AnyIndexWithWorkspace::new(
-                    builder.build_unprepared_with_distance($dist, $corr),
-                    $min_override,
+            ($dist:expr, $corr:expr, $min_override:expr) => {{
+                let mut index = builder.build_unprepared_with_distance($dist, $corr);
+                // Without a query sample the index is prepared on first use.
+                if query_sample.is_some() {
+                    prepare_index(&mut index, query_sample.as_ref());
+                }
+                Box::new(AnyIndexWithWorkspace::new(index, $min_override)) as Box<dyn AnyIndex>
+            }};
+        }
+
+        macro_rules! build_sq {
+            ($dist:expr, $corr:expr, $kind:expr, $options:expr) => {{
+                let mut index = builder.build_unprepared_with_distance($dist, $corr);
+                prepare_index(&mut index, query_sample.as_ref());
+                Box::new(QuantizedSqIndex::new(
+                    index,
+                    $kind,
+                    $options,
+                    quantized_candidate_width,
+                    quantized_rerank_width,
+                    random_seed,
                 )) as Box<dyn AnyIndex>
-            };
+            }};
         }
 
         let index_data: Box<dyn AnyIndex> = match metric {
+            // Augmented points (see MipsIndex); codes hold the original features.
+            Metric::SquaredEuclidean if mips_norm2.is_some() && sq_options.is_some() => build_sq!(
+                SquaredEuclidean,
+                None,
+                AffineKind::Mips { norm2: mips_norm2.unwrap() },
+                sq_options.unwrap()
+            ),
             // Minkowski family
+            Metric::Euclidean | Metric::L2 if sq_options.is_some() => build_sq!(
+                SquaredEuclidean,
+                Some(|d: f32| d.sqrt()),
+                AffineKind::SquaredEuclidean,
+                sq_options.unwrap()
+            ),
+            Metric::SquaredEuclidean if sq_options.is_some() => build_sq!(
+                SquaredEuclidean,
+                None,
+                AffineKind::SquaredEuclidean,
+                sq_options.unwrap()
+            ),
+            Metric::Cosine if sq_options.is_some() => build_sq!(
+                DirectNormalizedCosine,
+                None,
+                AffineKind::Dot,
+                sq_options.unwrap()
+            ),
             Metric::Euclidean | Metric::L2 => {
                 build!(SquaredEuclidean, Some(|d: f32| d.sqrt()), None)
             }

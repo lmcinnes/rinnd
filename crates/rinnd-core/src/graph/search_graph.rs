@@ -15,6 +15,91 @@ pub struct SearchGraph {
     pub indices: Vec<i32>,
     /// Number of vertices
     pub n_vertices: usize,
+    /// Fixed-width, cache-line aligned copy of the rows for search (see
+    /// [`SearchGraph::build_padded`]); empty unless built.
+    padded: PaddedAdjacency,
+}
+
+/// One cache line of a padded adjacency row.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(64))]
+struct AdjacencyBlock([i32; 16]);
+
+/// Adjacency rows stored at a fixed, 64-byte aligned stride.
+///
+/// Slot 0 of each row holds the vertex degree and the neighbors follow, so a
+/// row's position is known without reading `indptr` (one dependent load less
+/// per expansion) and the next row to be expanded can be prefetched.
+#[derive(Clone, Debug, Default)]
+pub struct PaddedAdjacency {
+    blocks: Vec<AdjacencyBlock>,
+    blocks_per_row: usize,
+}
+
+impl PaddedAdjacency {
+    fn from_csr(indptr: &[i32], indices: &[i32], n_vertices: usize) -> Self {
+        let degree = |v: usize| {
+            indices[indptr[v] as usize..indptr[v + 1] as usize]
+                .iter()
+                .filter(|&&neighbor| neighbor >= 0)
+                .count()
+        };
+        let max_degree = (0..n_vertices).map(degree).max().unwrap_or(0);
+        let blocks_per_row = (max_degree + 1).div_ceil(16).max(1);
+        let mut blocks = vec![AdjacencyBlock([-1; 16]); n_vertices * blocks_per_row];
+        let slots = blocks_per_row * 16;
+        for v in 0..n_vertices {
+            let row = &mut blocks[v * blocks_per_row..(v + 1) * blocks_per_row];
+            // SAFETY: the blocks are contiguous `[i32; 16]` arrays.
+            let row: &mut [i32] =
+                unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut i32, slots) };
+            let mut count = 0;
+            for &neighbor in &indices[indptr[v] as usize..indptr[v + 1] as usize] {
+                if neighbor >= 0 {
+                    count += 1;
+                    row[count] = neighbor;
+                }
+            }
+            row[0] = count as i32;
+        }
+        Self { blocks, blocks_per_row }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.blocks_per_row == 0
+    }
+
+    #[inline(always)]
+    fn row(&self, vertex: usize) -> &[i32] {
+        let start = vertex * self.blocks_per_row;
+        let blocks = &self.blocks[start..start + self.blocks_per_row];
+        // SAFETY: the blocks are contiguous `[i32; 16]` arrays.
+        let row = unsafe {
+            std::slice::from_raw_parts(blocks.as_ptr() as *const i32, self.blocks_per_row * 16)
+        };
+        &row[1..1 + row[0] as usize]
+    }
+
+    #[inline(always)]
+    fn prefetch_row(&self, vertex: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let start = vertex * self.blocks_per_row;
+            if start < self.blocks.len() {
+                // The degree and the first neighbors share the first line;
+                // two lines cover rows of up to 31 neighbors.
+                for block in start..start + self.blocks_per_row.min(2) {
+                    unsafe {
+                        core::arch::x86_64::_mm_prefetch(
+                            self.blocks.as_ptr().add(block) as *const i8,
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SearchGraph {
@@ -24,6 +109,7 @@ impl SearchGraph {
             indptr: vec![0; n_vertices + 1],
             indices: Vec::new(),
             n_vertices,
+            padded: PaddedAdjacency::default(),
         }
     }
 
@@ -53,6 +139,7 @@ impl SearchGraph {
             indptr,
             indices,
             n_vertices: n_points,
+            padded: PaddedAdjacency::default(),
         }
     }
 
@@ -92,6 +179,7 @@ impl SearchGraph {
             indptr,
             indices,
             n_vertices: n_points,
+            padded: PaddedAdjacency::default(),
         }
     }
 
@@ -101,6 +189,32 @@ impl SearchGraph {
         let start = self.indptr[vertex] as usize;
         let end = self.indptr[vertex + 1] as usize;
         &self.indices[start..end]
+    }
+
+    /// Build the fixed-width, cache-line aligned copy of the rows that search
+    /// uses ([`SearchGraph::search_row`]). Call it once the graph is final:
+    /// changing the graph afterwards discards it.
+    pub fn build_padded(&mut self) {
+        self.padded = PaddedAdjacency::from_csr(&self.indptr, &self.indices, self.n_vertices);
+    }
+
+    /// The neighbors of `vertex` for search: from the padded rows when built
+    /// (only valid neighbors), otherwise the CSR row (which may contain -1).
+    #[inline(always)]
+    pub fn search_row(&self, vertex: usize) -> &[i32] {
+        if self.padded.is_empty() {
+            self.neighbors(vertex)
+        } else {
+            self.padded.row(vertex)
+        }
+    }
+
+    /// Hint the CPU to fetch the padded row of `vertex` (no-op without one).
+    #[inline(always)]
+    pub fn prefetch_search_row(&self, vertex: i32) {
+        if !self.padded.is_empty() && vertex >= 0 {
+            self.padded.prefetch_row(vertex as usize);
+        }
     }
 
     /// Get the degree (number of neighbors) of a vertex.
@@ -152,6 +266,7 @@ impl SearchGraph {
             indptr,
             indices,
             n_vertices: n,
+            padded: PaddedAdjacency::default(),
         }
     }
 
@@ -192,7 +307,69 @@ impl SearchGraph {
             indptr,
             indices,
             n_vertices: n,
+            padded: PaddedAdjacency::default(),
         }
+    }
+
+    /// A vertex order that numbers graph neighbours closely (reverse
+    /// Cuthill-McKee on the symmetrised graph, as scipy's
+    /// `reverse_cuthill_mckee(graph, symmetric_mode=False)`): breadth-first
+    /// from the lowest-degree unvisited vertex of each component, adding each
+    /// vertex's unvisited neighbours in order of increasing degree, reversed.
+    /// Returns `order` with `order[new] = old`.
+    pub fn reverse_cuthill_mckee(&self) -> Vec<usize> {
+        let n = self.n_vertices;
+        let transposed = self.transpose();
+        let mut indptr = Vec::with_capacity(n + 1);
+        let mut indices: Vec<i32> = Vec::with_capacity(2 * self.indices.len());
+        indptr.push(0usize);
+        let mut row = Vec::new();
+        for v in 0..n {
+            row.clear();
+            row.extend(
+                self.neighbors(v)
+                    .iter()
+                    .chain(transposed.neighbors(v))
+                    .copied()
+                    .filter(|&u| u >= 0 && u as usize != v),
+            );
+            row.sort_unstable();
+            row.dedup();
+            indices.extend_from_slice(&row);
+            indptr.push(indices.len());
+        }
+        let degree: Vec<usize> = (0..n).map(|v| indptr[v + 1] - indptr[v]).collect();
+
+        let mut seeds: Vec<usize> = (0..n).collect();
+        seeds.sort_by_key(|&v| degree[v]);
+        let mut visited = vec![false; n];
+        let mut order = Vec::with_capacity(n);
+        for seed in seeds {
+            if visited[seed] {
+                continue;
+            }
+            visited[seed] = true;
+            order.push(seed);
+            let mut head = order.len() - 1;
+            while head < order.len() {
+                let v = order[head];
+                head += 1;
+                let added = order.len();
+                for &u in &indices[indptr[v]..indptr[v + 1]] {
+                    let u = u as usize;
+                    if !visited[u] {
+                        visited[u] = true;
+                        order.push(u);
+                    }
+                }
+                order[added..].sort_by_key(|&u| degree[u]);
+            }
+            if order.len() == n {
+                break;
+            }
+        }
+        order.reverse();
+        order
     }
 
     /// Reorder the graph according to a permutation.
@@ -226,6 +403,7 @@ impl SearchGraph {
 
         self.indptr = new_indptr;
         self.indices = new_indices;
+        self.padded = PaddedAdjacency::default();
     }
 
     /// Prune edges to limit maximum degree.
@@ -249,6 +427,7 @@ impl SearchGraph {
 
         self.indptr = new_indptr;
         self.indices = new_indices;
+        self.padded = PaddedAdjacency::default();
     }
 
     /// Build a diversified + pruned search graph matching PyNNDescent's pipeline.
@@ -256,10 +435,16 @@ impl SearchGraph {
     /// Steps:
     /// 1. Forward diversify: relative-neighborhood pruning on sorted k-NN
     /// 2. Build forward CSR graph
-    /// 3. Reverse diversify: transpose, sort rows by distance, diversify
+    /// 3. Reverse edges: transpose (and with `reverse_diversify`, sort rows by
+    ///    distance and diversify them)
     /// 4. Union: forward ∪ diversified_reverse
     /// 5. Remove self-loops
     /// 6. Degree prune: cap max vertex degree
+    ///
+    /// Diversification drops an edge `i -> j` when a retained neighbour `c` of
+    /// `i` has `relax * d(c, j) < d(i, j)`; `relax > 1` keeps more of the longer
+    /// edges (alpha-pruning; `relax = alpha^2` for squared distances). Without
+    /// `reverse_diversify` step 3 keeps every reverse edge (as PyNNDescent does).
     pub fn from_dense_diversified<D: Distance<f32>>(
         neighbor_indices: &[i32],
         neighbor_distances: &[f32],
@@ -269,7 +454,10 @@ impl SearchGraph {
         dim: usize,
         dist: &D,
         diversify_prob: f32,
+        diversify_relax: f32,
+        reverse_diversify: bool,
         pruning_degree_multiplier: f32,
+        extra_edges: Option<&[Vec<(i32, f32)>]>,
     ) -> (Self, f32) {
         use rayon::prelude::*;
 
@@ -277,7 +465,7 @@ impl SearchGraph {
 
         // Step 1: Forward diversify (parallel over points)
         // Each point's neighbors are already sorted by ascending distance after sort_all().
-        let diversified: Vec<Vec<(i32, f32)>> = (0..n_points)
+        let mut diversified: Vec<Vec<(i32, f32)>> = (0..n_points)
             .into_par_iter()
             .map(|i| {
                 let row_start = i * k;
@@ -290,10 +478,22 @@ impl SearchGraph {
                     dim,
                     dist,
                     diversify_prob,
+                    diversify_relax,
                     max_degree,
                 )
             })
             .collect();
+
+        // Extra edges (e.g. query-induced ones) join each row's diversified edges.
+        if let Some(extra) = extra_edges {
+            diversified.par_iter_mut().zip(extra.par_iter()).for_each(|(row, extra_row)| {
+                for &(idx, d) in extra_row {
+                    if !row.iter().any(|&(present, _)| present == idx) {
+                        row.push((idx, d));
+                    }
+                }
+            });
+        }
 
         // Step 2: Build forward CSR graph (with distances for reverse diversification)
         let mut fwd_indptr = Vec::with_capacity(n_points + 1);
@@ -323,6 +523,9 @@ impl SearchGraph {
                 }
                 let row_indices = &rev_indices[start..end];
                 let row_data = &rev_data[start..end];
+                if !reverse_diversify {
+                    return row_indices.iter().copied().zip(row_data.iter().copied()).collect();
+                }
 
                 // Sort by distance for diversification
                 let mut order: Vec<usize> = (0..row_indices.len()).collect();
@@ -340,6 +543,7 @@ impl SearchGraph {
                     dim,
                     dist,
                     diversify_prob,
+                    diversify_relax,
                     max_degree,
                 )
             })
@@ -422,6 +626,7 @@ fn weighted_union_pruned(
         indptr,
         indices,
         n_vertices: n_points,
+        padded: PaddedAdjacency::default(),
     }
 }
 
@@ -436,6 +641,7 @@ fn diversify_row<D: Distance<f32>>(
     dim: usize,
     dist: &D,
     prune_probability: f32,
+    relax: f32,
     max_degree: usize,
 ) -> Vec<(i32, f32)> {
     let mut retained = Vec::new();
@@ -453,7 +659,7 @@ fn diversify_row<D: Distance<f32>>(
             let c_start = (c as usize) * dim;
             let j_start = (j as usize) * dim;
             let d_cj = dist.distance(&data[c_start..c_start + dim], &data[j_start..j_start + dim]);
-            if _d_ic > f32::MIN_POSITIVE && d_cj < d_ij {
+            if _d_ic > f32::MIN_POSITIVE && relax * d_cj < d_ij {
                 if prune_probability >= 1.0 || rand::thread_rng().gen::<f32>() < prune_probability {
                     keep = false;
                     break;
@@ -483,6 +689,7 @@ fn diversify_sorted_csr<D: Distance<f32>>(
     dim: usize,
     dist: &D,
     prune_probability: f32,
+    relax: f32,
     max_degree: usize,
 ) -> Vec<(i32, f32)> {
     let mut retained_indices = Vec::new();
@@ -502,7 +709,7 @@ fn diversify_sorted_csr<D: Distance<f32>>(
             let c_start = (c as usize) * dim;
             let j_start = (j as usize) * dim;
             let d_cj = dist.distance(&data[c_start..c_start + dim], &data[j_start..j_start + dim]);
-            if d_ic > f32::MIN_POSITIVE && d_cj < d_ij {
+            if d_ic > f32::MIN_POSITIVE && relax * d_cj < d_ij {
                 if prune_probability >= 1.0 || rand::thread_rng().gen::<f32>() < prune_probability {
                     keep = false;
                     break;
@@ -664,5 +871,37 @@ mod tests {
 
         assert_eq!(graph.neighbors(0), &[2]);
         assert_eq!(graph.num_edges(), 1);
+    }
+
+    #[test]
+    fn reverse_cuthill_mckee_numbers_neighbours_closely() {
+        // Two rings of 50 vertices (directed one way), labelled in a scrambled order.
+        let n = 100;
+        let label = |v: usize| (v * 37) % n;
+        let mut neighbors = vec![0i32; n];
+        for v in 0..n {
+            let next = if v < 50 { (v + 1) % 50 } else { 50 + (v - 50 + 1) % 50 };
+            neighbors[label(v)] = label(next) as i32;
+        }
+        let graph = SearchGraph::from_dense(&neighbors, n, 1);
+        let bandwidth = |order: &[usize]| {
+            let mut position = vec![0usize; n];
+            for (new, &old) in order.iter().enumerate() {
+                position[old] = new;
+            }
+            (0..n)
+                .flat_map(|v| graph.neighbors(v).iter().map(move |&u| (v, u as usize)))
+                .map(|(v, u)| position[v].abs_diff(position[u]))
+                .max()
+                .unwrap()
+        };
+        let order = graph.reverse_cuthill_mckee();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+        let identity: Vec<usize> = (0..n).collect();
+        assert!(bandwidth(&identity) > 40);
+        // A ring numbered breadth-first from one vertex has bandwidth 2.
+        assert!(bandwidth(&order) <= 2, "bandwidth {}", bandwidth(&order));
     }
 }

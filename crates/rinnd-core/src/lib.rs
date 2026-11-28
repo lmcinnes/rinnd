@@ -39,7 +39,9 @@ pub mod distance;
 pub mod graph;
 pub mod heap;
 pub mod index;
+pub mod linalg;
 pub mod nndescent;
+pub mod query_sample;
 pub mod rng;
 pub mod search;
 pub mod tree;
@@ -48,7 +50,7 @@ pub mod visited;
 // Re-exports for convenience
 pub use distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 pub use heap::NeighborHeap;
-pub use index::{GraphBuildResult, NNDescentBuilder, NNDescentIndex};
+pub use index::{GraphBuildResult, NNDescentBuilder, NNDescentIndex, VertexOrder};
 pub use rng::{FastRng, TauRand};
 pub use visited::VisitedSet;
 

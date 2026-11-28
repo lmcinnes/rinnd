@@ -1,14 +1,17 @@
 //! Main NNDescent index structure and builder.
 
+use crate::distance::affine::{AffineCodes, AffineQuery, HalfQuery, HalfRows};
 use crate::distance::{Cosine, Distance, Euclidean, InnerProduct, Metric, SquaredEuclidean};
 use crate::graph::{NeighborGraph, SearchGraph};
 use crate::nndescent::{nn_descent_graph, nn_descent_retained, NNDescentParams, NNDescentStats};
+use crate::query_sample::{query_induced_edges, query_search_tree, QuerySample, QuerySampleOptions};
 use crate::rng::FastRng;
 use crate::search::{
+    greedy_search_affine_into,
     greedy_search_indices_with_workspace_initialized,
     greedy_search_quantized_custom_with_workspace_initialized,
     greedy_search_quantized_i8_with_workspace_initialized,
-    greedy_search_with_workspace_initialized, SearchWorkspace,
+    greedy_search_with_workspace_initialized, prefetch_row, SearchWorkspace,
 };
 use crate::tree::{FlatTree, QuantizedFlatTree};
 use rayon::prelude::*;
@@ -74,8 +77,24 @@ pub struct NNDescentIndex<D: Distance<f32>> {
     /// Proxy distances retained until the search graph is prepared.
     construction_distances: Option<Vec<f32>>,
     diversify_prob: f32,
+    diversify_relax: f32,
+    reverse_diversify: bool,
     pruning_degree_multiplier: f32,
+    vertex_order_method: VertexOrder,
+    /// Whether random projection trees split by angle (angular metrics).
+    angular_trees: bool,
     prepared: bool,
+}
+
+/// How [`NNDescentIndex::prepare`] numbers the points (and lays out their rows).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VertexOrder {
+    /// The leaf order of the first search tree.
+    #[default]
+    Tree,
+    /// Reverse Cuthill-McKee on the search graph, so that the rows a search
+    /// reads when it expands a vertex sit close together in memory.
+    Rcm,
 }
 
 fn resolve_quantized_candidate_width(
@@ -122,11 +141,29 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
 
     /// Build query-only structures. Calling this more than once is a no-op.
     pub fn prepare(&mut self) {
+        self.prepare_inner(None);
+    }
+
+    /// Build query-only structures adapted to a sample of the queries (see
+    /// [`crate::query_sample`]): query-induced edges join the search graph and
+    /// searches start from a tree over the sample queries. `sample` holds
+    /// queries in this index's (original) data space and the original indices
+    /// of their nearest data points. A no-op once prepared.
+    pub fn prepare_with_query_sample(&mut self, sample: &QuerySample, options: &QuerySampleOptions) {
+        assert_eq!(sample.queries.len(), sample.n_queries * self.dim, "query sample has the wrong shape");
+        assert_eq!(sample.neighbors.len(), sample.n_queries * sample.width, "query neighbors have the wrong shape");
+        self.prepare_inner(Some((sample, options)));
+    }
+
+    fn prepare_inner(&mut self, sample: Option<(&QuerySample, &QuerySampleOptions)>) {
         if self.prepared {
             return;
         }
 
         let search_graph_start = Instant::now();
+        let extra_edges = sample.filter(|(_, options)| options.edges > 0).map(|(sample, options)| {
+            query_induced_edges(&self.data, self.dim, self.n_points, &self.distance, sample, options)
+        });
         let construction_distances = self
             .construction_distances
             .as_deref()
@@ -140,16 +177,19 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
             self.dim,
             &self.distance,
             self.diversify_prob,
+            self.diversify_relax,
+            self.reverse_diversify,
             self.pruning_degree_multiplier,
+            extra_edges.as_deref(),
         );
         self.build_stats.search_graph_seconds = search_graph_start.elapsed().as_secs_f64();
 
         let layout_start = Instant::now();
-        let vertex_order: Vec<usize> = self
-            .search_trees
-            .first()
-            .map(|tree| tree.indices.iter().map(|&idx| idx as usize).collect())
-            .unwrap_or_else(|| (0..self.n_points).collect());
+        let vertex_order: Vec<usize> = match (self.vertex_order_method, self.search_trees.first()) {
+            (VertexOrder::Rcm, _) => search_graph.reverse_cuthill_mckee(),
+            (VertexOrder::Tree, Some(tree)) => tree.indices.iter().map(|&idx| idx as usize).collect(),
+            (VertexOrder::Tree, None) => (0..self.n_points).collect(),
+        };
         assert_eq!(vertex_order.len(), self.n_points);
 
         let mut old_to_new = vec![usize::MAX; self.n_points];
@@ -166,8 +206,17 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
         }
 
         search_graph.reorder(&vertex_order);
+        search_graph.build_padded();
         for tree in &mut self.search_trees {
             tree.remap_indices(&old_to_new);
+        }
+        if let Some((sample, options)) = sample.filter(|(_, options)| options.tree_leaf_size > 0) {
+            // The data tree still sets the layout above; searches start from the query tree.
+            let mut rng = FastRng::new(self.rng_seed ^ 0x9e37_79b9_7f4a_7c15);
+            let mut tree =
+                query_search_tree(sample, self.dim, self.n_points, options, self.angular_trees, &mut rng);
+            tree.remap_indices(&old_to_new);
+            self.search_trees = vec![tree];
         }
 
         self.data = reordered_data;
@@ -199,22 +248,150 @@ impl<D: Distance<f32>> NNDescentIndex<D> {
         k: usize,
         rerank_width: usize,
     ) -> (Vec<i32>, Vec<f32>) {
-        let mut reranked: Vec<(f32, i32)> = approximate_indices
+        let candidates: Vec<i32> = approximate_indices
             .iter()
             .copied()
             .filter(|&idx| idx >= 0)
             .take(rerank_width)
-            .map(|idx| {
-                let point = &self.data[idx as usize * self.dim..(idx as usize + 1) * self.dim];
-                (self.distance.distance(query, point), idx)
-            })
             .collect();
+        // Request every finalist's row up front so their memory accesses
+        // overlap, then score four at a time.
+        for &idx in &candidates {
+            prefetch_row(&self.data, idx, self.dim);
+        }
+        let row = |idx: i32| &self.data[idx as usize * self.dim..(idx as usize + 1) * self.dim];
+        let mut reranked: Vec<(f32, i32)> = Vec::with_capacity(candidates.len());
+        let mut chunks = candidates.chunks_exact(4);
+        for chunk in &mut chunks {
+            let distances = self
+                .distance
+                .distance_four(query, [row(chunk[0]), row(chunk[1]), row(chunk[2]), row(chunk[3])]);
+            reranked.extend(distances.into_iter().zip(chunk.iter().copied()));
+        }
+        for &idx in chunks.remainder() {
+            reranked.push((self.distance.distance(query, row(idx)), idx));
+        }
         reranked.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         reranked.truncate(k);
         (
             reranked.iter().map(|&(_, idx)| idx).collect(),
             reranked.iter().map(|&(distance, _)| distance).collect(),
         )
+    }
+
+    /// Query over affine codes (see [`AffineCodes`]), reranking the best
+    /// `rerank_width` candidates with the exact distance.
+    ///
+    /// `query` must be `tree_query` prepared for `codes`. Widths follow
+    /// [`Self::query_one_quantized_i8_with_workspace`]. Returned distances are
+    /// exact (corrected, e.g. square-rooted for euclidean) when reranked.
+    pub fn query_one_affine_with_workspace(
+        &self,
+        tree_query: &[f32],
+        query: &AffineQuery,
+        codes: &AffineCodes,
+        k: usize,
+        candidate_width: usize,
+        rerank_width: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>) {
+        self.query_one_codes(
+            tree_query, query, codes, None, k, candidate_width, rerank_width, epsilon, workspace,
+        )
+    }
+
+    /// As [`Self::query_one_affine_with_workspace`], reranking from `half`
+    /// (float16 rows of this index's data, with `tree_query` prepared for them)
+    /// when given. Only the returned vectors are allocated.
+    pub fn query_one_codes(
+        &self,
+        tree_query: &[f32],
+        query: &AffineQuery,
+        codes: &AffineCodes,
+        half: Option<(&HalfRows, &HalfQuery)>,
+        k: usize,
+        candidate_width: usize,
+        rerank_width: usize,
+        epsilon: f32,
+        workspace: &mut SearchWorkspace,
+    ) -> (Vec<i32>, Vec<f32>) {
+        let mut rng = FastRng::new(self.rng_seed);
+        let search_k = resolve_quantized_candidate_width(k, candidate_width, rerank_width);
+        greedy_search_affine_into(
+            tree_query,
+            query,
+            codes,
+            &self.search_graph,
+            &self.search_trees,
+            self.search_tree_leaf_budget,
+            search_k,
+            epsilon,
+            self.min_distance,
+            &mut rng,
+            workspace,
+        );
+        workspace.sort_results();
+        let order = |a: &(f32, i32), b: &(f32, i32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+        let mut finalists = std::mem::take(&mut workspace.reranked);
+        finalists.clear();
+        let reranked = should_rerank_quantized(k, candidate_width, rerank_width);
+        if reranked {
+            let count = rerank_width.min(workspace.results.len());
+            let candidates = &workspace.results[..count];
+            // Request every finalist's row up front so their memory accesses
+            // overlap, then score four at a time.
+            match half {
+                Some((rows, prepared)) => {
+                    for &(_, idx) in candidates {
+                        rows.prefetch(idx);
+                    }
+                    let mut chunks = candidates.chunks_exact(4);
+                    for chunk in &mut chunks {
+                        let ids = [chunk[0].1, chunk[1].1, chunk[2].1, chunk[3].1];
+                        let distances = rows.distance_four(prepared, ids);
+                        finalists.extend(distances.into_iter().zip(ids));
+                    }
+                    for &(_, idx) in chunks.remainder() {
+                        finalists.push((rows.distance(prepared, idx), idx));
+                    }
+                }
+                None => {
+                    for &(_, idx) in candidates {
+                        prefetch_row(&self.data, idx, self.dim);
+                    }
+                    let row =
+                        |idx: i32| &self.data[idx as usize * self.dim..(idx as usize + 1) * self.dim];
+                    let mut chunks = candidates.chunks_exact(4);
+                    for chunk in &mut chunks {
+                        let ids = [chunk[0].1, chunk[1].1, chunk[2].1, chunk[3].1];
+                        let distances = self.distance.distance_four(tree_query, ids.map(row));
+                        finalists.extend(distances.into_iter().zip(ids));
+                    }
+                    for &(_, idx) in chunks.remainder() {
+                        finalists.push((self.distance.distance(tree_query, row(idx)), idx));
+                    }
+                }
+            }
+            if finalists.len() > k && k > 0 {
+                finalists.select_nth_unstable_by(k - 1, order);
+                finalists.truncate(k);
+            }
+            finalists.sort_unstable_by(order);
+        } else {
+            finalists.extend_from_slice(&workspace.results[..k.min(workspace.results.len())]);
+        }
+        let correction = if reranked { self.distance_correction } else { None };
+        let mut indices = Vec::with_capacity(k);
+        let mut distances = Vec::with_capacity(k);
+        for &(distance, idx) in finalists.iter().take(k) {
+            indices.push(self.vertex_order[idx as usize] as i32);
+            distances.push(correction.map_or(distance, |correct| correct(distance)));
+        }
+        indices.resize(k, -1);
+        distances.resize(k, f32::INFINITY);
+        workspace.reranked = finalists;
+        (indices, distances)
     }
 
     fn original_to_internal(&self) -> Vec<usize> {
@@ -554,7 +731,10 @@ pub struct NNDescentBuilder<'a> {
     random_seed: u64,
     verbose: bool,
     diversify_prob: f32,
+    diversify_relax: f32,
+    reverse_diversify: bool,
     pruning_degree_multiplier: f32,
+    vertex_order: VertexOrder,
     breadth_first_batch_width: Option<usize>,
 }
 
@@ -582,7 +762,10 @@ impl<'a> NNDescentBuilder<'a> {
             random_seed: 42,
             verbose: false,
             diversify_prob: 1.0,
+            diversify_relax: 1.0,
+            reverse_diversify: false,
             pruning_degree_multiplier: 1.5,
+            vertex_order: VertexOrder::Tree,
             breadth_first_batch_width: Some(6),
         }
     }
@@ -605,7 +788,10 @@ impl<'a> NNDescentBuilder<'a> {
             random_seed: 42,
             verbose: false,
             diversify_prob: 1.0,
+            diversify_relax: 1.0,
+            reverse_diversify: false,
             pruning_degree_multiplier: 1.5,
+            vertex_order: VertexOrder::Tree,
             breadth_first_batch_width: Some(6),
         }
     }
@@ -706,6 +892,29 @@ impl<'a> NNDescentBuilder<'a> {
     /// Set the diversify probability (0.0 = no diversification, 1.0 = full).
     pub fn diversify_prob(mut self, prob: f32) -> Self {
         self.diversify_prob = prob;
+        self
+    }
+
+    /// Relax diversification: an edge `i -> j` is dropped only when a retained
+    /// neighbour `c` of `i` has `relax * d(c, j) < d(i, j)` (default 1). Values
+    /// above 1 keep more long edges (alpha-pruning; for squared distances
+    /// `relax = alpha^2`).
+    pub fn diversify_relax(mut self, relax: f32) -> Self {
+        self.diversify_relax = relax;
+        self
+    }
+
+    /// Whether the search graph's reverse edges are diversified too (default
+    /// false: as in PyNNDescent, they are all kept and the degree cap prunes
+    /// them, which gives a denser graph that searches better).
+    pub fn reverse_diversify(mut self, reverse: bool) -> Self {
+        self.reverse_diversify = reverse;
+        self
+    }
+
+    /// Set how prepared indexes number their points (default: tree order).
+    pub fn vertex_order(mut self, order: VertexOrder) -> Self {
+        self.vertex_order = order;
         self
     }
 
@@ -927,7 +1136,11 @@ impl<'a> NNDescentBuilder<'a> {
             build_stats,
             construction_distances,
             diversify_prob: self.diversify_prob,
+            diversify_relax: self.diversify_relax,
+            reverse_diversify: self.reverse_diversify,
             pruning_degree_multiplier: self.pruning_degree_multiplier,
+            vertex_order_method: self.vertex_order,
+            angular_trees: angular,
             prepared: false,
         }
     }
@@ -986,6 +1199,102 @@ mod tests {
 
         // First result should be very close (ideally the query point itself)
         assert!(distances[0] < 1.0);
+    }
+
+    #[test]
+    fn query_sample_adapts_the_search_index() {
+        let (n, dim, n_queries, width) = (2000, 16, 400, 30);
+        let mut rng = FastRng::new(17);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.next_float() * 2.0 - 1.0).collect();
+        // Queries from a shifted distribution, half for the sample, half for testing.
+        let queries: Vec<f32> = (0..2 * n_queries * dim).map(|t| rng.next_float() + (t % dim) as f32 * 0.05).collect();
+        let brute = |query: &[f32], k: usize| -> Vec<i32> {
+            let mut order: Vec<(f32, i32)> = (0..n)
+                .map(|i| (SquaredEuclidean.distance(query, &data[i * dim..(i + 1) * dim]), i as i32))
+                .collect();
+            order.sort_by(|a, b| a.0.total_cmp(&b.0));
+            order[..k].iter().map(|&(_, i)| i).collect()
+        };
+        let (sample_queries, test_queries) = queries.split_at(n_queries * dim);
+        let neighbors: Vec<i32> = sample_queries.chunks_exact(dim).flat_map(|q| brute(q, width)).collect();
+        let sample = QuerySample { queries: sample_queries, neighbors: &neighbors, n_queries, width };
+
+        let build = || {
+            NNDescentBuilder::new(&data, n, dim)
+                .n_neighbors(10)
+                .random_seed(3)
+                .build_unprepared_with_distance(SquaredEuclidean, None)
+        };
+        let mut plain = build();
+        plain.prepare();
+        let mut adapted = build();
+        adapted.prepare_with_query_sample(&sample, &QuerySampleOptions::default());
+        assert_eq!(adapted.search_trees.len(), 1);
+        assert!(adapted.search_trees[0].indices.len() <= n);
+        assert!(adapted.search_graph.indices.len() > plain.search_graph.indices.len());
+
+        let recall = |index: &NNDescentIndex<SquaredEuclidean>| {
+            let mut hits = 0;
+            for query in test_queries.chunks_exact(dim) {
+                let (found, _) = index.query_one(query, 10, 0.0);
+                let truth = brute(query, 10);
+                hits += found.iter().filter(|i| truth.contains(i)).count();
+            }
+            hits as f64 / (10 * n_queries) as f64
+        };
+        let (plain_recall, adapted_recall) = (recall(&plain), recall(&adapted));
+        assert!(adapted_recall > 0.9, "adapted recall {adapted_recall}");
+        assert!(adapted_recall >= plain_recall - 0.01, "{adapted_recall} vs {plain_recall}");
+    }
+
+    #[test]
+    fn diversify_options_and_rcm_order() {
+        let (n, dim) = (2000, 3);
+        let mut rng = FastRng::new(23);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.next_float() * 2.0 - 1.0).collect();
+        let build = |relax: f32, order: VertexOrder| {
+            let mut index = NNDescentBuilder::new(&data, n, dim)
+                .n_neighbors(10)
+                .random_seed(3)
+                .diversify_relax(relax)
+                .vertex_order(order)
+                .build_unprepared_with_distance(SquaredEuclidean, None);
+            index.prepare();
+            index
+        };
+        let tree = build(1.0, VertexOrder::Tree);
+        let relaxed = build(1.44, VertexOrder::Tree);
+        assert!(relaxed.search_graph.indices.len() > tree.search_graph.indices.len());
+        // Diversifying the reverse edges too thins the graph.
+        let mut thinned = NNDescentBuilder::new(&data, n, dim)
+            .n_neighbors(10)
+            .random_seed(3)
+            .reverse_diversify(true)
+            .build_unprepared_with_distance(SquaredEuclidean, None);
+        thinned.prepare();
+        assert!(thinned.search_graph.indices.len() < tree.search_graph.indices.len());
+
+        let rcm = build(1.0, VertexOrder::Rcm);
+        let mut order = rcm.vertex_order.clone();
+        order.sort_unstable();
+        assert_eq!(order, (0..n).collect::<Vec<_>>());
+        assert_ne!(rcm.vertex_order, tree.vertex_order);
+        assert_eq!(rcm.search_graph.indices.len(), tree.search_graph.indices.len());
+        // Graph neighbours get closer numbers than in tree order.
+        let mean_gap = |index: &NNDescentIndex<SquaredEuclidean>| {
+            let graph = &index.search_graph;
+            let total: usize = (0..n)
+                .flat_map(|v| graph.neighbors(v).iter().map(move |&u| v.abs_diff(u as usize)))
+                .sum();
+            total as f64 / graph.indices.len() as f64
+        };
+        // In a random order the mean gap is about n / 3.
+        assert!(mean_gap(&rcm) < 0.2 * n as f64 / 3.0, "{} vs {}", mean_gap(&rcm), mean_gap(&tree));
+        assert!(mean_gap(&rcm) < mean_gap(&tree));
+        // The same results, in original ids.
+        for query in data.chunks_exact(dim).take(50) {
+            assert_eq!(rcm.query_one(query, 5, 0.1).0[0], tree.query_one(query, 5, 0.1).0[0]);
+        }
     }
 
     #[test]

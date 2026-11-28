@@ -41,6 +41,9 @@ cargo test --release
 
 # Run benchmarks
 cargo bench --release
+
+# Time single-query search on a raw dataset dump (see the example's documentation)
+cargo run --release -p rinnd-core --example search_bench -- <dump dir> nn=30 quant=sq8 cpu=2
 ```
 
 ### Default Optimizations
@@ -312,6 +315,52 @@ legacy builder, or set `tree_batch_width` to tune breadth-first batching.
 Search-capable indexes use the same breadth-first forest by default and keep its
 first `n_search_trees` trees for query seeding, so their k-NN graph matches the
 graph-only build for the same parameters.
+
+### Quantized search
+
+With `quantization="sq8"` or `"sq4"` (euclidean metrics, and `metric="cosine"`
+with `normalize=True`), searches run over per-feature affine 8-bit or 4-bit
+codes, scored with integer dot products (AVX-512 VNNI where available), and
+the best candidates are reranked with exact distances. `rerank_precision="float16"`
+reranks from a float16 copy of the data. Each 4-bit feature's codes span its
+0.3%-99.7% quantiles by default (`quantization_clip`), and `quantization_dims`
+codes a PCA projection instead. Set the candidate and rerank widths per query:
+
+```python
+index = rinnd.RINND(data, n_neighbors=30, quantization="sq4", rerank_precision="float16")
+ids = index.query_one_indices_quantized(q, k=10, epsilon=0.01, candidate_width=150, rerank_width=150)
+```
+
+### Adapting to a sample of the queries
+
+When the queries come from a different distribution than the data, pass a
+sample of them and the indices of their nearest data points:
+
+```python
+index = rinnd.RINND(data, n_neighbors=30, query_sample=learn, query_neighbors=learn_neighbors)
+```
+
+The search graph gains edges among each sample query's nearest data points,
+and searches start from a tree over the sample queries.
+`query_sample_options` (a dict of `edges`, `pivots`, `candidates`,
+`tree_leaf_size`, `tree_entries`, `tree_ranks`) tunes both.
+
+### Maximum inner product search
+
+`metric="mips"` appends `sqrt(M^2 - |x|^2)` to each point (`M` the largest
+norm) and pads queries with a zero, so that euclidean order is inner-product
+order; distances are returned as negative inner products. It supports
+quantization (the codes hold the original features) and query samples, but
+not `quantization_dims`, `graph_only` or `neighbor_graph`.
+
+### Search graph options
+
+`diversify_alpha` (default 1.0) relaxes the search graph's diversification:
+an edge is dropped only when a retained neighbour is closer to its end by that
+factor, so values above 1 keep more long edges (a denser graph that can help
+out-of-distribution queries). `vertex_order="rcm"` numbers the points by
+reverse Cuthill-McKee on the search graph instead of by search-tree leaf
+order, placing graph neighbours close together in memory.
 
 ## Rust Usage
 

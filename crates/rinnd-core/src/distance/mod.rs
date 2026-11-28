@@ -36,6 +36,8 @@ mod alternatives;
 mod angular;
 mod binary;
 mod cosine;
+pub mod affine;
+pub mod int_dot;
 mod euclidean;
 mod hellinger;
 mod inner_product;

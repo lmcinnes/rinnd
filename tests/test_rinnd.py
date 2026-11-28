@@ -335,3 +335,305 @@ def test_graph_only_accepts_explicit_depth_first_forest():
         n_iters=3,
     )
     assert index.neighbor_graph[0].shape == (len(data), 6)
+
+
+def clustered_data(n_points=4000, n_queries=60, dimension=48, seed=0):
+    rng = np.random.default_rng(seed)
+    centers = rng.normal(size=(30, dimension)).astype(np.float32) * 3
+    data = centers[rng.integers(0, 30, n_points)] + rng.normal(size=(n_points, dimension))
+    queries = centers[rng.integers(0, 30, n_queries)] + rng.normal(size=(n_queries, dimension))
+    return data.astype(np.float32), queries.astype(np.float32)
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+@pytest.mark.parametrize("quantization", ["sq8", "sq4"])
+@pytest.mark.parametrize("rerank_precision", ["float32", "float16"])
+def test_sq_quantization_searches_and_reranks(metric, quantization, rerank_precision):
+    data, queries = clustered_data()
+    kwargs = dict(normalize=True, cosine_distance_mode="direct") if metric == "cosine" else {}
+    index = rinnd.RINND(
+        data, metric=metric, n_neighbors=15, random_state=42, quantization=quantization,
+        rerank_precision=rerank_precision, **kwargs
+    )
+    info = index.storage_info()
+    assert info["encoding"] == f"{quantization}_affine"
+    # Code rows are padded to whole 64-byte lines.
+    assert info["code_bytes"] >= len(data) * 64
+    if metric == "euclidean":
+        exact = np.sqrt(((queries[:, None] - data[None]) ** 2).sum(-1))
+    else:
+        unit = lambda values: values / np.linalg.norm(values, axis=1, keepdims=True)
+        exact = 1.0 - unit(queries) @ unit(data).T
+    true = np.argsort(exact, axis=1)[:, :10]
+
+    # Sixteen levels per feature need more candidates on this 48-feature data.
+    width = 40 if quantization == "sq8" else 80
+    found = np.vstack(
+        [
+            index.query_one_indices_quantized(
+                query, k=10, epsilon=0.05, candidate_width=width, rerank_width=width
+            )
+            for query in queries
+        ]
+    )
+    recall = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, true)])
+    assert recall > 0.95
+
+    indices, distances = index.query(queries, k=10, epsilon=0.05)
+    # Candidates are reranked with the exact distance (from float16 values,
+    # which carry about three significant digits).
+    tolerance = dict(rtol=1e-4, atol=1e-5) if rerank_precision == "float32" else dict(rtol=5e-3, atol=2e-3)
+    np.testing.assert_allclose(distances, np.take_along_axis(exact, indices, axis=1), **tolerance)
+    assert np.all(np.diff(distances, axis=1) >= 0)
+
+
+def test_sq_quantization_rejects_unsupported_settings():
+    data, _ = clustered_data(n_points=200)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, metric="manhattan", n_neighbors=10, quantization="sq8")
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, metric="cosine", n_neighbors=10, quantization="sq8")
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, quantization="sq2")
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, rerank_precision="float16")
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, quantization="sq8", rerank_precision="bfloat16")
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, quantization_clip=0.01)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, quantization="sq4", quantization_clip=0.6)
+
+
+def test_sq4_clipping_survives_outliers():
+    data, queries = clustered_data()
+    data = data.copy()
+    data[0, :] = 1e4  # an outlier that would stretch every feature's code range
+    unit_true = np.argsort(((queries[:, None] - data[None]) ** 2).sum(-1), axis=1)[:, :10]
+    recalls = {}
+    for clip in (0.0, None):
+        index = rinnd.RINND(data, n_neighbors=15, random_state=42, quantization="sq4", quantization_clip=clip)
+        found = np.vstack(
+            [
+                index.query_one_indices_quantized(q, k=10, epsilon=0.05, candidate_width=40, rerank_width=40)
+                for q in queries
+            ]
+        )
+        recalls[clip] = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, unit_true)])
+    # Without clipping sixteen levels span the outlier and the codes say little.
+    assert recalls[None] > 0.9
+    assert recalls[None] > recalls[0.0] + 0.1
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+@pytest.mark.parametrize("dims", [12, 0.99])
+def test_sq8_quantization_dims_projects_low_rank_data(metric, dims):
+    rng = np.random.default_rng(0)
+    basis = rng.normal(size=(8, 64)).astype(np.float32)
+    data = (rng.normal(size=(4000, 8)) @ basis + 0.05 * rng.normal(size=(4000, 64))).astype(np.float32)
+    queries = (rng.normal(size=(60, 8)) @ basis + 0.05 * rng.normal(size=(60, 64))).astype(np.float32)
+    kwargs = dict(normalize=True, cosine_distance_mode="direct") if metric == "cosine" else {}
+    index = rinnd.RINND(
+        data, metric=metric, n_neighbors=15, random_state=42, quantization="sq8",
+        quantization_dims=dims, **kwargs
+    )
+    info = index.storage_info()
+    assert info["encoding"] == "sq8_affine_pca"
+    # One 64-byte line per row (and a norm for euclidean) instead of 64 features.
+    assert info["code_bytes"] <= (64 + 4) * len(data)
+    if metric == "euclidean":
+        exact = np.sqrt(((queries[:, None] - data[None]) ** 2).sum(-1))
+    else:
+        unit = lambda values: values / np.linalg.norm(values, axis=1, keepdims=True)
+        exact = 1.0 - unit(queries) @ unit(data).T
+    true = np.argsort(exact, axis=1)[:, :10]
+    indices, distances = index.query(queries, k=10, epsilon=0.05)
+    recall = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(indices, true)])
+    assert recall > 0.9
+    np.testing.assert_allclose(
+        distances, np.take_along_axis(exact, indices, axis=1), rtol=1e-4, atol=1e-5
+    )
+
+
+def test_sq8_quantization_dims_skips_projection_for_spread_variance():
+    data = np.random.default_rng(0).normal(size=(2000, 32)).astype(np.float32)
+    index = rinnd.RINND(data, n_neighbors=10, quantization="sq8", quantization_dims=0.95)
+    assert index.storage_info()["encoding"] == "sq8_affine"
+
+
+@pytest.mark.parametrize("dims", [0.0, 2.5, -4.0])
+def test_sq8_quantization_dims_rejects_invalid_values(dims):
+    data, _ = clustered_data(n_points=200)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, quantization="sq8", quantization_dims=dims)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, quantization_dims=8)
+
+
+def shifted_queries(data_dim=32, n_points=3000, n_sample=600, n_test=100, seed=0):
+    """Data and queries from different distributions, with exact sample neighbours."""
+    rng = np.random.default_rng(seed)
+    data = rng.normal(size=(n_points, data_dim)).astype(np.float32)
+    shift = np.linspace(0, 2, data_dim).astype(np.float32)
+    queries = (rng.normal(size=(n_sample + n_test, data_dim)) * 0.6 + shift).astype(np.float32)
+    return data, queries[:n_sample], queries[n_sample:]
+
+
+def exact_neighbors(data, queries, k, metric="euclidean"):
+    if metric == "euclidean":
+        d = ((queries[:, None] - data[None]) ** 2).sum(-1)
+    else:
+        unit = lambda values: values / np.linalg.norm(values, axis=1, keepdims=True)
+        d = 1.0 - unit(queries) @ unit(data).T
+    return np.argsort(d, axis=1)[:, :k].astype(np.int32)
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+@pytest.mark.parametrize("quantization", [None, "sq8"])
+def test_query_sample_adapts_the_index(metric, quantization):
+    data, sample, tests = shifted_queries()
+    kwargs = dict(normalize=True, cosine_distance_mode="direct") if metric == "cosine" else {}
+    if quantization:
+        kwargs["quantization"] = quantization
+    neighbors = exact_neighbors(data, sample, 30, metric)
+    true = exact_neighbors(data, tests, 10, metric)
+
+    def recall(index):
+        if quantization:
+            found = np.vstack([index.query_one_indices_quantized(q, k=10, epsilon=0.02, candidate_width=30, rerank_width=30) for q in tests])
+        else:
+            found = np.vstack([index.query_one_indices(q, k=10, epsilon=0.1) for q in tests])
+        return np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, true)])
+
+    plain = rinnd.RINND(data, metric=metric, n_neighbors=10, random_state=42, **kwargs)
+    adapted = rinnd.RINND(
+        data, metric=metric, n_neighbors=10, random_state=42, query_sample=sample,
+        query_neighbors=neighbors, **kwargs
+    )
+    adapted.prepare()
+    assert len(adapted.search_graph[1]) > len(plain.search_graph[1])
+    assert recall(adapted) > 0.9
+    # The queries are far from the data, which the unadapted index finds hard.
+    assert recall(adapted) > recall(plain) + 0.1
+
+
+def test_query_sample_options_and_validation():
+    data, sample, _ = shifted_queries(n_points=500, n_sample=100)
+    neighbors = exact_neighbors(data, sample, 20)
+    no_edges = rinnd.RINND(
+        data, n_neighbors=10, random_state=42, query_sample=sample, query_neighbors=neighbors,
+        query_sample_options={"edges": 0},
+    )
+    plain = rinnd.RINND(data, n_neighbors=10, random_state=42)
+    no_edges.prepare()
+    plain.prepare()
+    # Without query edges only the search tree changes.
+    np.testing.assert_array_equal(no_edges.search_graph[1], plain.search_graph[1])
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, query_sample=sample)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, query_neighbors=neighbors)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, query_sample=sample[:, :5], query_neighbors=neighbors)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, query_sample=sample, query_neighbors=neighbors + 1000)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, n_neighbors=10, query_sample=sample, query_neighbors=neighbors,
+                    query_sample_options={"bogus": 3})
+
+
+def mips_data(n_points=4000, n_queries=60, dimension=48, seed=0):
+    rng = np.random.default_rng(seed)
+    # Varied norms, so inner product order differs from euclidean and cosine order.
+    scale = rng.uniform(0.3, 2.0, size=(n_points, 1))
+    data = rng.normal(size=(n_points, dimension)) * scale
+    queries = rng.normal(size=(n_queries, dimension))
+    return data.astype(np.float32), queries.astype(np.float32)
+
+
+@pytest.mark.parametrize(
+    "quantization,rerank_precision",
+    [(None, "float32"), ("sq8", "float32"), ("sq8", "float16"), ("sq4", "float16")],
+)
+def test_mips_finds_largest_inner_products(quantization, rerank_precision):
+    data, queries = mips_data()
+    kwargs = dict(quantization=quantization, rerank_precision=rerank_precision) if quantization else {}
+    index = rinnd.RINND(data, metric="mips", n_neighbors=15, random_state=42, **kwargs)
+    inner = queries @ data.T
+    true = np.argsort(-inner, axis=1)[:, :10]
+    if quantization:
+        width = 40 if quantization == "sq8" else 80
+        found = np.vstack(
+            [
+                index.query_one_indices_quantized(
+                    query, k=10, epsilon=0.3, candidate_width=width, rerank_width=width
+                )
+                for query in queries
+            ]
+        )
+        assert index.storage_info()["encoding"] == f"{quantization}_affine"
+    else:
+        found = np.vstack([index.query_one_indices(query, k=10, epsilon=0.3) for query in queries])
+    recall = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, true)])
+    assert recall > 0.95
+
+    # Distances are negative inner products.
+    indices, distances = index.query(queries, k=10, epsilon=0.3)
+    want = -np.take_along_axis(inner, indices, axis=1)
+    atol = 1e-2 if rerank_precision == "float32" else 0.05 * np.abs(inner).max() / 100
+    np.testing.assert_allclose(distances, want, rtol=1e-4, atol=atol)
+    assert np.all(np.diff(distances, axis=1) >= 0)
+    one_indices, one_distances = index.query_one(queries[0], k=10, epsilon=0.3)
+    np.testing.assert_array_equal(one_indices, indices[0])
+    np.testing.assert_allclose(one_distances, distances[0], rtol=1e-6)
+
+
+def test_mips_learn_queries_and_validation():
+    data, queries = mips_data(n_points=3000, n_queries=200)
+    index = rinnd.RINND(data, metric="mips", n_neighbors=10, random_state=42)
+    # The graph is of the augmented points, not an inner-product k-NN graph.
+    with pytest.raises(NotImplementedError):
+        index.neighbor_graph
+
+    sample, tests = queries[:150], queries[150:]
+    neighbors = np.argsort(-(sample @ data.T), axis=1)[:, :20].astype(np.int32)
+    adapted = rinnd.RINND(
+        data, metric="mips", n_neighbors=10, random_state=42, quantization="sq8",
+        query_sample=sample, query_neighbors=neighbors,
+    )
+    true = np.argsort(-(tests @ data.T), axis=1)[:, :10]
+    found = np.vstack(
+        [
+            adapted.query_one_indices_quantized(q, k=10, epsilon=0.3, candidate_width=40, rerank_width=40)
+            for q in tests
+        ]
+    )
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, true)]) > 0.95
+
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, metric="mips", n_neighbors=10, quantization="sq8", quantization_dims=8)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, metric="mips", n_neighbors=10, graph_only=True)
+    with pytest.raises(ValueError):
+        index.query(queries[:, :5], k=10)
+
+
+def test_diversify_alpha_and_vertex_order():
+    data, queries = clustered_data(n_points=3000)
+    base = dict(n_neighbors=15, random_state=42)
+    plain = rinnd.RINND(data, **base)
+    relaxed = rinnd.RINND(data, diversify_alpha=1.2, **base)
+    rcm = rinnd.RINND(data, vertex_order="rcm", **base)
+    for index in (plain, relaxed, rcm):
+        index.prepare()
+    # alpha-pruning keeps more edges; the vertex order does not change the graph.
+    assert len(relaxed.search_graph[1]) > len(plain.search_graph[1])
+    assert len(rcm.search_graph[1]) == len(plain.search_graph[1])
+    true = np.argsort(((queries[:, None] - data[None]) ** 2).sum(-1), axis=1)[:, :10]
+    for index in (relaxed, rcm):
+        found = np.vstack([index.query_one_indices(q, k=10, epsilon=0.1) for q in queries])
+        assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, true)]) > 0.95
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, diversify_alpha=0.9, **base)
+    with pytest.raises(ValueError):
+        rinnd.RINND(data, vertex_order="random", **base)

@@ -100,11 +100,10 @@ impl BoundedHeap {
             return true;
         }
 
-        // Only insert if smaller than current max
-        if let Some(&(max_d, _)) = self.heap.peek() {
-            if distance < max_d.0 {
-                self.heap.pop();
-                self.heap.push((OrderedFloat(distance), index));
+        // Only insert if smaller than current max, replacing it (one sift down).
+        if let Some(mut top) = self.heap.peek_mut() {
+            if distance < top.0 .0 {
+                *top = (OrderedFloat(distance), index);
                 return true;
             }
         }
@@ -159,6 +158,14 @@ impl BoundedHeap {
     #[inline]
     pub fn clear(&mut self) {
         self.heap.clear();
+    }
+
+    /// Move all entries into `out` (replacing its contents), sorted by
+    /// distance and then index; the heap is left empty with its allocation.
+    pub fn drain_sorted_into(&mut self, out: &mut Vec<(f32, i32)>) {
+        out.clear();
+        out.extend(self.heap.drain().map(|(d, idx)| (d.0, idx)));
+        out.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     }
 }
 

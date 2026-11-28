@@ -56,4 +56,6 @@ harness = false
 name = "heap"
 harness = false
 
-
+# search_bench example: pin the query thread to one core
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

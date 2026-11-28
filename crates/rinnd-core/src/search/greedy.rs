@@ -1,5 +1,6 @@
 //! Production greedy graph search for approximate nearest neighbors.
 
+use crate::distance::affine::{AffineCodes, AffineQuery};
 use crate::distance::{quantized::quantized_i8_dot, Distance};
 use crate::graph::SearchGraph;
 use crate::heap::{BoundedHeap, CandidateHeap};
@@ -7,8 +8,9 @@ use crate::rng::FastRng;
 use crate::tree::{FlatTree, QuantizedFlatTree};
 use crate::visited::VisitedSet;
 
-const PREFETCH_LOOKAHEAD: usize = 4;
-
+/// Hint the CPU to fetch row `index` of `data` (`dim` values per row): whole
+/// rows of up to 1 KiB, otherwise the first 8 cache lines (the hardware
+/// prefetcher streams the rest once the row is being read).
 #[inline(always)]
 fn prefetch<T>(data: &[T], index: i32, dim: usize) {
     if index < 0 || index as usize * dim >= data.len() {
@@ -20,11 +22,26 @@ fn prefetch<T>(data: &[T], index: i32, dim: usize) {
         use core::arch::x86::{_mm_prefetch, _MM_HINT_T0};
         #[cfg(target_arch = "x86_64")]
         use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        _mm_prefetch(
-            data.as_ptr().add(index as usize * dim) as *const i8,
-            _MM_HINT_T0,
-        );
+        let base = data.as_ptr().add(index as usize * dim) as *const i8;
+        let bytes = dim * core::mem::size_of::<T>();
+        let span = if bytes <= 1024 { bytes } else { 512 };
+        let mut offset = 0;
+        while offset < span {
+            _mm_prefetch(base.add(offset), _MM_HINT_T0);
+            offset += 64;
+        }
+        if span > 0 {
+            // Rows need not start on a cache line, so the span may end on one
+            // more line than the stride covers.
+            _mm_prefetch(base.add(span - 1), _MM_HINT_T0);
+        }
     }
+}
+
+/// Crate-visible alias of [`prefetch`] for other search stages (reranking).
+#[inline(always)]
+pub(crate) fn prefetch_row<T>(data: &[T], index: i32, dim: usize) {
+    prefetch(data, index, dim);
 }
 
 /// Reusable state for greedy graph search.
@@ -35,7 +52,12 @@ pub struct SearchWorkspace {
     seed_set: CandidateHeap,
     tree_frontier: Vec<(f32, usize)>,
     tree_leaves: Vec<(usize, usize)>,
+    pending: Vec<i32>,
     k: usize,
+    /// The search's results, sorted (see [`SearchWorkspace::sort_results`]).
+    pub(crate) results: Vec<(f32, i32)>,
+    /// Scratch for reranking.
+    pub(crate) reranked: Vec<(f32, i32)>,
 }
 
 impl SearchWorkspace {
@@ -46,8 +68,17 @@ impl SearchWorkspace {
             seed_set: CandidateHeap::with_capacity(k.saturating_mul(4).max(32)),
             tree_frontier: Vec::with_capacity(32),
             tree_leaves: Vec::with_capacity(8),
+            pending: Vec::with_capacity(64),
             k,
+            results: Vec::new(),
+            reranked: Vec::new(),
         }
+    }
+
+    /// Move the result heap's entries into `results`, nearest first (ties by
+    /// index), keeping both allocations for the next query.
+    pub(crate) fn sort_results(&mut self) {
+        self.result_heap.drain_sorted_into(&mut self.results);
     }
 
     #[inline]
@@ -67,6 +98,9 @@ impl SearchWorkspace {
     }
 }
 
+/// Seed a float search from the search trees' leaves: gather the unvisited leaf
+/// points, prefetch their rows, then score them (four at a time where the
+/// distance has a four-way kernel).
 fn initialize_fp32<D: Distance<f32>>(
     query: &[f32],
     data: &[f32],
@@ -77,6 +111,8 @@ fn initialize_fp32<D: Distance<f32>>(
     rng: &mut FastRng,
     workspace: &mut SearchWorkspace,
 ) {
+    let mut pending = std::mem::take(&mut workspace.pending);
+    pending.clear();
     for tree in trees {
         tree.search_leaves(
             query,
@@ -86,41 +122,34 @@ fn initialize_fp32<D: Distance<f32>>(
             &mut workspace.tree_leaves,
         );
         for &(start, end) in &workspace.tree_leaves {
-            if D::USE_DISTANCE_FOUR && dim >= 32 {
-                let mut pending = [0i32; 4];
-                let mut count = 0;
-                for &idx in &tree.indices[start..end] {
-                    if idx >= 0 && !workspace.visited.check_and_mark(idx) {
-                        pending[count] = idx;
-                        count += 1;
-                        if count == 4 {
-                            let vectors = pending.map(|c| &data[c as usize * dim..(c as usize + 1) * dim]);
-                            let distances = distance.distance_four(query, vectors);
-                            for slot in 0..4 {
-                                workspace.result_heap.push(distances[slot], pending[slot]);
-                                workspace.seed_set.push(distances[slot], pending[slot]);
-                            }
-                            count = 0;
-                        }
-                    }
-                }
-                for &idx in &pending[..count] {
-                    let d = distance.distance(query, &data[idx as usize * dim..(idx as usize + 1) * dim]);
-                    workspace.result_heap.push(d, idx);
-                    workspace.seed_set.push(d, idx);
-                }
-                continue;
-            }
             for &idx in &tree.indices[start..end] {
                 if idx >= 0 && !workspace.visited.check_and_mark(idx) {
-                    let d = distance
-                        .distance(query, &data[idx as usize * dim..(idx as usize + 1) * dim]);
-                    workspace.result_heap.push(d, idx);
-                    workspace.seed_set.push(d, idx);
+                    prefetch(data, idx, dim);
+                    pending.push(idx);
                 }
             }
         }
     }
+    let row = |idx: i32| &data[idx as usize * dim..(idx as usize + 1) * dim];
+    let mut rest = pending.as_slice();
+    if D::USE_DISTANCE_FOUR && dim >= 32 {
+        let mut chunks = pending.chunks_exact(4);
+        for chunk in &mut chunks {
+            let candidates = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let distances = distance.distance_four(query, candidates.map(row));
+            for slot in 0..4 {
+                workspace.result_heap.push(distances[slot], candidates[slot]);
+                workspace.seed_set.push(distances[slot], candidates[slot]);
+            }
+        }
+        rest = chunks.remainder();
+    }
+    for &idx in rest {
+        let d = distance.distance(query, row(idx));
+        workspace.result_heap.push(d, idx);
+        workspace.seed_set.push(d, idx);
+    }
+    workspace.pending = pending;
 }
 
 fn initialize_quantized<F: Fn(i32) -> f32>(
@@ -187,6 +216,17 @@ fn fill_random<F: Fn(i32) -> f32>(
     }
 }
 
+/// The search radius: the worst retained distance relaxed by `epsilon`, or no
+/// bound until the result heap is full.
+#[inline(always)]
+fn distance_bound(heap: &BoundedHeap, epsilon: f32, min_distance: f32) -> f32 {
+    if !heap.is_full() {
+        return f32::INFINITY;
+    }
+    let maximum = heap.max_distance();
+    maximum + epsilon * (maximum - min_distance)
+}
+
 #[inline]
 fn consider_neighbor(
     neighbor: i32,
@@ -200,8 +240,7 @@ fn consider_neighbor(
         let inserted = workspace.result_heap.push(value, neighbor);
         workspace.seed_set.push(value, neighbor);
         if inserted {
-            let maximum = workspace.result_heap.max_distance();
-            *bound = maximum + epsilon * (maximum - min_distance);
+            *bound = distance_bound(&workspace.result_heap, epsilon, min_distance);
         }
     }
 }
@@ -215,33 +254,40 @@ fn traverse<T, F: Fn(i32) -> f32>(
     distance_to: &F,
     workspace: &mut SearchWorkspace,
 ) {
-    let mut max_distance = workspace.result_heap.max_distance();
-    let mut distance_bound = max_distance + epsilon * (max_distance - min_distance);
+    let mut bound = distance_bound(&workspace.result_heap, epsilon, min_distance);
+    let mut pending = std::mem::take(&mut workspace.pending);
     while let Some((vertex_distance, vertex)) = workspace.seed_set.pop() {
-        if workspace.result_heap.is_full() && vertex_distance >= distance_bound {
+        if workspace.result_heap.is_full() && vertex_distance >= bound {
             break;
         }
-        let neighbors = graph.neighbors(vertex as usize);
-        for (position, &neighbor) in neighbors.iter().enumerate() {
-            if let (Some(values), Some(&upcoming)) =
-                (data, neighbors.get(position + PREFETCH_LOOKAHEAD))
-            {
-                prefetch(values, upcoming, dim);
-            }
+        if let Some((_, next)) = workspace.seed_set.peek() {
+            // The closest remaining candidate is likely expanded next.
+            graph.prefetch_search_row(next);
+        }
+        // Gather the unvisited neighbors first, prefetching their vectors, so
+        // that their memory accesses overlap.
+        pending.clear();
+        for &neighbor in graph.search_row(vertex as usize) {
             if neighbor < 0 || workspace.visited.check_and_mark(neighbor) {
                 continue;
             }
+            if let Some(values) = data {
+                prefetch(values, neighbor, dim);
+            }
+            pending.push(neighbor);
+        }
+        for &neighbor in &pending {
             let d = distance_to(neighbor);
-            if d < distance_bound {
+            if d < bound {
                 let inserted = workspace.result_heap.push(d, neighbor);
                 workspace.seed_set.push(d, neighbor);
                 if inserted {
-                    max_distance = workspace.result_heap.max_distance();
-                    distance_bound = max_distance + epsilon * (max_distance - min_distance);
+                    bound = distance_bound(&workspace.result_heap, epsilon, min_distance);
                 }
             }
         }
     }
+    workspace.pending = pending;
 }
 
 fn traverse_four<D: Distance<f32>>(
@@ -254,41 +300,42 @@ fn traverse_four<D: Distance<f32>>(
     distance: &D,
     workspace: &mut SearchWorkspace,
 ) {
-    let maximum = workspace.result_heap.max_distance();
-    let mut bound = maximum + epsilon * (maximum - min_distance);
+    let mut bound = distance_bound(&workspace.result_heap, epsilon, min_distance);
+    let mut pending = std::mem::take(&mut workspace.pending);
+    let row = |candidate: i32| &data[candidate as usize * dim..(candidate as usize + 1) * dim];
     while let Some((vertex_distance, vertex)) = workspace.seed_set.pop() {
         if workspace.result_heap.is_full() && vertex_distance >= bound {
             break;
         }
-        let neighbors = graph.neighbors(vertex as usize);
-        let mut pending = [0; 4];
-        let mut count = 0;
-        for (position, &neighbor) in neighbors.iter().enumerate() {
-            if let Some(&upcoming) = neighbors.get(position + PREFETCH_LOOKAHEAD) {
-                prefetch(data, upcoming, dim);
-            }
+        if let Some((_, next)) = workspace.seed_set.peek() {
+            // The closest remaining candidate is likely expanded next.
+            graph.prefetch_search_row(next);
+        }
+        // Gather the unvisited neighbors first, prefetching their vectors, so
+        // that their memory accesses overlap.
+        pending.clear();
+        for &neighbor in graph.search_row(vertex as usize) {
             if neighbor < 0 || workspace.visited.check_and_mark(neighbor) {
                 continue;
             }
-            pending[count] = neighbor;
-            count += 1;
-            if count == 4 {
-                let vectors = pending.map(|candidate| {
-                    &data[candidate as usize * dim..(candidate as usize + 1) * dim]
-                });
-                let distances = distance.distance_four(query, vectors);
-                for candidate in 0..4 {
-                    consider_neighbor(pending[candidate], distances[candidate], epsilon, min_distance,
-                                      &mut bound, workspace);
-                }
-                count = 0;
+            prefetch(data, neighbor, dim);
+            pending.push(neighbor);
+        }
+        let mut chunks = pending.chunks_exact(4);
+        for chunk in &mut chunks {
+            let candidates = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let distances = distance.distance_four(query, candidates.map(row));
+            for position in 0..4 {
+                consider_neighbor(candidates[position], distances[position], epsilon,
+                                  min_distance, &mut bound, workspace);
             }
         }
-        for &neighbor in &pending[..count] {
-            let value = distance.distance(query, &data[neighbor as usize * dim..(neighbor as usize + 1) * dim]);
+        for &neighbor in chunks.remainder() {
+            let value = distance.distance(query, row(neighbor));
             consider_neighbor(neighbor, value, epsilon, min_distance, &mut bound, workspace);
         }
     }
+    workspace.pending = pending;
 }
 
 fn search<D: Distance<f32>>(
@@ -318,7 +365,10 @@ fn search<D: Distance<f32>>(
     );
     let distance_to =
         |idx: i32| distance.distance(query, &data[idx as usize * dim..(idx as usize + 1) * dim]);
-    fill_random(graph.n_vertices, k, &distance_to, rng, workspace);
+    // Random seeds only when the trees give none (see greedy_search_affine_into).
+    if workspace.seed_set.is_empty() {
+        fill_random(graph.n_vertices, k, &distance_to, rng, workspace);
+    }
     if D::USE_DISTANCE_FOUR && dim >= 32 {
         traverse_four(query, data, dim, graph, epsilon, min_distance, distance, workspace);
     } else {
@@ -577,6 +627,159 @@ pub fn greedy_search_quantized_custom_with_workspace_initialized<F: Fn(i32) -> f
     workspace.result_heap.clone().into_sorted()
 }
 
+/// Traverse with affine 8-bit code distances: gather each expanded vertex's
+/// unvisited neighbors (prefetching their code rows), then score them four
+/// at a time.
+fn traverse_affine(
+    query: &AffineQuery,
+    codes: &AffineCodes,
+    graph: &SearchGraph,
+    epsilon: f32,
+    min_distance: f32,
+    workspace: &mut SearchWorkspace,
+) {
+    let mut bound = distance_bound(&workspace.result_heap, epsilon, min_distance);
+    let mut pending = std::mem::take(&mut workspace.pending);
+    while let Some((vertex_distance, vertex)) = workspace.seed_set.pop() {
+        if workspace.result_heap.is_full() && vertex_distance >= bound {
+            break;
+        }
+        if let Some((_, next)) = workspace.seed_set.peek() {
+            graph.prefetch_search_row(next);
+        }
+        pending.clear();
+        for &neighbor in graph.search_row(vertex as usize) {
+            if neighbor < 0 || workspace.visited.check_and_mark(neighbor) {
+                continue;
+            }
+            codes.prefetch(neighbor, CODE_PREFETCH_LINES);
+            pending.push(neighbor);
+        }
+        let mut chunks = pending.chunks_exact(4);
+        for chunk in &mut chunks {
+            let candidates = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let distances = codes.distance_four(query, candidates);
+            for position in 0..4 {
+                consider_neighbor(candidates[position], distances[position], epsilon,
+                                  min_distance, &mut bound, workspace);
+            }
+        }
+        for &neighbor in chunks.remainder() {
+            let value = codes.distance(query, neighbor);
+            consider_neighbor(neighbor, value, epsilon, min_distance, &mut bound, workspace);
+        }
+    }
+    workspace.pending = pending;
+}
+
+/// Lines of a code row prefetched when it is queued for scoring: whole rows of
+/// up to 1 KiB (the hardware prefetcher streams the rest of longer ones).
+const CODE_PREFETCH_LINES: usize = 16;
+
+/// Seed an affine-code search from the search trees' leaves: gather the unvisited
+/// leaf points, prefetch their code rows, then score them four at a time.
+fn initialize_affine(
+    tree_query: &[f32],
+    query: &AffineQuery,
+    codes: &AffineCodes,
+    trees: &[FlatTree],
+    tree_leaf_budget: usize,
+    rng: &mut FastRng,
+    workspace: &mut SearchWorkspace,
+) {
+    let mut pending = std::mem::take(&mut workspace.pending);
+    pending.clear();
+    for tree in trees {
+        tree.search_leaves(
+            tree_query,
+            rng,
+            tree_leaf_budget,
+            &mut workspace.tree_frontier,
+            &mut workspace.tree_leaves,
+        );
+        for &(start, end) in &workspace.tree_leaves {
+            for &idx in &tree.indices[start..end] {
+                if idx >= 0 && !workspace.visited.check_and_mark(idx) {
+                    codes.prefetch(idx, CODE_PREFETCH_LINES);
+                    pending.push(idx);
+                }
+            }
+        }
+    }
+    let mut chunks = pending.chunks_exact(4);
+    for chunk in &mut chunks {
+        let candidates = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let distances = codes.distance_four(query, candidates);
+        for slot in 0..4 {
+            workspace.result_heap.push(distances[slot], candidates[slot]);
+            workspace.seed_set.push(distances[slot], candidates[slot]);
+        }
+    }
+    for &idx in chunks.remainder() {
+        let d = codes.distance(query, idx);
+        workspace.result_heap.push(d, idx);
+        workspace.seed_set.push(d, idx);
+    }
+    workspace.pending = pending;
+}
+
+/// Greedy search over affine codes, leaving the best `k` by code distance in
+/// the workspace's result heap (see [`SearchWorkspace::sort_results`]).
+///
+/// `tree_query` routes the float32 search trees; `query` is the same query
+/// prepared for `codes` (in the coded space, which may be a projection).
+/// Searches start from the trees' leaves only (as PyNNDescent's do): until the
+/// result heap is full nothing bounds the search, so it fills from the leaves'
+/// graph neighbourhoods rather than from random points, which are needed only
+/// when the trees give no seeds.
+pub fn greedy_search_affine_into(
+    tree_query: &[f32],
+    query: &AffineQuery,
+    codes: &AffineCodes,
+    graph: &SearchGraph,
+    trees: &[FlatTree],
+    tree_leaf_budget: usize,
+    k: usize,
+    epsilon: f32,
+    min_distance: f32,
+    rng: &mut FastRng,
+    workspace: &mut SearchWorkspace,
+) {
+    workspace.reset(graph.n_vertices, k);
+    initialize_affine(tree_query, query, codes, trees, tree_leaf_budget, rng, workspace);
+    if workspace.seed_set.is_empty() {
+        let distance_to = |idx: i32| codes.distance(query, idx);
+        fill_random(graph.n_vertices, k, &distance_to, rng, workspace);
+    }
+    traverse_affine(query, codes, graph, epsilon, min_distance, workspace);
+}
+
+/// Greedy search over affine codes, returning the best `k` by code distance
+/// (rerank them with exact distances afterwards).
+pub fn greedy_search_affine_with_workspace_initialized(
+    tree_query: &[f32],
+    query: &AffineQuery,
+    codes: &AffineCodes,
+    graph: &SearchGraph,
+    trees: &[FlatTree],
+    tree_leaf_budget: usize,
+    k: usize,
+    epsilon: f32,
+    min_distance: f32,
+    rng: &mut FastRng,
+    workspace: &mut SearchWorkspace,
+) -> (Vec<i32>, Vec<f32>) {
+    greedy_search_affine_into(
+        tree_query, query, codes, graph, trees, tree_leaf_budget, k, epsilon, min_distance, rng,
+        workspace,
+    );
+    workspace.sort_results();
+    (
+        workspace.results.iter().map(|&(_, idx)| idx).collect(),
+        workspace.results.iter().map(|&(d, _)| d).collect(),
+    )
+}
+
 pub fn greedy_search<D: Distance<f32>>(
     query: &[f32],
     data: &[f32],
@@ -713,6 +916,53 @@ mod tests {
                     assert_eq!(actual.1.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
                                expected.1.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn padded_rows_match_csr_search() {
+        let points = 97;
+        let mut graph = SearchGraph::new(points);
+        for point in 0..points {
+            // Degrees vary (up to 40, so rows span several cache lines) and rows
+            // contain -1 entries and repeated neighbors.
+            for offset in 0..(point % 41) {
+                graph.indices.push(((point * 7 + offset * 3) % points) as i32);
+                if offset % 5 == 4 {
+                    graph.indices.push(-1);
+                }
+            }
+            graph.indices.push(((point + 1) % points) as i32);
+            graph.indptr[point + 1] = graph.indices.len() as i32;
+        }
+        let mut padded = graph.clone();
+        padded.build_padded();
+        for vertex in 0..points {
+            let expected: Vec<i32> =
+                graph.neighbors(vertex).iter().copied().filter(|&neighbor| neighbor >= 0).collect();
+            let row = padded.search_row(vertex);
+            assert_eq!(row, &expected[..]);
+            // Slot 0 holds the degree, at the start of a cache line.
+            assert_eq!((row.as_ptr() as usize - 4) % 64, 0);
+        }
+
+        let dimension = 100;
+        let mut rng = FastRng::new(5);
+        let data: Vec<f32> = (0..points * dimension).map(|_| rng.next_float() - 0.5).collect();
+        let mut workspace = SearchWorkspace::new(points, 10);
+        for epsilon in [0.0, 0.1, 0.5] {
+            for query_row in 0..8 {
+                let query = &data[query_row * dimension..(query_row + 1) * dimension];
+                let expected = greedy_search_with_workspace(
+                    query, &data, dimension, &graph, &[], 1, &SquaredEuclidean, 10, epsilon,
+                    0.0, &mut FastRng::new(42), &mut workspace,
+                );
+                let actual = greedy_search_with_workspace(
+                    query, &data, dimension, &padded, &[], 1, &SquaredEuclidean, 10, epsilon,
+                    0.0, &mut FastRng::new(42), &mut workspace,
+                );
+                assert_eq!(actual, expected);
             }
         }
     }

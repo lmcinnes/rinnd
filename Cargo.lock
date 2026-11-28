@@ -688,6 +688,7 @@ dependencies = [
  "bincode",
  "bytemuck",
  "criterion",
+ "libc",
  "memmap2",
  "num-traits",
  "ordered-float",
